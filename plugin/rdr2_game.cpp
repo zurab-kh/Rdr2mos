@@ -19,6 +19,7 @@ const uint32_t kFallbackAvatar = joaat("player_three");
 int g_peds[kMaxHandles];
 // Survives the script restart after a save load, so a protection we switched on is never left behind.
 bool g_protectionLeftOn = false;
+bool g_holdLeftOn = false;
 int g_vehicles[kMaxHandles];
 
 int collectPeds() { return std::clamp(worldGetAllPeds(g_peds, kMaxHandles), 0, kMaxHandles); }
@@ -49,6 +50,16 @@ void Rdr2Game::frame(uint32_t nowMs) {
         n::SET_ENTITY_INVINCIBLE(playerPed_, false);
         g_protectionLeftOn = false;
     }
+    if (g_holdLeftOn && !held_) {  // the script restarted while the world was frozen
+        n::SET_TIME_SCALE(1.0f);
+        n::DO_SCREEN_FADE_IN(500);
+        g_holdLeftOn = false;
+    }
+    if (held_) {
+        n::SET_TIME_SCALE(0.0f);
+        n::DISABLE_ALL_CONTROL_ACTIONS(0);
+    }
+    if (camera_) n::DISABLE_ALL_CONTROL_ACTIONS(0);
     int player = n::PLAYER_ID();
     if (n::IS_PED_ON_MOUNT(playerPed_)) playerMount_ = n::GET_MOUNT(playerPed_);
     if (n::IS_PED_IN_ANY_VEHICLE(playerPed_)) playerVehicle_ = n::GET_VEHICLE_PED_IS_IN(playerPed_);
@@ -156,6 +167,120 @@ void Rdr2Game::setLocalProtected(bool on) {
     if (playerPed_) n::SET_ENTITY_INVINCIBLE(playerPed_, on);
 }
 
+void Rdr2Game::killLocalPlayer() {
+    if (playerPed_ && !n::IS_ENTITY_DEAD(playerPed_)) {
+        n::SET_ENTITY_INVINCIBLE(playerPed_, false);
+        n::SET_ENTITY_HEALTH(playerPed_, 0, 0);
+    }
+}
+
+void Rdr2Game::holdWorld(bool on) {
+    if (on == held_) return;
+    held_ = on;
+    g_holdLeftOn = on;
+    n::SET_TIME_SCALE(on ? 0.0f : 1.0f);
+    if (on) n::DO_SCREEN_FADE_OUT(800);
+    else n::DO_SCREEN_FADE_IN(800);
+}
+
+void Rdr2Game::listMissionEntities(std::vector<MissionEntity>& out) {
+    auto add = [&](int h, EntityKind kind) {
+        if (!h || own_.count(h) || isSpawned(h) || !n::DOES_ENTITY_EXIST(h) || !n::IS_ENTITY_A_MISSION_ENTITY(h)) return;
+        uint32_t script = n::GET_ENTITY_SCRIPT(h);
+        if (!script) return;
+        out.push_back({h, kind, n::GET_ENTITY_MODEL(h), script, n::GET_ENTITY_COORDS(h)});
+    };
+    int peds = collectPeds();
+    for (int i = 0; i < peds; ++i)
+        if (!n::IS_PED_A_PLAYER(g_peds[i])) add(g_peds[i], EntityKind::Ped);
+    int vehicles = collectVehicles();
+    for (int i = 0; i < vehicles; ++i) add(g_vehicles[i], EntityKind::Vehicle);
+    missionCache_ = out;
+    missionCacheMs_ = nowMs_;
+}
+
+uint32_t Rdr2Game::localMissionScript() {
+    if (!playerPed_ || !n::GET_MISSION_FLAG()) return 0;
+    if (missionCache_.empty() || nowMs_ - missionCacheMs_ > 1000) {
+        std::vector<MissionEntity> fresh;
+        listMissionEntities(fresh);
+    }
+    // The mission script is the one that owns most of the story entities around the player.
+    Vec3 me = n::GET_ENTITY_COORDS(playerPed_);
+    std::unordered_map<uint32_t, int> votes;
+    for (const MissionEntity& e : missionCache_)
+        if (distance(e.pos, me) < 150.0f) ++votes[e.script];
+    uint32_t best = 0;
+    int bestVotes = 0;
+    for (const auto& [script, count] : votes)
+        if (count > bestVotes) {
+            best = script;
+            bestVotes = count;
+        }
+    return best;
+}
+
+void Rdr2Game::setHarmless(EntityHandle h, bool on) {
+    if (n::DOES_ENTITY_EXIST(h) && n::IS_ENTITY_A_PED(h)) n::SET_PED_TO_PLAYER_WEAPON_DAMAGE_MODIFIER(h, on ? 0.0f : 1.0f);
+}
+
+void Rdr2Game::revive(EntityHandle h, int health) {
+    invalidate(h);
+    n::RESURRECT_PED(h);
+    n::REVIVE_INJURED_PED(h);
+    n::SET_ENTITY_HEALTH(h, health, 0);
+}
+
+bool Rdr2Game::readCamera(CameraState& out) {
+    out.pos = n::GET_FINAL_RENDERED_CAM_COORD();
+    out.rot = n::GET_FINAL_RENDERED_CAM_ROT();
+    out.fov = n::GET_FINAL_RENDERED_CAM_FOV();
+    return out.fov > 1.0f;
+}
+
+void Rdr2Game::spectate(bool on, const CameraState& cam) {
+    if (on) {
+        if (!camera_) {
+            camera_ = n::CREATE_CAM("DEFAULT_SCRIPTED_CAMERA");
+            if (!camera_) return;
+            n::SET_CAM_ACTIVE(camera_, true);
+            n::RENDER_SCRIPT_CAMS(true, 500);
+        }
+        n::SET_CAM_COORD(camera_, cam.pos);
+        n::SET_CAM_ROT(camera_, cam.rot);
+        n::SET_CAM_FOV(camera_, cam.fov);
+        n::SET_FOCUS_POS_AND_VEL(cam.pos);  // stream the world in where the camera is, not where we stand
+    } else if (camera_) {
+        n::RENDER_SCRIPT_CAMS(false, 500);
+        n::SET_CAM_ACTIVE(camera_, false);
+        n::DESTROY_CAM(camera_);
+        n::CLEAR_FOCUS();
+        camera_ = 0;
+    }
+}
+
+bool Rdr2Game::readWaypoint(Vec3& out) {
+    if (!n::IS_WAYPOINT_ACTIVE()) return false;
+    out = n::GET_WAYPOINT_COORDS();
+    return true;
+}
+
+void Rdr2Game::showFriendWaypoint(bool on, const Vec3& pos) {
+    if (!on) {
+        if (waypointBlip_) n::REMOVE_BLIP(&waypointBlip_);
+        waypointBlip_ = 0;
+        return;
+    }
+    if (waypointBlip_) {
+        n::SET_BLIP_COORDS(waypointBlip_, pos);
+        return;
+    }
+    static const uint32_t kStyles[] = {joaat("BLIP_STYLE_WAYPOINT"), joaat("BLIP_STYLE_FRIENDLY")};
+    for (uint32_t style : kStyles)
+        if ((waypointBlip_ = n::BLIP_ADD_FOR_COORDS(style, pos)) != 0) break;
+    if (waypointBlip_) n::SET_BLIP_NAME(waypointBlip_, n::LITERAL_STRING("Friend's waypoint"));
+}
+
 bool Rdr2Game::skipPed(int ped) {
     Skip& s = skip_[ped];
     if (static_cast<int32_t>(nowMs_ - s.untilMs) >= 0) {
@@ -209,6 +334,7 @@ void Rdr2Game::readEntity(EntityHandle h, EntityKind kind, EntityRead& out) {
     st.pos = n::GET_ENTITY_COORDS(h);
     st.vel = n::GET_ENTITY_VELOCITY(h);
     st.heading = n::GET_ENTITY_HEADING(h);
+    if (n::IS_ENTITY_A_MISSION_ENTITY(h)) st.script = n::GET_ENTITY_SCRIPT(h);
     if (kind == EntityKind::Vehicle) {
         Vec3 rot = n::GET_ENTITY_ROTATION(h);
         st.pitch = rot.x;
@@ -245,10 +371,12 @@ void Rdr2Game::listForeign(std::vector<ForeignEntity>& out) {
     int peds = collectPeds();
     for (int i = 0; i < peds; ++i)
         if (g_peds[i] && g_peds[i] != playerPed_)
-            out.push_back({g_peds[i], n::GET_VEHICLE_DRAFT_HORSE_IS_ATTACHED_TO(g_peds[i])});
+            out.push_back({g_peds[i], n::GET_VEHICLE_DRAFT_HORSE_IS_ATTACHED_TO(g_peds[i]),
+                           n::IS_ENTITY_A_MISSION_ENTITY(g_peds[i]) && !isSpawned(g_peds[i])});
     int vehicles = collectVehicles();
     for (int i = 0; i < vehicles; ++i)
-        if (g_vehicles[i]) out.push_back({g_vehicles[i], 0});
+        if (g_vehicles[i])
+            out.push_back({g_vehicles[i], 0, n::IS_ENTITY_A_MISSION_ENTITY(g_vehicles[i]) && !isSpawned(g_vehicles[i])});
 }
 
 WorldInfo Rdr2Game::readWorldInfo() {

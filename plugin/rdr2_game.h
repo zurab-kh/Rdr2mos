@@ -17,6 +17,16 @@ public:
     void teleportLocalPlayer(const coop::Vec3& pos) override;
     uint32_t localOutfit() override;
     void setLocalProtected(bool on) override;
+    void killLocalPlayer() override;
+    void holdWorld(bool on) override;
+    uint32_t localMissionScript() override;
+    void listMissionEntities(std::vector<coop::MissionEntity>& out) override;
+    void setHarmless(coop::EntityHandle h, bool on) override;
+    void revive(coop::EntityHandle h, int health) override;
+    bool readCamera(coop::CameraState& out) override;
+    void spectate(bool on, const coop::CameraState& cam) override;
+    bool readWaypoint(coop::Vec3& out) override;
+    void showFriendWaypoint(bool on, const coop::Vec3& pos) override;
     bool belongsToLocalPlayer(coop::EntityHandle h) override;
 
     void listNearby(const coop::Vec3& a, const coop::Vec3& b, float radius, std::vector<coop::NearbyEntity>& out) override;
@@ -109,4 +119,10 @@ private:
     std::unordered_map<int, int> blips_;
     uint32_t lastWeatherSet_ = 0;
     bool protected_ = false;
+    bool held_ = false;
+    int camera_ = 0;
+    int waypointBlip_ = 0;
+    std::vector<coop::MissionEntity> missionCache_;
+    uint32_t missionCacheMs_ = 0;
+    bool isSpawned(int h) const { return vehicles_.count(h) || quadruped_.count(h); }
 };

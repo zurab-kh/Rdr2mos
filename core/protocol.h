@@ -12,7 +12,7 @@
 namespace coop {
 
 constexpr uint16_t kMagic = 0x4352;  // "RC"
-constexpr uint8_t kProtocolVersion = 3;
+constexpr uint8_t kProtocolVersion = 4;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr size_t kMaxDatagram = 1200;  // stays below any sane path MTU
 constexpr size_t kMaxMessage = 1100;   // payload budget for one unreliable message
@@ -38,6 +38,17 @@ enum class Msg : uint8_t {
     Ping = 5,
     Pong = 6,
     Appearance = 7,
+    Story = 8,          // mission identity, deaths (reliable)
+    Camera = 9,         // rendered camera during the host's scenes (host-world mode)
+    Waypoint = 10,      // map waypoint (reliable)
+    SaveRequest = 11,   // guest asks for the host's save (reliable)
+    SaveChunk = 12,     // a piece of the save file (reliable)
+};
+
+// How the two games share the story.
+enum class StoryMode : uint8_t {
+    HostWorld = 0,  // the guest visits the host's world; only the host runs missions
+    Shared = 1,     // both play the same save: each runs the mission, the games are kept in step
 };
 
 // References to things in the host's world. Entity ids are assigned by the host.
@@ -51,6 +62,7 @@ struct HelloInfo {
     uint32_t nonce = 0;        // changes on every (re)start so a restarted peer is noticed
     std::string name;
     std::string avatar;        // ped model name the peer wants to be shown as
+    StoryMode storyMode = StoryMode::Shared;
 };
 
 enum PlayerFlags : uint16_t {
@@ -63,6 +75,7 @@ enum PlayerFlags : uint16_t {
     PF_InVehicle = 1 << 6,
     PF_InMission = 1 << 7,
     PF_Cutscene = 1 << 8,      // in a scripted scene: the player has no control
+    PF_Holding = 1 << 9,       // finished a scene first and waits for the friend (world frozen)
 };
 
 struct PlayerState {
@@ -112,6 +125,7 @@ struct EntityState {
     EntityKind kind = EntityKind::Ped;
     uint32_t model = 0;
     uint32_t outfit = 0;       // meta ped outfit hash, 0 = unknown
+    uint32_t script = 0;       // hash of the script that owns it (mission entities), 0 = ambient
     // EF_Pos / EF_Heading / EF_Tilt / EF_Vel
     Vec3 pos;
     float heading = 0;
@@ -145,6 +159,41 @@ struct Appearance {
     uint32_t outfit = 0;
 };
 
+enum class StoryEvent : uint8_t {
+    Mission = 1,    // the mission being played changed (script hash, 0 = free roam)
+    Died = 2,       // the player died during a mission
+};
+
+struct StoryInfo {
+    StoryEvent event = StoryEvent::Mission;
+    uint32_t missionScript = 0;
+};
+
+struct CameraState {
+    uint32_t timeMs = 0;
+    Vec3 pos;
+    Vec3 rot;      // pitch, roll, yaw in degrees
+    float fov = 50.0f;
+};
+
+struct WaypointInfo {
+    uint8_t active = 0;
+    float x = 0, y = 0;
+};
+
+struct SaveRequest {
+    uint8_t reserved = 0;
+};
+
+struct SaveChunk {
+    uint32_t total = 0;    // size of the whole file
+    uint32_t crc = 0;      // CRC-32 of the whole file
+    uint32_t offset = 0;
+    std::vector<uint8_t> data;
+};
+constexpr size_t kSaveChunkBytes = 960;
+constexpr uint32_t kMaxSaveBytes = 64u << 20;
+
 struct WorldInfo {
     uint8_t hour = 0, minute = 0, second = 0;
     uint8_t worldSync = 0;     // host is streaming its world; the guest should show only that
@@ -161,6 +210,17 @@ void write(ByteWriter& w, const Damage& v);
 bool read(ByteReader& r, Damage& v);
 void write(ByteWriter& w, const Appearance& v);
 bool read(ByteReader& r, Appearance& v);
+void write(ByteWriter& w, const StoryInfo& v);
+bool read(ByteReader& r, StoryInfo& v);
+void write(ByteWriter& w, const CameraState& v);
+bool read(ByteReader& r, CameraState& v);
+void write(ByteWriter& w, const WaypointInfo& v);
+bool read(ByteReader& r, WaypointInfo& v);
+void write(ByteWriter& w, const SaveRequest& v);
+bool read(ByteReader& r, SaveRequest& v);
+void write(ByteWriter& w, const SaveChunk& v);
+bool read(ByteReader& r, SaveChunk& v);
+uint32_t crc32(const uint8_t* data, size_t size, uint32_t crc = 0);
 void write(ByteWriter& w, const WorldInfo& v);
 bool read(ByteReader& r, WorldInfo& v);
 

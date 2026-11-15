@@ -77,6 +77,10 @@ inline void SET_ENTITY_ROTATION(Entity e, coop::Vec3 r) { call(0x9CC8314DFEDE441
 inline void SET_ENTITY_VELOCITY(Entity e, coop::Vec3 v) { call(0x1C99BB7B6E96D16F, e, v.x, v.y, v.z); }
 inline bool IS_ENTITY_A_MISSION_ENTITY(Entity e) { return test(0x138190F64DB4BBD1, e); }
 inline bool IS_ENTITY_A_PED(Entity e) { return test(0xCF8176912DDA4EA5, e); }
+inline Hash GET_ENTITY_SCRIPT(Entity e) {
+    int args[8] = {};
+    return invoke<Hash>(0x2A08A32B6D49906F, e, args);
+}
 inline void SET_ENTITY_HEADING(Entity e, float heading) { call(0xCF2B9C0645C4651B, e, heading); }
 inline void SET_ENTITY_AS_MISSION_ENTITY(Entity e) { call(0xDC19C288082E586E, e, 1, 1); }
 inline void SET_ENTITY_INVINCIBLE(Entity e, bool on) { call(0xA5C38736C426FCB8, e, on ? 1 : 0); }
@@ -93,6 +97,8 @@ inline Ped CREATE_PED(Hash model, coop::Vec3 p, float heading) {
     return invoke<Ped>(0xD49F9B0955C367DE, model, p.x, p.y, p.z, heading, 0, 0, 0, 0);
 }
 inline void DELETE_PED(Ped* ped) { call(0xCC0EF140F99365C5, ped); }
+inline void RESURRECT_PED(Ped ped) { call(0x71BC8E838B9C6035, ped); }
+inline void REVIVE_INJURED_PED(Ped ped) { call(0x8D8ACD8388CD99CE, ped); }
 inline bool IS_PED_WEAPON_READY_TO_SHOOT(Ped ped) { return test(0xB80CA294F2F26749, ped); }
 inline Entity GET_CURRENT_TARGET_FOR_PED(Ped ped) { return invoke<Entity>(0xCD66FEA29400A0B5, ped); }
 inline void SET_PED_INTO_VEHICLE(Ped ped, int vehicle, int seat) { call(0xF75B0D629E1C063D, ped, vehicle, seat); }
@@ -171,6 +177,22 @@ inline bool HAS_MODEL_LOADED(Hash model) { return test(0x1283B8B89DD5D1B6, model
 inline void SET_MODEL_AS_NO_LONGER_NEEDED(Hash model) { call(0x4AD96EF928BD4F9A, model); }
 
 // --- CAMERA / CLOCK / MISC
+inline coop::Vec3 GET_FINAL_RENDERED_CAM_COORD() { return invoke<Vector3>(0x5352E025EC2B416F).vec(); }
+inline coop::Vec3 GET_FINAL_RENDERED_CAM_ROT() { return invoke<Vector3>(0x602685BD85DD26CA, 2).vec(); }
+inline float GET_FINAL_RENDERED_CAM_FOV() { return invoke<float>(0x04AF77971E508F6A); }
+inline int CREATE_CAM(const char* name) { return invoke<int>(0xE72CDBA7F0A02DD6, name, 1); }
+inline void DESTROY_CAM(int cam) { call(0x4E67E0B6D7FD5145, cam, 0); }
+inline void SET_CAM_ACTIVE(int cam, bool on) { call(0x87295BCA613800C8, cam, on ? 1 : 0); }
+inline void RENDER_SCRIPT_CAMS(bool on, int easeMs) { call(0x33281167E4942E4F, on ? 1 : 0, easeMs > 0 ? 1 : 0, easeMs, 1, 1, 0); }
+inline void SET_CAM_COORD(int cam, coop::Vec3 p) { call(0xF9EE7D419EE49DE6, cam, p.x, p.y, p.z); }
+inline void SET_CAM_ROT(int cam, coop::Vec3 r) { call(0x63DFA6810AD78719, cam, r.x, r.y, r.z, 2); }
+inline void SET_CAM_FOV(int cam, float fov) { call(0x27666E5988D9D429, cam, fov); }
+inline void DO_SCREEN_FADE_OUT(int ms) { call(0x40C719A5E410B9E4, ms); }
+inline void DO_SCREEN_FADE_IN(int ms) { call(0x6A053CF596F67DF7, ms); }
+inline void SET_TIME_SCALE(float scale) { call(0x9682AF6050854856, scale); }
+inline void DISABLE_ALL_CONTROL_ACTIONS(int control) { call(0x5F4B6931816E599B, control); }
+inline void SET_FOCUS_POS_AND_VEL(coop::Vec3 p) { call(0x25F6EF88664540E2, p.x, p.y, p.z, 0.0f, 0.0f, 0.0f); }
+inline void CLEAR_FOCUS() { call(0x86CCAF7CE493EFBE); }
 inline coop::Vec3 GET_GAMEPLAY_CAM_COORD() { return invoke<Vector3>(0x595320200B98596E).vec(); }
 inline coop::Vec3 GET_GAMEPLAY_CAM_ROT() { return invoke<Vector3>(0x0252D2B5582957A6, 2).vec(); }
 inline int GET_CLOCK_HOURS() { return invoke<int>(0xC82CF208C2B19199); }
@@ -189,6 +211,10 @@ inline const char* LITERAL_STRING(const char* text) { return invoke<const char*>
 inline int BLIP_ADD_FOR_ENTITY(Hash style, Entity e) { return invoke<int>(0x23F74C2FDA6E7C61, style, e); }
 inline void SET_BLIP_NAME(int blip, const char* varString) { call(0x9CB1A1623062F402, blip, varString); }
 inline void REMOVE_BLIP(int* blip) { call(0xF2C3C9DA47AAA54A, blip); }
+inline int BLIP_ADD_FOR_COORDS(Hash style, coop::Vec3 p) { return invoke<int>(0x554D9D53F696D002, style, p.x, p.y, p.z); }
+inline void SET_BLIP_COORDS(int blip, coop::Vec3 p) { call(0x4FF674F5E23D49CE, blip, p.x, p.y, p.z); }
+inline bool IS_WAYPOINT_ACTIVE() { return test(0x202B1BBFC6AB5EE4); }
+inline coop::Vec3 GET_WAYPOINT_COORDS() { return invoke<Vector3>(0x29B30D07C3F7873B).vec(); }
 inline void SET_TEXT_SCALE(float x, float y) { call(0x4170B650590B3B00, x, y); }
 inline void SET_TEXT_COLOR(int r, int g, int b, int a) { call(0x50A41AD966910F03, r, g, b, a); }
 inline void DISPLAY_TEXT(const char* varString, float x, float y) { call(0xD79334A4BB99BAD1, varString, x, y); }

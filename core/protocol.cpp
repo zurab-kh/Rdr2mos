@@ -49,14 +49,17 @@ void write(ByteWriter& w, const HelloInfo& v) {
     w.u32(v.nonce);
     w.str(v.name);
     w.str(v.avatar);
+    w.u8(static_cast<uint8_t>(v.storyMode));
 }
 bool read(ByteReader& r, HelloInfo& v) {
     uint8_t role = r.u8();
     v.nonce = r.u32();
     v.name = r.str();
     v.avatar = r.str();
-    if (!r.ok() || role > 1) return false;
+    uint8_t mode = r.u8();
+    if (!r.ok() || role > 1 || mode > 1) return false;
     v.role = static_cast<Role>(role);
+    v.storyMode = static_cast<StoryMode>(mode);
     return true;
 }
 
@@ -119,7 +122,7 @@ bool read(ByteReader& r, PlayerState& v) {
 // ---------------------------------------------------------------- entities
 size_t encodedSize(const EntityState& e, const Vec3& anchor) {
     size_t n = 3;  // id + field mask
-    if (e.fields & EF_Static) n += 9;
+    if (e.fields & EF_Static) n += 13;
     if (e.fields & EF_Pos) n += relativeFits(e.pos, anchor) ? 6 : 12;
     if (e.fields & EF_Heading) n += 2;
     if (e.fields & EF_Tilt) n += 2;
@@ -139,6 +142,7 @@ static void writeEntity(ByteWriter& w, const EntityState& e, const Vec3& anchor)
         w.u8(static_cast<uint8_t>(e.kind));
         w.u32(e.model);
         w.u32(e.outfit);
+        w.u32(e.script);
     }
     if (fields & EF_Pos) {
         if (far) {
@@ -180,6 +184,7 @@ static bool readEntity(ByteReader& r, EntityState& e, const Vec3& anchor) {
         e.kind = static_cast<EntityKind>(kind);
         e.model = r.u32();
         e.outfit = r.u32();
+        e.script = r.u32();
     }
     if (fields & EF_Pos) {
         if (fields & EF_FarPos) {
@@ -279,6 +284,88 @@ bool read(ByteReader& r, Damage& v) {
     v.target = r.u16();
     v.amount = r.u16();
     return r.ok();
+}
+
+void write(ByteWriter& w, const StoryInfo& v) {
+    w.u8(static_cast<uint8_t>(v.event));
+    w.u32(v.missionScript);
+}
+bool read(ByteReader& r, StoryInfo& v) {
+    uint8_t e = r.u8();
+    v.event = static_cast<StoryEvent>(e);
+    v.missionScript = r.u32();
+    return r.ok() && (e == 1 || e == 2);
+}
+
+void write(ByteWriter& w, const CameraState& v) {
+    w.u32(v.timeMs);
+    w.vec3(v.pos);
+    w.i16(q16(v.rot.x, 0.01f));
+    w.i16(q16(v.rot.y, 0.01f));
+    w.u16(packHeading(v.rot.z));
+    w.u16(static_cast<uint16_t>(std::clamp(std::lround(v.fov * 100.0f), 1L, 65535L)));
+}
+bool read(ByteReader& r, CameraState& v) {
+    v.timeMs = r.u32();
+    v.pos = r.vec3();
+    v.rot.x = r.i16() * 0.01f;
+    v.rot.y = r.i16() * 0.01f;
+    v.rot.z = unpackHeading(r.u16());
+    v.fov = r.u16() / 100.0f;
+    return r.ok() && std::isfinite(v.pos.x) && std::isfinite(v.pos.y) && std::isfinite(v.pos.z);
+}
+
+void write(ByteWriter& w, const WaypointInfo& v) {
+    w.u8(v.active);
+    w.f32(v.x);
+    w.f32(v.y);
+}
+bool read(ByteReader& r, WaypointInfo& v) {
+    v.active = r.u8();
+    v.x = r.f32();
+    v.y = r.f32();
+    return r.ok() && std::isfinite(v.x) && std::isfinite(v.y);
+}
+
+void write(ByteWriter& w, const SaveRequest& v) { w.u8(v.reserved); }
+bool read(ByteReader& r, SaveRequest& v) {
+    v.reserved = r.u8();
+    return r.ok();
+}
+
+void write(ByteWriter& w, const SaveChunk& v) {
+    w.u32(v.total);
+    w.u32(v.crc);
+    w.u32(v.offset);
+    w.u16(static_cast<uint16_t>(v.data.size()));
+    w.bytes(v.data.data(), v.data.size());
+}
+bool read(ByteReader& r, SaveChunk& v) {
+    v.total = r.u32();
+    v.crc = r.u32();
+    v.offset = r.u32();
+    size_t n = r.u16();
+    const uint8_t* p = r.take(n);
+    if (!r.ok() || n > kSaveChunkBytes || v.total > kMaxSaveBytes || v.offset > v.total || n > v.total - v.offset)
+        return false;
+    v.data.assign(p, p + n);
+    return true;
+}
+
+uint32_t crc32(const uint8_t* data, size_t size, uint32_t crc) {
+    static uint32_t table[256];
+    static bool ready = false;
+    if (!ready) {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            table[i] = c;
+        }
+        ready = true;
+    }
+    crc = ~crc;
+    for (size_t i = 0; i < size; ++i) crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    return ~crc;
 }
 
 void write(ByteWriter& w, const Appearance& v) { w.u32(v.outfit); }

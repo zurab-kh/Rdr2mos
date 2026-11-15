@@ -22,6 +22,9 @@ constexpr uint32_t kOutfitCheckMs = 2000;
 constexpr float kStreamHysteresis = 20.0f;       // entities leave the stream this much further out than they enter
 constexpr size_t kPoolSize = 24;
 constexpr uint32_t kPoolKeepMs = 10000;
+constexpr uint32_t kBindWaitMs = 2500;      // shared story: wait this long for the local copy before showing a mirror
+constexpr uint32_t kMissionScanMs = 250;
+constexpr float kBindDistance = 35.0f;
 
 constexpr int kGroupPos = 0, kGroupHeading = 1, kGroupTilt = 2, kGroupVel = 3, kGroupHealth = 4, kGroupState = 5,
               kGroupStatic = 6;
@@ -52,7 +55,7 @@ uint32_t updateInterval(float guestDistance, const EntityState& st) {
 }  // namespace
 
 CoopSession::CoopSession(IGame& game, Link& link, const SessionConfig& config)
-    : game_(game), link_(link), config_(config) {
+    : game_(game), link_(link), config_(config), story_(game, link, config_, [this](const std::string& t) { notice(t); }) {
     nearby_.reserve(512);
     outgoing_.reserve(128);
 }
@@ -80,7 +83,11 @@ void CoopSession::tick(uint32_t nowMs) {
         sendAppearance(nowMs);
         if (isHost()) sendWorld(nowMs);
         updatePuppet(nowMs, dt);
-        if (!isHost()) followHost(nowMs);
+        story_.tick(nowMs, local_.state, puppet_.haveState ? &puppet_.state : nullptr, status_.peerDistance);
+        status_.holding = story_.holding();
+        status_.spectating = story_.spectating();
+        status_.missionMismatch = story_.missionMismatch();
+        status_.saveProgress = story_.saveProgress();
         if (!isHost()) {
             if (config_.worldSync && hostWorldSync_) {
                 game_.suppressAmbientPopulation();
@@ -130,10 +137,9 @@ void CoopSession::cleanup() {
     lastSentMoving_ = false;
     lastOutfitCheckMs_ = sentOutfit_ = 0;
     appearanceSent_ = false;
-    prevPeerFlags_ = 0;
-    regroupPending_ = false;
-    if (protected_) game_.setLocalProtected(false);
-    protected_ = false;
+    story_.reset();
+    missionLocal_.clear();
+    lastMissionScanMs_ = 0;
     status_ = SessionStatus{};
     active_ = false;
 }
@@ -241,6 +247,15 @@ void CoopSession::destroyPuppet() {
 }
 
 void CoopSession::destroyMirror(Mirror& m, bool recycle) {
+    if (m.bound) {
+        // Never delete the guest's own mission entity: just stop driving it.
+        mirrorByHandle_.erase(m.handle);
+        if (game_.exists(m.handle)) game_.setHarmless(m.handle, false);
+        m.handle = 0;
+        m.bound = false;
+        m.mover = Mover{};
+        return;
+    }
     if (m.handle) {
         mirrorByHandle_.erase(m.handle);
         if (game_.exists(m.handle)) {
@@ -301,6 +316,13 @@ void CoopSession::handleMessages(uint32_t nowMs) {
                 }
                 break;
             }
+            case Msg::Story:
+            case Msg::Camera:
+            case Msg::Waypoint:
+            case Msg::SaveRequest:
+            case Msg::SaveChunk:
+                story_.handle(type, payload, nowMs);
+                break;
             case Msg::Appearance: {
                 Appearance a;
                 if (decode(payload, a)) puppet_.outfit = a.outfit;
@@ -326,6 +348,7 @@ void CoopSession::onSnapshot(const EntitySnapshot& snap, uint32_t nowMs) {
             if (mirrors_.size() >= 1024) continue;
             it = mirrors_.emplace(e.id, Mirror{}).first;
             it->second.id = e.id;
+            it->second.firstHeardMs = nowMs;
         }
         Mirror& m = it->second;
         m.lastHeardMs = nowMs;
@@ -338,6 +361,7 @@ void CoopSession::onSnapshot(const EntitySnapshot& snap, uint32_t nowMs) {
             m.st.kind = e.kind;
             m.st.model = e.model;
             m.st.outfit = e.outfit;
+            m.st.script = e.script;
             m.haveStatic = true;
         }
         if (e.fields & EF_Health) m.st.health = e.health;
@@ -398,6 +422,7 @@ void CoopSession::sendLocalState(uint32_t nowMs) {
     bool due = first || nowMs - lastStateMs_ >= interval;
     if (!due && s.flags == lastSentFlags_ && moving == lastSentMoving_) return;
     lastSentMoving_ = moving;
+    s.flags |= story_.extraFlags();
     s.timeMs = nowMs;
     s.mountRef = kRefNone;
     s.vehicleRef = kRefNone;
@@ -422,32 +447,6 @@ void CoopSession::sendAppearance(uint32_t nowMs) {
     link_.send(Msg::Appearance, Appearance{outfit}, true);
     sentOutfit_ = outfit;
     appearanceSent_ = true;
-}
-
-void CoopSession::followHost(uint32_t nowMs) {
-    (void)nowMs;
-    if (!puppet_.haveState) return;
-    uint16_t flags = puppet_.state.flags;
-    bool cutscene = (flags & PF_Cutscene) != 0;
-    bool mission = (flags & PF_InMission) != 0;
-    if (cutscene != protected_) {
-        // Nobody can help the guest while the host watches a scene, so the guest cannot be hurt meanwhile.
-        game_.setLocalProtected(cutscene);
-        protected_ = cutscene;
-        if (cutscene) notice("Host is in a cutscene - you are protected until it ends");
-    }
-    if (mission && !(prevPeerFlags_ & PF_InMission)) {
-        notice("Host started a mission");
-        regroupPending_ = true;
-    }
-    if (!cutscene && (prevPeerFlags_ & PF_Cutscene)) regroupPending_ = true;
-    prevPeerFlags_ = flags;
-    if (regroupPending_) {
-        regroupPending_ = false;
-        if (config_.autoRegroup && !(flags & PF_Dead) && status_.peerDistance > config_.regroupDistance &&
-            teleportToPeer())
-            notice("Moved you to the host");
-    }
 }
 
 void CoopSession::sendWorld(uint32_t nowMs) {
@@ -593,7 +592,10 @@ void CoopSession::streamEntity(Streamed& s, uint32_t nowMs) {
 
     if (key) s.lastKeyMs = s.fresh ? nowMs - (s.id * 97u) % kKeyframeMs : nowMs;  // stagger keyframes
     s.fresh = false;
-    s.nextDueMs = nowMs + updateInterval(s.guestDistance, cur) * kWorldIntervalMs - 5;
+    // While the guest watches the host's scene through the camera, the scene gets the full rate.
+    uint32_t ticks = updateInterval(s.guestDistance, cur);
+    if (story_.boostStreaming() && distance(cur.pos, local_.state.pos) < 60.0f) ticks = 1;
+    s.nextDueMs = nowMs + ticks * kWorldIntervalMs - 5;
     if (out.fields) outgoing_.push_back(out);
 }
 
@@ -659,12 +661,16 @@ void CoopSession::steerVehicle(EntityHandle h, Mover& m, const MotionSample& t, 
     game_.steerVehicle(h, t.vel + pull, t.heading, t.pitch, t.roll, dt);
 }
 
-void CoopSession::forwardDamage(EntityHandle h, int& expectedHealth, uint16_t target) {
+void CoopSession::forwardDamage(EntityHandle h, int& expectedHealth, uint16_t target, bool onlyLocalPlayer) {
     int current = game_.health(h);
     if (current < expectedHealth) {
         bool byLocalPlayer = game_.wasDamagedByLocalPlayer(h);
         bool forward;
-        if (target != kRefGuestPlayer && target != kRefHostPlayer) {
+        if (onlyLocalPlayer) {
+            // A linked mission NPC also fights with its own AI here; the host simulates the same
+            // fight, so only the guest's own hits count. The rest is undone by the host's health.
+            forward = byLocalPlayer;
+        } else if (target != kRefGuestPlayer && target != kRefHostPlayer) {
             // A mirror lost health on the guest. Remote characters only fire blanks here, so
             // whatever hurt it was the guest's doing: tell the host, who owns the real NPC.
             forward = true;
@@ -857,8 +863,60 @@ void CoopSession::updatePuppet(uint32_t nowMs, float dt) {
 
 // ---------------------------------------------------------------- the host's world, on the guest
 
+void CoopSession::bindMissionEntities(uint32_t nowMs) {
+    if (config_.storyMode != StoryMode::Shared || nowMs - lastMissionScanMs_ < kMissionScanMs) return;
+    lastMissionScanMs_ = nowMs;
+    missionLocal_.clear();
+    game_.listMissionEntities(missionLocal_);
+    if (missionLocal_.empty()) return;
+    // Both games run the same mission script, which creates the same NPCs (same model, same place).
+    // Pair each host mission entity with the guest's own copy: the copy keeps its AI and its role in
+    // the guest's mission, while health, death and position follow the host. A mission objective
+    // like "kill them all" therefore completes in both games.
+    for (auto& [id, m] : mirrors_) {
+        if (m.bound || !m.st.script || !m.haveStatic || !m.havePos) continue;
+        const MissionEntity* best = nullptr;
+        float bestDistance = kBindDistance;
+        for (const MissionEntity& e : missionLocal_) {
+            if (e.kind != m.st.kind || e.model != m.st.model || e.script != m.st.script) continue;
+            if (mirrorByHandle_.count(e.handle) || isSessionEntity(e.handle)) continue;
+            float d = distance(e.pos, m.st.pos);
+            if (d < bestDistance) {
+                bestDistance = d;
+                best = &e;
+            }
+        }
+        if (!best || !game_.exists(best->handle)) continue;
+        if (m.handle) destroyMirror(m, true);  // replace the stand-in shown so far
+        m.handle = best->handle;
+        m.bound = true;
+        m.mover = Mover{};
+        m.lastUpdateMs = 0;
+        m.deadSinceMs = 0;
+        m.outfitApplied = m.st.outfit;  // it is the real one: already dressed by its script
+        mirrorByHandle_[m.handle] = id;
+        game_.setHarmless(m.handle, true);
+        m.expectedHealth = game_.health(m.handle);
+    }
+}
+
+void CoopSession::followBound(EntityHandle h, const MotionSample& t, float dt) {
+    // The local AI animates it; only keep it where the host's copy is.
+    Vec3 err = t.pos - game_.position(h);
+    float dist = length(err);
+    if (dist > 12.0f) {
+        game_.teleport(h, t.pos, t.heading);
+    } else if (dist > 0.75f) {
+        Vec3 flat{err.x, err.y, 0};
+        game_.nudge(h, flat * std::min(1.0f, dt * 2.0f));
+    }
+}
+
 void CoopSession::updateMirrors(uint32_t nowMs, float dt) {
     spawnQueue_.clear();
+    bindMissionEntities(nowMs);
+    const bool shared = config_.storyMode == StoryMode::Shared;
+    const Vec3 view = story_.viewPoint(local_.state.pos);
     int shown = 0;
     for (auto it = mirrors_.begin(); it != mirrors_.end();) {
         Mirror& m = it->second;
@@ -876,17 +934,50 @@ void CoopSession::updateMirrors(uint32_t nowMs, float dt) {
             m.mover = Mover{};
         }
         if (!m.handle) {
-            if (m.haveStatic && m.havePos) spawnQueue_.push_back(&m);
+            // A mission entity may get its local twin in a moment: do not show a stand-in right away.
+            bool awaitTwin = shared && m.st.script && nowMs - m.firstHeardMs < kBindWaitMs;
+            if (m.haveStatic && m.havePos && !awaitTwin) spawnQueue_.push_back(&m);
             continue;
         }
         ++shown;
+        if (m.bound) {
+            float step = m.lastUpdateMs ? std::clamp((nowMs - m.lastUpdateMs) / 1000.0f, 0.0f, 0.25f) : dt;
+            m.lastUpdateMs = nowMs;
+            MotionSample t = m.motion.sample(nowMs);
+            if (m.st.kind == EntityKind::Vehicle) {
+                if (!(local_.vehicle == m.handle && local_.state.seat == -1)) steerVehicle(m.handle, m.mover, t, step);
+                continue;
+            }
+            if (m.st.flags & NF_Dead) {
+                if (!game_.isDead(m.handle)) game_.kill(m.handle);  // the guest's mission sees the kill
+                m.expectedHealth = 0;
+                continue;
+            }
+            forwardDamage(m.handle, m.expectedHealth, m.id, true);
+            if (game_.isDead(m.handle)) {
+                if (!m.deadSinceMs) m.deadSinceMs = nowMs ? nowMs : 1;
+                else if (nowMs - m.deadSinceMs > kRespawnGraceMs && m.st.health > 0) {
+                    game_.revive(m.handle, m.st.health);  // the host says it survived
+                    m.expectedHealth = game_.health(m.handle);
+                    m.deadSinceMs = 0;
+                }
+                continue;
+            }
+            m.deadSinceMs = 0;
+            if (m.st.health > 0 && m.st.health != m.expectedHealth) {
+                game_.setHealth(m.handle, m.st.health, 0);
+                m.expectedHealth = game_.health(m.handle);
+            }
+            if (local_.mount != m.handle) followBound(m.handle, t, step);
+            continue;
+        }
         if (m.st.outfit && m.st.outfit != m.outfitApplied && m.st.kind == EntityKind::Ped) {
             game_.setOutfit(m.handle, m.st.outfit);
             m.outfitApplied = m.st.outfit;
         }
         // CPU level of detail: what is far from the guest is updated every 2nd or 4th frame
         // (staggered by id so the work spreads evenly). Motion is time-based, so nothing slows down.
-        float range = distance(m.st.pos, local_.state.pos);
+        float range = distance(m.st.pos, view);
         uint32_t every = range < 35.0f ? 1u : range < 80.0f ? 2u : 4u;
         if (m.st.kind == EntityKind::Vehicle) every = std::min(every, 2u);  // physics drifts if left alone longer
         if ((frame_ + m.id) % every != 0 && m.lastUpdateMs) continue;
@@ -904,7 +995,7 @@ void CoopSession::updateMirrors(uint32_t nowMs, float dt) {
     // Spawn the closest first, vehicles before peds so riders find their seats.
     std::sort(spawnQueue_.begin(), spawnQueue_.end(), [&](const Mirror* a, const Mirror* b) {
         if (a->st.kind != b->st.kind) return a->st.kind == EntityKind::Vehicle;
-        return distance(a->st.pos, local_.state.pos) < distance(b->st.pos, local_.state.pos);
+        return distance(a->st.pos, view) < distance(b->st.pos, view);
     });
     int budget = kSpawnsPerFrame;
     prefetched_.clear();
@@ -1015,6 +1106,7 @@ void CoopSession::clearForeign(uint32_t nowMs) {
     game_.listForeign(foreign_);
     for (const ForeignEntity& f : foreign_) {
         if (ours(f.handle) || hidden_.count(f.handle)) continue;
+        if (f.mission && config_.storyMode == StoryMode::Shared) continue;  // the guest's own mission needs them
         if (f.draftOf && ours(f.draftOf)) continue;  // horses pulling one of our wagons
         if (game_.removeForeign(f.handle) == ForeignAction::Hidden) hidden_.insert(f.handle);
     }

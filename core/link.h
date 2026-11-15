@@ -49,6 +49,8 @@ public:
     int relayPeers() const { return relayPeers_; }
     // Traffic over the last second, in bytes per second (UDP payload, without IP/UDP headers).
     uint32_t sendRate() const { return sendRate_; }
+    // Reliable messages queued and not yet acknowledged (bulk transfers throttle on this).
+    size_t pendingReliable() const { return outReliable_.size(); }
     uint32_t receiveRate() const { return receiveRate_; }
 
 private:

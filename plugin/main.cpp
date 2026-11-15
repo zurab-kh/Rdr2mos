@@ -12,6 +12,7 @@
 #include "link.h"
 #include "natives.h"
 #include "rdr2_game.h"
+#include "saves.h"
 #include "session.h"
 
 using namespace coop;
@@ -103,7 +104,7 @@ struct Settings {
     bool autoConnect = false;
     bool showHud = true;
     SessionConfig session;
-    std::string toggleKey = "F7", teleportKey = "F8", hudKey = "F9";
+    std::string toggleKey = "F7", teleportKey = "F8", hudKey = "F9", saveKey = "F10";
     std::string problem;  // configuration error to show on screen
 
     void load(const std::string& path) {
@@ -140,6 +141,15 @@ struct Settings {
         session.syncWeather = ini.getBool("sync", "sync_weather", true);
         session.softCorrection = ini.getBool("sync", "soft_correction", true);
         session.autoRegroup = ini.getBool("sync", "auto_regroup", true);
+        std::string mode = ini.get("story", "mode", "shared");
+        if (mode == "shared") session.storyMode = StoryMode::Shared;
+        else if (mode == "host") session.storyMode = StoryMode::HostWorld;
+        else problem = "RDR2Coop.ini: [story] mode must be shared or host";
+        session.cutsceneBarrier = ini.getBool("story", "cutscene_barrier", true);
+        session.barrierTimeoutMs = static_cast<uint32_t>(std::clamp(ini.getInt("story", "barrier_timeout", 120), 10, 1800)) * 1000u;
+        session.sharedFail = ini.getBool("story", "shared_fail", true);
+        session.spectate = ini.getBool("story", "spectate", true);
+        session.syncWaypoints = ini.getBool("story", "sync_waypoints", true);
         session.regroupDistance = std::clamp(ini.getFloat("sync", "regroup_distance", 150.0f), 20.0f, 5000.0f);
         session.npcRadius = std::clamp(ini.getFloat("sync", "radius", 150.0f), 30.0f, 400.0f);
         session.maxPeds = std::clamp(ini.getInt("sync", "max_peds", 64), 0, 200);
@@ -148,6 +158,7 @@ struct Settings {
         toggleKey = ini.get("keys", "toggle", "F7");
         teleportKey = ini.get("keys", "teleport_to_friend", "F8");
         hudKey = ini.get("keys", "hud", "F9");
+        saveKey = ini.get("keys", "get_host_save", "F10");
         showHud = ini.getBool("hud", "show", true);
     }
 };
@@ -159,6 +170,7 @@ public:
         toggle_ = Hotkey(parseKey(settings_.toggleKey));
         teleport_ = Hotkey(parseKey(settings_.teleportKey));
         hud_ = Hotkey(parseKey(settings_.hudKey));
+        save_ = Hotkey(parseKey(settings_.saveKey));
         showHud_ = settings_.showHud;
         logLine("RDR2 Co-op started: role=%s connection=%s%s%s", settings_.role == Role::Host ? "host" : "guest",
                 settings_.viaRelay ? "relay" : "direct", settings_.problem.empty() ? "" : " CONFIG ERROR: ",
@@ -188,6 +200,11 @@ public:
                 if (!session_->teleportToPeer()) notify(now, "Friend's position is not known yet");
             }
             if (hud_.pressed()) showHud_ = !showHud_;
+            if (save_.pressed()) {
+                if (settings_.role != Role::Guest) notify(now, "Only the guest copies the host's save");
+                else if (!session_ || !link_->connected()) notify(now, "Connect to the host first");
+                else if (!session_->requestHostSave()) notify(now, "A save transfer is already running");
+            }
 
             if (online_) {
                 session_->tick(now);
@@ -215,6 +232,7 @@ private:
         config.local.role = settings_.role;
         config.local.name = settings_.name;
         config.local.avatar = settings_.avatar;
+        config.local.storyMode = settings_.session.storyMode;
         config.viaRelay = settings_.viaRelay;
         config.room = settings_.room;
         config.listen = !settings_.viaRelay && settings_.role == Role::Host;
@@ -231,6 +249,7 @@ private:
         link_ = std::make_unique<Link>();
         link_->start(&socket_, config, now);
         session_ = std::make_unique<CoopSession>(game_, *link_, settings_.session);
+        session_->setSaveStore(&saves_);
         online_ = true;
         g_reconnect = true;
         lastState_ = Link::State::Idle;
@@ -326,7 +345,17 @@ private:
                               st.syncedEntities, workUs_ / 1000.0, natives_);
                 drawText(line, x, y += 0.026f, 0.28f, 220, 220, 220);
             }
-            if (st.peerInCutscene) drawText("Host is in a cutscene", x, y += 0.026f, 0.28f, 240, 220, 120);
+            const char* storyLine = nullptr;
+            if (st.holding) storyLine = "Waiting for your friend - the world is paused";
+            else if (st.spectating) storyLine = "Watching the host's cutscene";
+            else if (st.peerInCutscene) storyLine = "Your friend is in a cutscene";
+            if (storyLine) drawText(storyLine, x, y += 0.026f, 0.28f, 240, 220, 120);
+            if (st.missionMismatch) drawText("Different missions! Load the same save to play the story together", x,
+                                             y += 0.026f, 0.28f, 255, 110, 90);
+            if (st.saveProgress >= 0) {
+                std::snprintf(line, sizeof(line), "Save transfer: %d%%", st.saveProgress);
+                drawText(line, x, y += 0.026f, 0.28f, 240, 220, 120);
+            }
         }
         if (!notice_.empty() && static_cast<int32_t>(noticeUntil_ - now) > 0)
             drawText(notice_, x, y + 0.03f, 0.32f, 255, 255, 255);
@@ -340,7 +369,8 @@ private:
     bool online_ = false;
     bool showHud_ = true;
     Link::State lastState_ = Link::State::Idle;
-    Hotkey toggle_, teleport_, hud_;
+    Hotkey toggle_, teleport_, hud_, save_;
+    Rdr2SaveStore saves_;
     std::string notice_;
     uint32_t noticeUntil_ = 0;
     double workUs_ = 0, natives_ = 0;

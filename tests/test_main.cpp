@@ -116,7 +116,8 @@ public:
         std::string label;
         bool hasGoal = false, steered = false;
         bool parked = false;
-        uint32_t outfit = 0;
+        bool harmless = false;
+        uint32_t outfit = 0, script = 0;
         int faces = 0, updates = 0;  // updates: any driving call (task, nudge, face, steer)
         mutable int queries = 0;     // position / health reads
         Vec3 goal;
@@ -140,6 +141,12 @@ public:
     int spawns = 0, removals = 0, prefetches = 0;
     uint32_t playerOutfit = 0;
     bool playerProtected = false;
+    bool held = false;
+    uint32_t missionScript = 0;
+    bool cameraValid = false, spectating = false;
+    CameraState camera, spectateCam;
+    bool waypoint = false, friendWaypoint = false;
+    Vec3 waypointPos, friendWaypointPos;
 
     FakeGame() {
         playerPed = add(EntityKind::Ped, joaat("player"), {});
@@ -220,6 +227,31 @@ public:
     void teleportLocalPlayer(const Vec3& pos) override { player.pos = pos; }
     uint32_t localOutfit() override { return playerOutfit; }
     void setLocalProtected(bool on) override { playerProtected = on; }
+    void killLocalPlayer() override { playerHealth = 0; }
+    void holdWorld(bool on) override { held = on; }
+    uint32_t localMissionScript() override { return missionScript; }
+    void listMissionEntities(std::vector<MissionEntity>& out) override {
+        for (auto& [h, e] : ents)
+            if (e.mission && !e.ours && !belongsToLocalPlayer(h)) out.push_back({h, e.kind, e.model, e.script, e.pos});
+    }
+    void setHarmless(EntityHandle h, bool on) override { ents.at(h).harmless = on; }
+    void revive(EntityHandle h, int health) override { ents.at(h).health = health; }
+    bool readCamera(CameraState& out) override {
+        out = camera;
+        return cameraValid;
+    }
+    void spectate(bool on, const CameraState& cam) override {
+        spectating = on;
+        spectateCam = cam;
+    }
+    bool readWaypoint(Vec3& out) override {
+        out = waypointPos;
+        return waypoint;
+    }
+    void showFriendWaypoint(bool on, const Vec3& pos) override {
+        friendWaypoint = on;
+        friendWaypointPos = pos;
+    }
     bool belongsToLocalPlayer(EntityHandle h) override {
         return h == playerPed || h == ownHorse || (h && (h == playerMount || h == playerVehicle));
     }
@@ -237,6 +269,7 @@ public:
         out.state.kind = e.kind;
         out.state.model = e.model;
         out.state.outfit = e.outfit;
+        out.state.script = e.mission ? e.script : 0;
         out.state.pos = e.pos;
         out.state.vel = e.vel;
         out.state.heading = e.heading;
@@ -250,7 +283,7 @@ public:
     }
     void listForeign(std::vector<ForeignEntity>& out) override {
         for (auto& [h, e] : ents)
-            if (h != playerPed) out.push_back({h, e.draftOf});
+            if (h != playerPed) out.push_back({h, e.draftOf, e.mission});
     }
     WorldInfo readWorldInfo() override { return world; }
     void applyWorldInfo(const WorldInfo& info, bool clock, bool weather) override {
@@ -418,11 +451,15 @@ struct Pair {
     std::unique_ptr<CoopSession> host, guest;
     uint32_t now = 1000;
     std::function<void()> perFrame;
+    StoryMode hostStory = StoryMode::Shared, guestStory = StoryMode::Shared;
 
     void start() {
         net.now = now;
-        hostLink.start(hostSock, hostConfig(), now);
-        guestLink.start(guestSock, guestConfig(), now);
+        LinkConfig hc = hostConfig(), gc = guestConfig();
+        hc.local.storyMode = hostStory;
+        gc.local.storyMode = guestStory;
+        hostLink.start(hostSock, hc, now);
+        guestLink.start(guestSock, gc, now);
         host = std::make_unique<CoopSession>(hostGame, hostLink, config);
         guest = std::make_unique<CoopSession>(guestGame, guestLink, config);
     }
@@ -789,7 +826,9 @@ static void testRelay() {
 }
 
 static void testSessionSharedWorld() {
-    Pair p;
+    Pair p;  // host-world story mode: the guest's own story entities are hidden while visiting
+    p.config.storyMode = StoryMode::HostWorld;
+    p.hostStory = p.guestStory = StoryMode::HostWorld;
     const uint32_t kOutlaw = joaat("g_m_m_uniduster_01");
     const uint32_t kHorse = joaat("a_c_horse_morgan_bay");
     const uint32_t kWagon = joaat("wagon02x");
@@ -1221,6 +1260,8 @@ static void testPoolHysteresisAndLod() {
 
 static void testCutsceneRegroupAndAppearance() {
     Pair p;
+    p.config.storyMode = StoryMode::HostWorld;
+    p.hostStory = p.guestStory = StoryMode::HostWorld;
     p.hostGame.player.pos = {0, 0, 0};
     p.guestGame.player.pos = {800, 0, 0};
     p.guestGame.playerOutfit = 0x5555u;
@@ -1268,6 +1309,252 @@ static void testCutsceneRegroupAndAppearance() {
     CHECK(idleRate * 2 < movingRate);
 }
 
+
+class MemorySaveStore : public ISaveStore {
+public:
+    std::vector<uint8_t> latest;
+    std::vector<std::vector<uint8_t>> written;
+    bool readLatest(std::vector<uint8_t>& data, std::string& name) override {
+        if (latest.empty()) return false;
+        data = latest;
+        name = "SRDR30003";
+        return true;
+    }
+    bool writeCopy(const std::vector<uint8_t>& data, std::string& placedAs, std::string&) override {
+        written.push_back(data);
+        placedAs = "SRDR30007";
+        return true;
+    }
+};
+
+static bool sawNotice(CoopSession& s, const char* needle) {
+    std::string text;
+    bool seen = false;
+    while (s.popNotice(text)) seen = seen || text.find(needle) != std::string::npos;
+    return seen;
+}
+
+static void testSharedStoryMissionEntities() {
+    // Both run the same mission: each game has its own copy of the gang and the enemies.
+    Pair p;
+    const uint32_t kScript = joaat("mission_script_x");
+    const uint32_t kOutlaw = joaat("g_m_m_uniduster_01"), kDutch = joaat("cs_dutch");
+    p.hostGame.player.pos = {0, 0, 0};
+    p.guestGame.player.pos = {2, 0, 0};
+    auto missionPed = [&](FakeGame& g, uint32_t model, Vec3 pos) {
+        EntityHandle h = g.addPed(model, pos);
+        g.ents[h].mission = true;
+        g.ents[h].script = kScript;
+        return h;
+    };
+    EntityHandle hostEnemy = missionPed(p.hostGame, kOutlaw, {20, 0, 0});
+    EntityHandle hostEnemy2 = missionPed(p.hostGame, kOutlaw, {22, 5, 0});
+    EntityHandle hostDutch = missionPed(p.hostGame, kDutch, {3, 3, 0});
+    EntityHandle hostOnly = missionPed(p.hostGame, joaat("cs_hosea"), {6, 6, 0});
+    // The guest's copies spawned by its own mission script, slightly elsewhere (their AI differs a bit).
+    EntityHandle guestEnemy = missionPed(p.guestGame, kOutlaw, {21, 1, 0});
+    EntityHandle guestEnemy2 = missionPed(p.guestGame, kOutlaw, {23, 6, 0});
+    EntityHandle guestDutch = missionPed(p.guestGame, kDutch, {4, 2, 0});
+    EntityHandle guestOnly = missionPed(p.guestGame, joaat("cs_bill"), {9, 9, 0});
+    p.guestGame.ents[guestOnly].script = joaat("other_script");
+    p.start();
+    p.run(1200);
+
+    // Linked, not duplicated: no stand-ins for the enemies or Dutch, the guest's own copies are used.
+    CHECK(p.guestGame.find(SpawnRole::Mirror, kOutlaw) == 0 && p.guestGame.find(SpawnRole::Mirror, kDutch) == 0);
+    CHECK(p.guestGame.ents[guestEnemy].harmless && p.guestGame.ents[guestDutch].harmless);
+    CHECK(p.guestGame.find(SpawnRole::Mirror, joaat("cs_hosea")) == 0);  // still waiting for a twin
+    p.run(2500);
+    CHECK(p.guestGame.find(SpawnRole::Mirror, joaat("cs_hosea")) != 0);  // none came: a stand-in is shown
+    // Copies are kept where the host's are; the guest-only ped is left alone.
+    CHECK(distance(p.guestGame.ents[guestEnemy].pos, p.hostGame.ents[hostEnemy].pos) < 0.8f);
+    CHECK(p.guestGame.ents.count(guestOnly) && !p.guestGame.ents[guestOnly].hidden && !p.guestGame.ents[guestOnly].harmless);
+
+    // The host kills an enemy: the guest's copy dies too (the guest's mission counts the kill).
+    p.hostGame.playerShoots(hostEnemy, 500);
+    p.run(500);
+    CHECK(p.guestGame.ents.count(guestEnemy) && p.guestGame.ents[guestEnemy].health == 0);
+    // The guest shoots its copy of the second enemy: the host's real one takes the hit.
+    p.guestGame.playerShoots(guestEnemy2, 35);
+    p.run(500);
+    CHECK(p.hostGame.ents[hostEnemy2].health == 65);
+    CHECK(p.guestGame.ents[guestEnemy2].health == 65);
+    // A copy that dies only locally (killed by local AI, not by the guest) is not counted: it comes back.
+    p.guestGame.ents[guestDutch].health = 0;
+    p.run(2500);
+    CHECK(p.guestGame.ents[guestDutch].health > 0);
+    (void)hostDutch;
+    (void)hostOnly;
+
+    // The mission ends on the host: its entities go away -> the guest's copies are released, not deleted.
+    p.hostGame.remove(hostEnemy2);
+    p.run(500);
+    CHECK(p.guestGame.ents.count(guestEnemy2) && !p.guestGame.ents[guestEnemy2].harmless);
+}
+
+static void testSharedStoryFlow() {
+    Pair p;
+    MemorySaveStore hostSaves, guestSaves;
+    std::mt19937 rng(3);
+    for (int i = 0; i < 300000; ++i) hostSaves.latest.push_back(static_cast<uint8_t>(rng()));
+    p.hostGame.player.pos = {0, 0, 0};
+    p.guestGame.player.pos = {100, 0, 0};
+    p.net.loss = 0.05;
+    p.net.latencyMs = 40;
+    p.start();
+    p.host->setSaveStore(&hostSaves);
+    p.guest->setSaveStore(&guestSaves);
+    p.run(1500);
+
+    // One key: the guest gets the host's save.
+    CHECK(p.guest->requestHostSave());
+    p.run(200);
+    CHECK(p.guest->status().saveProgress >= 0);
+    p.run(8000);
+    CHECK(guestSaves.written.size() == 1 && guestSaves.written[0] == hostSaves.latest);
+    CHECK(sawNotice(*p.guest, "SRDR30007"));
+    CHECK(p.hostGame.find(SpawnRole::PlayerPuppet) != 0);  // the game kept running meanwhile
+
+    // The host starts a mission: the guest is moved to the start and told to start it too.
+    p.hostGame.player.flags = PF_InMission | PF_Cutscene;
+    p.hostGame.missionScript = joaat("mission_a");
+    p.run(400);
+    CHECK(distance(p.guestGame.player.pos, Vec3{0, 0, 0}) < 3.0f);
+    CHECK(sawNotice(*p.guest, "start it here too"));
+    // The host's scene ends before the guest has even started: the host waits.
+    p.run(1000);
+    p.hostGame.player.flags = PF_InMission;
+    p.run(300);
+    CHECK(p.hostGame.held && p.host->status().holding);
+    // The guest starts the mission and watches its own cutscene; the host keeps waiting.
+    p.guestGame.player.flags = PF_InMission | PF_Cutscene;
+    p.guestGame.missionScript = joaat("mission_a");
+    p.run(3000);
+    CHECK(p.hostGame.held);
+    CHECK((p.guest->status().peerInCutscene) == false);
+    // The guest's scene ends: both continue together (after a short settle).
+    p.guestGame.player.flags = PF_InMission;
+    p.run(2500);
+    CHECK(!p.hostGame.held && !p.guestGame.held);
+    CHECK(!p.host->status().missionMismatch);
+
+    // Both in a scene again; the guest finishes first this time and waits for the host.
+    p.hostGame.player.flags = p.guestGame.player.flags = PF_InMission | PF_Cutscene;
+    p.run(1000);
+    p.guestGame.player.flags = PF_InMission;
+    p.run(1000);
+    CHECK(p.guestGame.held && !p.hostGame.held);
+    p.hostGame.player.flags = PF_InMission;
+    p.run(2500);
+    CHECK(!p.guestGame.held);
+
+    // Shared failure: the guest dies in the mission -> the host's mission fails too (no echo back).
+    p.guestGame.playerHealth = 0;
+    p.run(800);
+    CHECK(p.hostGame.playerHealth == 0);
+    CHECK(sawNotice(*p.host, "restarts for both"));
+    p.hostGame.playerHealth = 200;
+    p.guestGame.playerHealth = 200;
+    p.run(1000);
+    CHECK(p.guestGame.playerHealth == 200 && p.hostGame.playerHealth == 200);
+
+    // The host dies while the guest watches a scene: the guest's mission fails once the scene is over.
+    p.guestGame.player.flags = PF_InMission | PF_Cutscene;
+    p.run(2500);
+    p.hostGame.playerHealth = 0;
+    p.run(1500);
+    CHECK(p.guestGame.playerHealth == 200);  // not in the middle of the scene
+    p.hostGame.playerHealth = 200;
+    p.guestGame.player.flags = PF_InMission;
+    p.run(500);
+    CHECK(p.guestGame.playerHealth == 0);
+    p.guestGame.playerHealth = 200;
+    p.run(1000);
+    CHECK(p.hostGame.playerHealth == 200);  // no echo back to the host
+
+    // Different missions are reported.
+    p.guestGame.missionScript = joaat("mission_b");
+    p.run(2500);
+    CHECK(p.host->status().missionMismatch && p.guest->status().missionMismatch);
+    CHECK(sawNotice(*p.guest, "different missions"));
+    // ... and nobody waits for a scene of another mission.
+    p.hostGame.player.flags = p.guestGame.player.flags = PF_InMission | PF_Cutscene;
+    p.run(1500);
+    p.hostGame.player.flags = PF_InMission;
+    p.run(600);
+    CHECK(!p.hostGame.held);
+    p.guestGame.player.flags = PF_InMission;
+    p.guestGame.missionScript = joaat("mission_a");
+    p.run(1500);
+
+    // Waypoints travel both ways.
+    p.hostGame.player.flags = p.guestGame.player.flags = 0;
+    p.hostGame.waypoint = true;
+    p.hostGame.waypointPos = {1234, -567, 0};
+    p.run(1200);
+    CHECK(p.guestGame.friendWaypoint && distance(p.guestGame.friendWaypointPos, Vec3{1234, -567, 0}) < 0.01f);
+    p.hostGame.waypoint = false;
+    p.run(1200);
+    CHECK(!p.guestGame.friendWaypoint);
+    p.guestGame.waypoint = true;
+    p.guestGame.waypointPos = {10, 20, 0};
+    p.run(1200);
+    CHECK(p.hostGame.friendWaypoint && distance(p.hostGame.friendWaypointPos, Vec3{10, 20, 0}) < 0.01f);
+
+    // Disconnect while waiting: nothing stays frozen.
+    p.hostGame.player.flags = p.guestGame.player.flags = PF_InMission | PF_Cutscene;
+    p.run(500);
+    p.guestGame.player.flags = PF_InMission;
+    p.run(500);
+    CHECK(p.guestGame.held);
+    p.hostLink.stop();
+    p.run(300);
+    CHECK(!p.guestGame.held && !p.guestGame.playerProtected && !p.guestGame.friendWaypoint);
+
+    // Both players must use the same story mode.
+    Pair q;
+    q.guestStory = StoryMode::HostWorld;
+    q.start();
+    q.run(1500);
+    CHECK(!q.guestLink.connected() && q.guestLink.error().find("story") != std::string::npos);
+}
+
+static void testSpectatorCamera() {
+    // Host world: the guest watches the host's scene through the host's camera.
+    Pair p;
+    p.config.storyMode = StoryMode::HostWorld;
+    p.hostStory = p.guestStory = StoryMode::HostWorld;
+    p.hostGame.player.pos = {0, 0, 0};
+    p.guestGame.player.pos = {50, 0, 0};
+    p.start();
+    p.run(1500);
+    p.hostGame.player.flags = PF_InMission | PF_Cutscene;
+    p.hostGame.cameraValid = true;
+    float t = 0;
+    p.perFrame = [&] {
+        t += 0.016f;
+        p.hostGame.camera.pos = {10 + 2 * t, 5, 3};
+        p.hostGame.camera.rot = {-10, 0, 90 + 10 * t};
+        p.hostGame.camera.fov = 40;
+    };
+    p.run(2000);
+    CHECK(p.guestGame.spectating && p.guest->status().spectating);
+    CHECK(p.guestGame.playerProtected);
+    Vec3 hostCam = p.hostGame.camera.pos;
+    float lag = distance(p.guestGame.spectateCam.pos, hostCam);
+    std::printf("  spectator: camera %.2f m behind the host's (moving 2 m/s)\n", lag);
+    CHECK(lag < 0.6f);
+    CHECK(std::abs(p.guestGame.spectateCam.fov - 40) < 0.1f);
+    CHECK(std::abs(angleDelta(p.guestGame.spectateCam.rot.z, p.hostGame.camera.rot.z)) < 3.0f);
+    p.perFrame = nullptr;
+    p.hostGame.player.flags = PF_InMission;
+    p.hostGame.cameraValid = false;
+    p.run(800);
+    CHECK(!p.guestGame.spectating && !p.guestGame.playerProtected);
+    // The scene ended within regroup distance (50 m < 150 m): the guest stays where they are.
+    CHECK(distance(p.guestGame.player.pos, Vec3{50, 0, 0}) < 0.5f);
+}
+
 static void testUdpLoopback() {
     UdpSocket a, b;
     std::string error;
@@ -1304,6 +1591,9 @@ int main() {
         {"session: bandwidth and level of detail", testBandwidthAndLod},
         {"session: pool, hysteresis, cpu lod, outfits", testPoolHysteresisAndLod},
         {"session: cutscenes, regroup, appearance, idle rate", testCutsceneRegroupAndAppearance},
+        {"story: linked mission entities", testSharedStoryMissionEntities},
+        {"story: save copy, mission start, cutscene barrier, shared fail, waypoints", testSharedStoryFlow},
+        {"story: spectator camera (host world)", testSpectatorCamera},
         {"udp loopback", testUdpLoopback},
     };
     for (const Test& t : tests) {

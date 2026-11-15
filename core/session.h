@@ -17,21 +17,12 @@
 #include "game_api.h"
 #include "interp.h"
 #include "link.h"
+#include "session_config.h"
+#include "story.h"
 
 namespace coop {
 
-struct SessionConfig {
-    bool worldSync = true;       // stream the host's world to the guest
-    bool friendlyFire = false;   // let players hurt each other
-    bool syncClock = true;
-    bool syncWeather = true;
-    bool softCorrection = true;  // nudge remote characters onto their path instead of only re-tasking
-    bool autoRegroup = true;     // guest: jump to the host when a mission starts or a cutscene ends far away
-    float regroupDistance = 150.0f;
-    float npcRadius = 150.0f;
-    int maxPeds = 64;
-    int maxVehicles = 16;
-};
+
 
 struct SessionStatus {
     bool peerVisible = false;
@@ -40,6 +31,10 @@ struct SessionStatus {
     bool peerDead = false;
     bool peerInMission = false;
     bool peerInCutscene = false;
+    bool holding = false;        // waiting for the friend to finish a cutscene (world frozen)
+    bool spectating = false;     // watching the host's cutscene through their camera
+    bool missionMismatch = false;
+    int saveProgress = -1;
     int syncedEntities = 0;      // host: entities streamed; guest: mirrors shown
     int bufferMs = 0;            // current smoothing delay for the friend's character
 };
@@ -58,6 +53,9 @@ public:
     const SessionStatus& status() const { return status_; }
     // Things worth telling the player ("Host started a mission"); returns false when none are left.
     bool popNotice(std::string& out);
+    // Shared story: the guest asks the host for their save (stored in a free slot).
+    bool requestHostSave() { return story_.requestHostSave(); }
+    void setSaveStore(ISaveStore* store) { story_.setSaveStore(store); }
 
 private:
     // Keeps track of how a driven entity was last told to move, so tasks are not re-issued
@@ -116,7 +114,9 @@ private:
         int expectedHealth = 0;
         uint32_t deadSinceMs = 0, lastShotMs = 0, lastUpdateMs = 0;
         uint32_t outfitApplied = 0;
+        uint32_t firstHeardMs = 0;
         bool ragdolled = false;
+        bool bound = false;          // shared story: drives the guest's own copy of this mission entity
     };
 
     // Guest side: mirrors that left the stream, kept invisible for quick reuse.
@@ -140,13 +140,14 @@ private:
 
     void movePed(EntityHandle h, Mover& m, const MotionSample& target, float dt, uint32_t nowMs);
     void steerVehicle(EntityHandle h, Mover& m, const MotionSample& target, float dt);
-    void forwardDamage(EntityHandle h, int& expectedHealth, uint16_t target);
+    void forwardDamage(EntityHandle h, int& expectedHealth, uint16_t target, bool onlyLocalPlayer = false);
     Vec3 refPosition(uint16_t ref, bool& found);
     EntityHandle resolveRef(uint16_t ref);
     uint16_t refOf(EntityHandle h);
     bool isSessionEntity(EntityHandle h) const;
     void sendAppearance(uint32_t nowMs);
-    void followHost(uint32_t nowMs);
+    void bindMissionEntities(uint32_t nowMs);
+    void followBound(EntityHandle h, const MotionSample& target, float dt);
     void notice(const std::string& text);
     void destroyPuppet();
     void destroyMirror(Mirror& m, bool recycle);
@@ -172,10 +173,10 @@ private:
     bool lastSentMoving_ = false;
     uint32_t lastOutfitCheckMs_ = 0, sentOutfit_ = 0;
     bool appearanceSent_ = false;
-    uint16_t prevPeerFlags_ = 0;
-    bool protected_ = false;
-    bool regroupPending_ = false;
     std::vector<std::string> notices_;
+    StorySync story_;
+    std::vector<MissionEntity> missionLocal_;
+    uint32_t lastMissionScanMs_ = 0;
     uint32_t frame_ = 0;
     uint32_t lastWorldMs_ = 0;
     uint32_t lastInfoMs_ = 0;

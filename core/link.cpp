@@ -191,6 +191,13 @@ void Link::handleHello(const Endpoint& from, ByteReader& r, uint32_t nowMs) {
         else fail(why);
         return;
     }
+    if (hello.storyMode != config_.local.storyMode) {
+        const char* why = "different story modes: set the same [story] mode in both RDR2Coop.ini files";
+        if (nowMs - lastHelloMs_ >= kHelloIntervalMs / 2) sendHello(from, nowMs);
+        if (config_.listen && !config_.viaRelay) error_ = why;
+        else fail(why);
+        return;
+    }
     bool newSession = state_ != State::Connected || hello.nonce != peer_.nonce;
     if (newSession) {
         resetSession();

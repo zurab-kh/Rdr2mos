@@ -5,6 +5,7 @@
 // The expensive readEntity() is only called for entities whose update is due.
 #pragma once
 #include <cstdint>
+#include <string>
 #include <vector>
 #include "protocol.h"
 
@@ -41,6 +42,26 @@ struct EntityRead {
 struct ForeignEntity {
     EntityHandle handle = 0;
     EntityHandle draftOf = 0;   // for draft animals: the vehicle they pull
+    bool mission = false;       // owned by a story script
+};
+
+// An entity owned by a local story script (shared story: the local copy of a mission NPC).
+struct MissionEntity {
+    EntityHandle handle = 0;
+    EntityKind kind = EntityKind::Ped;
+    uint32_t model = 0;
+    uint32_t script = 0;
+    Vec3 pos;
+};
+
+// Where save games live. Implemented by the plugin with the real save folder.
+class ISaveStore {
+public:
+    virtual ~ISaveStore() = default;
+    // The most recent save of the local player.
+    virtual bool readLatest(std::vector<uint8_t>& data, std::string& name) = 0;
+    // Stores a copy in a free slot, never overwriting anything. `placedAs` names the slot.
+    virtual bool writeCopy(const std::vector<uint8_t>& data, std::string& placedAs, std::string& error) = 0;
 };
 
 enum class ForeignAction { Deleted, Hidden };
@@ -60,6 +81,25 @@ public:
     virtual uint32_t localOutfit() = 0;                 // meta outfit hash of the player's character, 0 = unknown
     // Guest during the host's cutscenes: nobody can help them, so they cannot be hurt.
     virtual void setLocalProtected(bool on) = 0;
+    virtual void killLocalPlayer() = 0;                 // shared mission failure
+    // Cutscene barrier: freezes time and input and fades the screen until released.
+    virtual void holdWorld(bool on) = 0;
+
+    // --- story
+    // Hash of the story script running the current mission, 0 in free roam.
+    virtual uint32_t localMissionScript() = 0;
+    // Entities owned by local story scripts (not created by the mod, not the player's own).
+    virtual void listMissionEntities(std::vector<MissionEntity>& out) = 0;
+    // A linked local mission NPC keeps its own AI, but its weapons no longer hurt the local
+    // player: the other machine decides that damage.
+    virtual void setHarmless(EntityHandle h, bool on) = 0;
+    virtual void revive(EntityHandle h, int health) = 0;
+    // Camera: what the screen shows, and a script camera that follows the friend's view.
+    virtual bool readCamera(CameraState& out) = 0;
+    virtual void spectate(bool on, const CameraState& cam) = 0;  // call every frame while on
+    // Map waypoints.
+    virtual bool readWaypoint(Vec3& out) = 0;
+    virtual void showFriendWaypoint(bool on, const Vec3& pos) = 0;
     // The player, their current mount and their own horses: never mirrored, never removed.
     virtual bool belongsToLocalPlayer(EntityHandle h) = 0;
 
