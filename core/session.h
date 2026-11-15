@@ -26,6 +26,8 @@ struct SessionConfig {
     bool syncClock = true;
     bool syncWeather = true;
     bool softCorrection = true;  // nudge remote characters onto their path instead of only re-tasking
+    bool autoRegroup = true;     // guest: jump to the host when a mission starts or a cutscene ends far away
+    float regroupDistance = 150.0f;
     float npcRadius = 150.0f;
     int maxPeds = 64;
     int maxVehicles = 16;
@@ -37,6 +39,7 @@ struct SessionStatus {
     float peerDistance = 0;
     bool peerDead = false;
     bool peerInMission = false;
+    bool peerInCutscene = false;
     int syncedEntities = 0;      // host: entities streamed; guest: mirrors shown
     int bufferMs = 0;            // current smoothing delay for the friend's character
 };
@@ -53,6 +56,8 @@ public:
     bool teleportToPeer();
 
     const SessionStatus& status() const { return status_; }
+    // Things worth telling the player ("Host started a mission"); returns false when none are left.
+    bool popNotice(std::string& out);
 
 private:
     // Keeps track of how a driven entity was last told to move, so tasks are not re-issued
@@ -60,6 +65,7 @@ private:
     struct Mover {
         enum Mode { None, Idle, Moving } mode = None;
         uint32_t lastTaskMs = 0;
+        uint32_t lastFaceMs = 0;
         Vec3 lastGoal;
         float lastSpeed = 0;
     };
@@ -79,6 +85,7 @@ private:
         MotionBuffer motion{40, 300};
         PlayerState state;
         bool haveState = false;
+        uint32_t outfit = 0, outfitApplied = 0;
     };
 
     // Host side: an entity of the host's world that is being streamed.
@@ -107,8 +114,17 @@ private:
         int seat = -1;
         uint32_t weapon = 0;
         int expectedHealth = 0;
-        uint32_t deadSinceMs = 0, lastShotMs = 0;
+        uint32_t deadSinceMs = 0, lastShotMs = 0, lastUpdateMs = 0;
+        uint32_t outfitApplied = 0;
         bool ragdolled = false;
+    };
+
+    // Guest side: mirrors that left the stream, kept invisible for quick reuse.
+    struct Parked {
+        EntityHandle handle = 0;
+        EntityKind kind = EntityKind::Ped;
+        uint32_t model = 0;
+        uint32_t sinceMs = 0;
     };
 
     void handleMessages(uint32_t nowMs);
@@ -129,8 +145,14 @@ private:
     EntityHandle resolveRef(uint16_t ref);
     uint16_t refOf(EntityHandle h);
     bool isSessionEntity(EntityHandle h) const;
+    void sendAppearance(uint32_t nowMs);
+    void followHost(uint32_t nowMs);
+    void notice(const std::string& text);
     void destroyPuppet();
-    void destroyMirror(Mirror& m);
+    void destroyMirror(Mirror& m, bool recycle);
+    EntityHandle obtain(EntityKind kind, uint32_t model, const Vec3& pos, float heading);
+    bool inPool(EntityHandle h) const;
+    void flushPool(uint32_t nowMs, bool all);
     uint16_t allocateId();
     bool isHost() const { return link_.local().role == Role::Host; }
 
@@ -147,6 +169,14 @@ private:
     bool haveLocal_ = false;
     uint32_t lastStateMs_ = 0;
     uint16_t lastSentFlags_ = 0;
+    bool lastSentMoving_ = false;
+    uint32_t lastOutfitCheckMs_ = 0, sentOutfit_ = 0;
+    bool appearanceSent_ = false;
+    uint16_t prevPeerFlags_ = 0;
+    bool protected_ = false;
+    bool regroupPending_ = false;
+    std::vector<std::string> notices_;
+    uint32_t frame_ = 0;
     uint32_t lastWorldMs_ = 0;
     uint32_t lastInfoMs_ = 0;
     uint32_t lastForeignMs_ = 0;
@@ -160,6 +190,7 @@ private:
     std::unordered_map<uint16_t, Mirror> mirrors_;
     std::unordered_map<EntityHandle, uint16_t> mirrorByHandle_;
     std::unordered_set<EntityHandle> hidden_;
+    std::vector<Parked> pool_;
     bool hostWorldSync_ = false;
 
     // scratch buffers reused every tick (no per-frame allocations)
@@ -170,6 +201,7 @@ private:
     std::vector<std::vector<uint8_t>> packets_;
     std::vector<ForeignEntity> foreign_;
     std::vector<Mirror*> spawnQueue_;
+    std::vector<uint32_t> prefetched_;
 };
 
 }  // namespace coop

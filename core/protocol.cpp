@@ -119,7 +119,7 @@ bool read(ByteReader& r, PlayerState& v) {
 // ---------------------------------------------------------------- entities
 size_t encodedSize(const EntityState& e, const Vec3& anchor) {
     size_t n = 3;  // id + field mask
-    if (e.fields & EF_Static) n += 5;
+    if (e.fields & EF_Static) n += 9;
     if (e.fields & EF_Pos) n += relativeFits(e.pos, anchor) ? 6 : 12;
     if (e.fields & EF_Heading) n += 2;
     if (e.fields & EF_Tilt) n += 2;
@@ -138,6 +138,7 @@ static void writeEntity(ByteWriter& w, const EntityState& e, const Vec3& anchor)
     if (fields & EF_Static) {
         w.u8(static_cast<uint8_t>(e.kind));
         w.u32(e.model);
+        w.u32(e.outfit);
     }
     if (fields & EF_Pos) {
         if (far) {
@@ -178,6 +179,7 @@ static bool readEntity(ByteReader& r, EntityState& e, const Vec3& anchor) {
         if (kind > 1) return false;
         e.kind = static_cast<EntityKind>(kind);
         e.model = r.u32();
+        e.outfit = r.u32();
     }
     if (fields & EF_Pos) {
         if (fields & EF_FarPos) {
@@ -276,6 +278,12 @@ void write(ByteWriter& w, const Damage& v) {
 bool read(ByteReader& r, Damage& v) {
     v.target = r.u16();
     v.amount = r.u16();
+    return r.ok();
+}
+
+void write(ByteWriter& w, const Appearance& v) { w.u32(v.outfit); }
+bool read(ByteReader& r, Appearance& v) {
+    v.outfit = r.u32();
     return r.ok();
 }
 

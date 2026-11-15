@@ -17,6 +17,11 @@ constexpr uint32_t kForeignScanMs = 500;
 constexpr uint32_t kRespawnGraceMs = 1500;
 constexpr uint32_t kOwnRideKeepMs = 30000;
 constexpr int kSpawnsPerFrame = 3;
+constexpr uint32_t kIdlePlayerIntervalMs = 200;  // standing still: 5 Hz is plenty
+constexpr uint32_t kOutfitCheckMs = 2000;
+constexpr float kStreamHysteresis = 20.0f;       // entities leave the stream this much further out than they enter
+constexpr size_t kPoolSize = 24;
+constexpr uint32_t kPoolKeepMs = 10000;
 
 constexpr int kGroupPos = 0, kGroupHeading = 1, kGroupTilt = 2, kGroupVel = 3, kGroupHealth = 4, kGroupState = 5,
               kGroupStatic = 6;
@@ -70,9 +75,12 @@ void CoopSession::tick(uint32_t nowMs) {
     bool ready = game_.ready();
     handleMessages(nowMs);
     if (ready) {
+        ++frame_;
         sendLocalState(nowMs);
+        sendAppearance(nowMs);
         if (isHost()) sendWorld(nowMs);
         updatePuppet(nowMs, dt);
+        if (!isHost()) followHost(nowMs);
         if (!isHost()) {
             if (config_.worldSync && hostWorldSync_) {
                 game_.suppressAmbientPopulation();
@@ -86,10 +94,22 @@ void CoopSession::tick(uint32_t nowMs) {
     link_.flush(nowMs);
 }
 
+bool CoopSession::popNotice(std::string& out) {
+    if (notices_.empty()) return false;
+    out = notices_.front();
+    notices_.erase(notices_.begin());
+    return true;
+}
+
+void CoopSession::notice(const std::string& text) {
+    if (notices_.size() < 8) notices_.push_back(text);
+}
+
 void CoopSession::restoreWorld() {
-    for (auto& [id, m] : mirrors_) destroyMirror(m);
+    for (auto& [id, m] : mirrors_) destroyMirror(m, false);
     mirrors_.clear();
     mirrorByHandle_.clear();
+    flushPool(0, true);
     for (EntityHandle h : hidden_)
         if (game_.exists(h)) game_.restoreForeign(h);
     hidden_.clear();
@@ -107,6 +127,13 @@ void CoopSession::cleanup() {
     haveLocal_ = false;
     lastStateMs_ = lastWorldMs_ = lastInfoMs_ = lastForeignMs_ = 0;
     lastSentFlags_ = 0;
+    lastSentMoving_ = false;
+    lastOutfitCheckMs_ = sentOutfit_ = 0;
+    appearanceSent_ = false;
+    prevPeerFlags_ = 0;
+    regroupPending_ = false;
+    if (protected_) game_.setLocalProtected(false);
+    protected_ = false;
     status_ = SessionStatus{};
     active_ = false;
 }
@@ -159,7 +186,36 @@ Vec3 CoopSession::refPosition(uint16_t ref, bool& found) {
 }
 
 bool CoopSession::isSessionEntity(EntityHandle h) const {
-    return h && (h == puppet_.ped || h == puppet_.ownMount || h == puppet_.ownVehicle);
+    return h && (h == puppet_.ped || h == puppet_.ownMount || h == puppet_.ownVehicle || inPool(h));
+}
+
+bool CoopSession::inPool(EntityHandle h) const {
+    for (const Parked& p : pool_)
+        if (p.handle == h) return true;
+    return false;
+}
+
+EntityHandle CoopSession::obtain(EntityKind kind, uint32_t model, const Vec3& pos, float heading) {
+    for (size_t i = 0; i < pool_.size(); ++i) {
+        if (pool_[i].kind != kind || pool_[i].model != model) continue;
+        EntityHandle h = pool_[i].handle;
+        pool_.erase(pool_.begin() + static_cast<std::ptrdiff_t>(i));
+        if (!game_.exists(h)) break;  // the game removed it; create a fresh one
+        game_.unpark(h, pos, heading);
+        return h;
+    }
+    return game_.spawn(kind, model, pos, heading, SpawnRole::Mirror);
+}
+
+void CoopSession::flushPool(uint32_t nowMs, bool all) {
+    for (auto it = pool_.begin(); it != pool_.end();) {
+        if (all || nowMs - it->sinceMs > kPoolKeepMs) {
+            if (game_.exists(it->handle)) game_.remove(it->handle);
+            it = pool_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 uint16_t CoopSession::allocateId() {
@@ -184,11 +240,20 @@ void CoopSession::destroyPuppet() {
     puppet_.mover = puppet_.bodyMover = Mover{};
 }
 
-void CoopSession::destroyMirror(Mirror& m) {
+void CoopSession::destroyMirror(Mirror& m, bool recycle) {
     if (m.handle) {
         mirrorByHandle_.erase(m.handle);
-        if (game_.exists(m.handle)) game_.remove(m.handle);
+        if (game_.exists(m.handle)) {
+            // Live entities are parked for reuse: the next mirror of the same model appears instantly.
+            if (recycle && pool_.size() < kPoolSize && !game_.isDead(m.handle)) {
+                game_.park(m.handle);
+                pool_.push_back(Parked{m.handle, m.st.kind, m.st.model, lastTickMs_});
+            } else {
+                game_.remove(m.handle);
+            }
+        }
     }
+    m.outfitApplied = 0;
     m.handle = 0;
     m.ridingOn = m.seatedIn = 0;
     m.weapon = 0;
@@ -236,6 +301,11 @@ void CoopSession::handleMessages(uint32_t nowMs) {
                 }
                 break;
             }
+            case Msg::Appearance: {
+                Appearance a;
+                if (decode(payload, a)) puppet_.outfit = a.outfit;
+                break;
+            }
             case Msg::WorldInfo: {
                 WorldInfo info;
                 if (isHost() || !decode(payload, info)) break;
@@ -261,12 +331,13 @@ void CoopSession::onSnapshot(const EntitySnapshot& snap, uint32_t nowMs) {
         m.lastHeardMs = nowMs;
         if (e.fields & EF_Static) {
             if (m.haveStatic && (m.st.model != e.model || m.st.kind != e.kind)) {
-                destroyMirror(m);  // the host reused the id for something else
+                destroyMirror(m, true);  // the host reused the id for something else
                 m.motion.clear();
                 m.havePos = m.haveVel = false;
             }
             m.st.kind = e.kind;
             m.st.model = e.model;
+            m.st.outfit = e.outfit;
             m.haveStatic = true;
         }
         if (e.fields & EF_Health) m.st.health = e.health;
@@ -307,7 +378,7 @@ void CoopSession::onSnapshot(const EntitySnapshot& snap, uint32_t nowMs) {
     for (uint16_t id : snap.removed) {
         auto it = mirrors_.find(id);
         if (it == mirrors_.end()) continue;
-        destroyMirror(it->second);
+        destroyMirror(it->second, true);
         mirrors_.erase(it);
     }
 }
@@ -315,12 +386,18 @@ void CoopSession::onSnapshot(const EntitySnapshot& snap, uint32_t nowMs) {
 // ---------------------------------------------------------------- outgoing
 
 void CoopSession::sendLocalState(uint32_t nowMs) {
-    // Discrete changes (first shot, mounting, death) go out immediately instead of waiting for the next tick.
-    bool due = !haveLocal_ || nowMs - lastStateMs_ >= kPlayerIntervalMs;
+    bool first = !haveLocal_;
     local_ = game_.readLocalPlayer();
     haveLocal_ = true;
     PlayerState& s = local_.state;
-    if (!due && s.flags == lastSentFlags_) return;
+    // Full rate while anything happens, 5 Hz while standing still. Discrete changes (first shot,
+    // mounting, starting to move) go out immediately instead of waiting for the next tick.
+    bool moving = horizontalSpeed(s.vel) > 0.15f || std::fabs(s.vel.z) > 0.5f ||
+                  (s.flags & (PF_Aiming | PF_Shooting | PF_Ragdoll)) != 0;
+    uint32_t interval = moving || lastSentMoving_ ? kPlayerIntervalMs : kIdlePlayerIntervalMs;
+    bool due = first || nowMs - lastStateMs_ >= interval;
+    if (!due && s.flags == lastSentFlags_ && moving == lastSentMoving_) return;
+    lastSentMoving_ = moving;
     s.timeMs = nowMs;
     s.mountRef = kRefNone;
     s.vehicleRef = kRefNone;
@@ -337,6 +414,42 @@ void CoopSession::sendLocalState(uint32_t nowMs) {
     link_.send(Msg::PlayerState, s, false);
 }
 
+void CoopSession::sendAppearance(uint32_t nowMs) {
+    if (appearanceSent_ && nowMs - lastOutfitCheckMs_ < kOutfitCheckMs) return;
+    lastOutfitCheckMs_ = nowMs;
+    uint32_t outfit = game_.localOutfit();
+    if (appearanceSent_ && outfit == sentOutfit_) return;
+    link_.send(Msg::Appearance, Appearance{outfit}, true);
+    sentOutfit_ = outfit;
+    appearanceSent_ = true;
+}
+
+void CoopSession::followHost(uint32_t nowMs) {
+    (void)nowMs;
+    if (!puppet_.haveState) return;
+    uint16_t flags = puppet_.state.flags;
+    bool cutscene = (flags & PF_Cutscene) != 0;
+    bool mission = (flags & PF_InMission) != 0;
+    if (cutscene != protected_) {
+        // Nobody can help the guest while the host watches a scene, so the guest cannot be hurt meanwhile.
+        game_.setLocalProtected(cutscene);
+        protected_ = cutscene;
+        if (cutscene) notice("Host is in a cutscene - you are protected until it ends");
+    }
+    if (mission && !(prevPeerFlags_ & PF_InMission)) {
+        notice("Host started a mission");
+        regroupPending_ = true;
+    }
+    if (!cutscene && (prevPeerFlags_ & PF_Cutscene)) regroupPending_ = true;
+    prevPeerFlags_ = flags;
+    if (regroupPending_) {
+        regroupPending_ = false;
+        if (config_.autoRegroup && !(flags & PF_Dead) && status_.peerDistance > config_.regroupDistance &&
+            teleportToPeer())
+            notice("Moved you to the host");
+    }
+}
+
 void CoopSession::sendWorld(uint32_t nowMs) {
     if (lastInfoMs_ == 0 || nowMs - lastInfoMs_ >= kInfoIntervalMs) {
         WorldInfo info = game_.readWorldInfo();
@@ -350,14 +463,18 @@ void CoopSession::sendWorld(uint32_t nowMs) {
     Vec3 hostPos = local_.state.pos;
     Vec3 guestPos = puppet_.haveState ? puppet_.state.pos : hostPos;
     nearby_.clear();
-    game_.listNearby(hostPos, guestPos, config_.npcRadius, nearby_);
+    game_.listNearby(hostPos, guestPos, config_.npcRadius + kStreamHysteresis, nearby_);
 
-    // Closest to the guest first; keep at most maxPeds / maxVehicles.
+    // Closest to the guest first; keep at most maxPeds / maxVehicles. Hysteresis keeps entities at
+    // the edge (of the radius or of the budget) from popping in and out every tick.
     order_.clear();
     for (size_t i = 0; i < nearby_.size(); ++i) {
         if (isSessionEntity(nearby_[i].handle)) continue;
+        bool streamed = streamed_.count(nearby_[i].handle) != 0;
+        float range = std::min(distance(nearby_[i].pos, guestPos), distance(nearby_[i].pos, hostPos));
+        if (!streamed && range > config_.npcRadius) continue;
         float d = std::min(distance(nearby_[i].pos, guestPos), distance(nearby_[i].pos, hostPos) + 15.0f);
-        order_.emplace_back(d, i);
+        order_.emplace_back(streamed ? d - 10.0f : d, i);
     }
     std::sort(order_.begin(), order_.end());
 
@@ -443,7 +560,8 @@ void CoopSession::streamEntity(Streamed& s, uint32_t nowMs) {
     EntityState out = cur;
     out.id = s.id;
     out.fields = 0;
-    if (changed(kGroupStatic, false) || nowMs - s.createdMs <= kRedundancyMs) out.fields |= EF_Static;
+    if (changed(kGroupStatic, cur.outfit != sent.outfit) || nowMs - s.createdMs <= kRedundancyMs) out.fields |= EF_Static;
+    sent.outfit = cur.outfit;
     if (changed(kGroupPos, distance(cur.pos, sent.pos) > 0.03f)) out.fields |= EF_Pos;
     if (changed(kGroupHeading, std::fabs(angleDelta(sent.heading, cur.heading)) > 0.5f)) out.fields |= EF_Heading;
     if (s.kind == EntityKind::Vehicle &&
@@ -494,11 +612,13 @@ void CoopSession::movePed(EntityHandle h, Mover& m, const MotionSample& t, float
         return;
     }
     if (speed < 0.35f && dist < 0.5f) {
-        bool turned = std::fabs(angleDelta(game_.heading(h), t.heading)) > 25.0f;
-        if (m.mode != Mover::Idle || (turned && nowMs - m.lastTaskMs >= 400)) {
+        if (m.mode != Mover::Idle) {
             game_.standStill(h, t.heading);
             m.mode = Mover::Idle;
             m.lastTaskMs = nowMs;
+        } else if (nowMs - m.lastFaceMs >= 100 && std::fabs(angleDelta(game_.heading(h), t.heading)) > 4.0f) {
+            game_.face(h, t.heading);  // turn on the spot smoothly, following the stream
+            m.lastFaceMs = nowMs;
         }
         return;
     }
@@ -522,7 +642,6 @@ void CoopSession::movePed(EntityHandle h, Mover& m, const MotionSample& t, float
 }
 
 void CoopSession::steerVehicle(EntityHandle h, Mover& m, const MotionSample& t, float dt) {
-    (void)dt;
     Vec3 pos = game_.position(h);
     Vec3 err = t.pos - pos;
     float dist = length(err);
@@ -537,7 +656,7 @@ void CoopSession::steerVehicle(EntityHandle h, Mover& m, const MotionSample& t, 
     Vec3 pull = err * 2.0f;
     float pullLen = length(pull);
     if (pullLen > 6.0f) pull = pull * (6.0f / pullLen);
-    game_.steerVehicle(h, t.vel + pull, t.heading, t.pitch, t.roll);
+    game_.steerVehicle(h, t.vel + pull, t.heading, t.pitch, t.roll, dt);
 }
 
 void CoopSession::forwardDamage(EntityHandle h, int& expectedHealth, uint16_t target) {
@@ -574,6 +693,7 @@ void CoopSession::updatePuppet(uint32_t nowMs, float dt) {
     status_.peerDistance = haveLocal_ ? distance(local_.state.pos, s.pos) : 0;
     status_.peerDead = (s.flags & PF_Dead) != 0;
     status_.peerInMission = (s.flags & PF_InMission) != 0;
+    status_.peerInCutscene = (s.flags & PF_Cutscene) != 0;
     uint16_t peerRef = isHost() ? kRefGuestPlayer : kRefHostPlayer;
 
     if (p.ped && !game_.exists(p.ped)) {  // the game removed it behind our back
@@ -591,6 +711,11 @@ void CoopSession::updatePuppet(uint32_t nowMs, float dt) {
         game_.setHealth(p.ped, std::max<int>(s.health, 1), s.maxHealth);
         game_.setLabel(p.ped, link_.peer().name.c_str());
         p.expectedHealth = game_.health(p.ped);
+        p.outfitApplied = 0;
+    }
+    if (p.outfit && p.outfit != p.outfitApplied) {
+        game_.setOutfit(p.ped, p.outfit);
+        p.outfitApplied = p.outfit;
     }
     status_.peerVisible = true;
     MotionSample target = p.motion.sample(nowMs);
@@ -738,7 +863,7 @@ void CoopSession::updateMirrors(uint32_t nowMs, float dt) {
     for (auto it = mirrors_.begin(); it != mirrors_.end();) {
         Mirror& m = it->second;
         if (nowMs - m.lastHeardMs > kMirrorTimeoutMs) {  // the host stopped mentioning it
-            destroyMirror(m);
+            destroyMirror(m, true);
             it = mirrors_.erase(it);
             continue;
         }
@@ -755,13 +880,25 @@ void CoopSession::updateMirrors(uint32_t nowMs, float dt) {
             continue;
         }
         ++shown;
+        if (m.st.outfit && m.st.outfit != m.outfitApplied && m.st.kind == EntityKind::Ped) {
+            game_.setOutfit(m.handle, m.st.outfit);
+            m.outfitApplied = m.st.outfit;
+        }
+        // CPU level of detail: what is far from the guest is updated every 2nd or 4th frame
+        // (staggered by id so the work spreads evenly). Motion is time-based, so nothing slows down.
+        float range = distance(m.st.pos, local_.state.pos);
+        uint32_t every = range < 35.0f ? 1u : range < 80.0f ? 2u : 4u;
+        if (m.st.kind == EntityKind::Vehicle) every = std::min(every, 2u);  // physics drifts if left alone longer
+        if ((frame_ + m.id) % every != 0 && m.lastUpdateMs) continue;
+        float step = m.lastUpdateMs ? std::clamp((nowMs - m.lastUpdateMs) / 1000.0f, 0.0f, 0.25f) : dt;
+        m.lastUpdateMs = nowMs;
         if (m.st.kind == EntityKind::Vehicle) {
             MotionSample t = m.motion.sample(nowMs);
             // The guest is driving it: the guest's game moves it and the host follows.
             if (local_.vehicle == m.handle && local_.state.seat == -1) continue;
-            steerVehicle(m.handle, m.mover, t, dt);
+            steerVehicle(m.handle, m.mover, t, step);
         } else {
-            updateMirrorPed(m, nowMs, dt);
+            updateMirrorPed(m, nowMs, step);
         }
     }
     // Spawn the closest first, vehicles before peds so riders find their seats.
@@ -770,13 +907,25 @@ void CoopSession::updateMirrors(uint32_t nowMs, float dt) {
         return distance(a->st.pos, local_.state.pos) < distance(b->st.pos, local_.state.pos);
     });
     int budget = kSpawnsPerFrame;
+    prefetched_.clear();
     for (Mirror* m : spawnQueue_) {
-        if (budget-- <= 0) break;
+        if (budget <= 0) {
+            // Over this frame's budget: at least get the model streaming so it spawns instantly later.
+            if (prefetched_.size() < 8 && std::find(prefetched_.begin(), prefetched_.end(), m->st.model) == prefetched_.end()) {
+                game_.prefetchModel(m->st.model);
+                prefetched_.push_back(m->st.model);
+            }
+            continue;
+        }
+        --budget;
         MotionSample t = m->motion.empty() ? MotionSample{} : m->motion.sample(nowMs);
         Vec3 pos = m->motion.empty() ? m->st.pos : t.pos;
-        m->handle = game_.spawn(m->st.kind, m->st.model, pos, m->st.heading, SpawnRole::Mirror);
+        m->handle = obtain(m->st.kind, m->st.model, pos, m->st.heading);
         if (!m->handle) continue;
         mirrorByHandle_[m->handle] = m->id;
+        m->weapon = 0xFFFFFFFFu;  // force weapon / outfit to be applied (pooled entities keep old ones)
+        m->outfitApplied = 0;
+        m->lastUpdateMs = 0;
         if (m->st.kind == EntityKind::Ped) {
             if (!(m->st.flags & NF_Dead) && m->st.health > 0) game_.setHealth(m->handle, m->st.health, 0);
             m->expectedHealth = game_.health(m->handle);
@@ -784,6 +933,7 @@ void CoopSession::updateMirrors(uint32_t nowMs, float dt) {
         ++shown;
     }
     status_.syncedEntities = shown;
+    flushPool(nowMs, false);
 }
 
 void CoopSession::updateMirrorPed(Mirror& m, uint32_t nowMs, float dt) {
@@ -797,7 +947,7 @@ void CoopSession::updateMirrorPed(Mirror& m, uint32_t nowMs, float dt) {
     if (game_.isDead(m.handle)) {
         // We killed it locally; if the host disagrees for long enough, bring it back.
         if (!m.deadSinceMs) m.deadSinceMs = nowMs ? nowMs : 1;
-        else if (nowMs - m.deadSinceMs > kRespawnGraceMs) destroyMirror(m);
+        else if (nowMs - m.deadSinceMs > kRespawnGraceMs) destroyMirror(m, false);
         return;
     }
     m.deadSinceMs = 0;

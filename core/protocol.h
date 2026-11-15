@@ -12,7 +12,7 @@
 namespace coop {
 
 constexpr uint16_t kMagic = 0x4352;  // "RC"
-constexpr uint8_t kProtocolVersion = 2;
+constexpr uint8_t kProtocolVersion = 3;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr size_t kMaxDatagram = 1200;  // stays below any sane path MTU
 constexpr size_t kMaxMessage = 1100;   // payload budget for one unreliable message
@@ -37,6 +37,7 @@ enum class Msg : uint8_t {
     WorldInfo = 4,
     Ping = 5,
     Pong = 6,
+    Appearance = 7,
 };
 
 // References to things in the host's world. Entity ids are assigned by the host.
@@ -61,6 +62,7 @@ enum PlayerFlags : uint16_t {
     PF_Crouching = 1 << 5,
     PF_InVehicle = 1 << 6,
     PF_InMission = 1 << 7,
+    PF_Cutscene = 1 << 8,      // in a scripted scene: the player has no control
 };
 
 struct PlayerState {
@@ -109,6 +111,7 @@ struct EntityState {
     // EF_Static
     EntityKind kind = EntityKind::Ped;
     uint32_t model = 0;
+    uint32_t outfit = 0;       // meta ped outfit hash, 0 = unknown
     // EF_Pos / EF_Heading / EF_Tilt / EF_Vel
     Vec3 pos;
     float heading = 0;
@@ -137,6 +140,11 @@ struct Damage {
     uint16_t amount = 0;
 };
 
+// The look of a player's character; sent reliably when it changes.
+struct Appearance {
+    uint32_t outfit = 0;
+};
+
 struct WorldInfo {
     uint8_t hour = 0, minute = 0, second = 0;
     uint8_t worldSync = 0;     // host is streaming its world; the guest should show only that
@@ -151,6 +159,8 @@ void write(ByteWriter& w, const EntitySnapshot& v);
 bool read(ByteReader& r, EntitySnapshot& v);
 void write(ByteWriter& w, const Damage& v);
 bool read(ByteReader& r, Damage& v);
+void write(ByteWriter& w, const Appearance& v);
+bool read(ByteReader& r, Appearance& v);
 void write(ByteWriter& w, const WorldInfo& v);
 bool read(ByteReader& r, WorldInfo& v);
 

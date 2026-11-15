@@ -115,6 +115,10 @@ public:
         int shots = 0, aims = 0, ragdolls = 0, teleports = 0, tasks = 0, nudges = 0;
         std::string label;
         bool hasGoal = false, steered = false;
+        bool parked = false;
+        uint32_t outfit = 0;
+        int faces = 0, updates = 0;  // updates: any driving call (task, nudge, face, steer)
+        mutable int queries = 0;     // position / health reads
         Vec3 goal;
         float goalSpeed = 0;
         Vec3 aimPoint;
@@ -133,6 +137,9 @@ public:
     WorldInfo world{12, 0, 0, 0, 0};
     int modelLoadDelay = 0;  // spawn() returns 0 this many times first
     int readCalls = 0;
+    int spawns = 0, removals = 0, prefetches = 0;
+    uint32_t playerOutfit = 0;
+    bool playerProtected = false;
 
     FakeGame() {
         playerPed = add(EntityKind::Ped, joaat("player"), {});
@@ -156,12 +163,12 @@ public:
     }
     int count(SpawnRole role, EntityKind kind = EntityKind::Ped) const {
         int n = 0;
-        for (auto& [h, e] : ents) n += e.ours && e.role == role && e.kind == kind;
+        for (auto& [h, e] : ents) n += e.ours && !e.parked && e.role == role && e.kind == kind;
         return n;
     }
     EntityHandle find(SpawnRole role, uint32_t model = 0, EntityKind kind = EntityKind::Ped) const {
         for (auto& [h, e] : ents)
-            if (e.ours && e.role == role && e.kind == kind && (!model || e.model == model)) return h;
+            if (e.ours && !e.parked && e.role == role && e.kind == kind && (!model || e.model == model)) return h;
         return 0;
     }
 
@@ -179,10 +186,7 @@ public:
                     e.pos = e.pos + d * (step / len);
                 }
             }
-            if (e.steered) {
-                e.pos = e.pos + e.vel * dt;
-                e.steered = false;
-            }
+            if (e.steered) e.pos = e.pos + e.vel * dt;  // physics keeps the last velocity
         }
         for (auto& [h, e] : ents) {
             if (e.mount && ents.count(e.mount)) e.pos = ents[e.mount].pos;
@@ -214,13 +218,15 @@ public:
     EntityHandle localPlayerPed() override { return playerPed; }
     void damageLocalPlayer(int amount) override { playerHealth = std::max(0, playerHealth - amount); }
     void teleportLocalPlayer(const Vec3& pos) override { player.pos = pos; }
+    uint32_t localOutfit() override { return playerOutfit; }
+    void setLocalProtected(bool on) override { playerProtected = on; }
     bool belongsToLocalPlayer(EntityHandle h) override {
         return h == playerPed || h == ownHorse || (h && (h == playerMount || h == playerVehicle));
     }
 
     void listNearby(const Vec3& a, const Vec3& b, float radius, std::vector<NearbyEntity>& out) override {
         for (auto& [h, e] : ents) {
-            if (belongsToLocalPlayer(h) || e.draftOf) continue;
+            if (belongsToLocalPlayer(h) || e.draftOf || e.parked) continue;
             if (distance(e.pos, a) > radius && distance(e.pos, b) > radius) continue;
             out.push_back({h, e.kind, e.pos});
         }
@@ -230,6 +236,7 @@ public:
         const Ent& e = ents.at(h);
         out.state.kind = e.kind;
         out.state.model = e.model;
+        out.state.outfit = e.outfit;
         out.state.pos = e.pos;
         out.state.vel = e.vel;
         out.state.heading = e.heading;
@@ -264,9 +271,24 @@ public:
         e.heading = heading;
         e.ours = true;
         e.role = role;
+        ++spawns;
         return h;
     }
+    void prefetchModel(uint32_t) override { ++prefetches; }
+    void park(EntityHandle h) override {
+        Ent& e = ents.at(h);
+        e.parked = e.hidden = true;
+        e.hasGoal = false;
+        e.mount = e.vehicle = 0;
+    }
+    void unpark(EntityHandle h, const Vec3& pos, float heading) override {
+        Ent& e = ents.at(h);
+        e.parked = e.hidden = false;
+        e.pos = pos;
+        e.heading = heading;
+    }
     void remove(EntityHandle h) override {
+        ++removals;
         ents.erase(h);
         for (auto& [k, e] : ents) {
             if (e.mount == h) e.mount = 0;
@@ -275,9 +297,15 @@ public:
     }
     bool exists(EntityHandle h) override { return ents.count(h) != 0; }
     bool isDead(EntityHandle h) override { return ents.at(h).health <= 0; }
-    Vec3 position(EntityHandle h) override { return ents.at(h).pos; }
+    Vec3 position(EntityHandle h) override {
+        ++ents.at(h).queries;
+        return ents.at(h).pos;
+    }
     float heading(EntityHandle h) override { return ents.at(h).heading; }
-    int health(EntityHandle h) override { return ents.at(h).health; }
+    int health(EntityHandle h) override {
+        ++ents.at(h).queries;
+        return ents.at(h).health;
+    }
     void setHealth(EntityHandle h, int health, int) override { ents.at(h).health = health; }
     void kill(EntityHandle h) override { ents.at(h).health = 0; }
     void teleport(EntityHandle h, const Vec3& pos, float heading) override {
@@ -286,10 +314,12 @@ public:
         e.heading = heading;
         e.hasGoal = false;
         ++e.teleports;
+        ++e.updates;
     }
     void nudge(EntityHandle h, const Vec3& delta) override {
         ents.at(h).pos = ents.at(h).pos + delta;
         ++ents.at(h).nudges;
+        ++ents.at(h).updates;
     }
     void moveTo(EntityHandle h, const Vec3& pos, float speed, float heading) override {
         Ent& e = ents.at(h);
@@ -298,12 +328,20 @@ public:
         e.goalSpeed = speed;
         e.heading = heading;
         ++e.tasks;
+        ++e.updates;
     }
     void standStill(EntityHandle h, float heading) override {
         ents.at(h).hasGoal = false;
         ents.at(h).heading = heading;
         ++ents.at(h).tasks;
     }
+    void face(EntityHandle h, float heading) override {
+        Ent& e = ents.at(h);
+        e.heading = lerpHeading(e.heading, heading, 0.5f);
+        ++e.faces;
+        ++e.updates;
+    }
+    void setOutfit(EntityHandle h, uint32_t outfit) override { ents.at(h).outfit = outfit; }
     void aimAt(EntityHandle h, const Vec3& target) override {
         ++ents.at(h).aims;
         ents.at(h).aimPoint = target;
@@ -321,8 +359,9 @@ public:
     void setCrouch(EntityHandle h, bool crouch) override { ents.at(h).crouch = crouch; }
     void ragdoll(EntityHandle h) override { ++ents.at(h).ragdolls; }
     void setLabel(EntityHandle h, const char* name) override { ents.at(h).label = name; }
-    void steerVehicle(EntityHandle h, const Vec3& velocity, float heading, float, float) override {
+    void steerVehicle(EntityHandle h, const Vec3& velocity, float heading, float, float, float) override {
         Ent& e = ents.at(h);
+        ++e.updates;
         e.vel = velocity;
         e.heading = heading;
         e.steered = true;
@@ -873,7 +912,10 @@ static void testSessionSharedWorld() {
     p.hostGame.remove(rider);
     p.hostGame.remove(horse);
     p.run(400);
-    CHECK(!p.guestGame.ents.count(mirrorRider) && !p.guestGame.ents.count(mirrorHorse));
+    // Both live: parked in the pool for reuse, invisible, not counted as mirrors.
+    CHECK(p.guestGame.ents.count(mirrorRider) && p.guestGame.ents[mirrorRider].parked);
+    CHECK(p.guestGame.ents.count(mirrorHorse) && p.guestGame.ents[mirrorHorse].parked);
+    CHECK(p.guestGame.find(SpawnRole::Mirror, kHorse) == 0);
 
     // Disconnect: everything the session created disappears and hidden entities come back.
     p.hostLink.stop();
@@ -882,6 +924,9 @@ static void testSessionSharedWorld() {
     CHECK(p.guestGame.count(SpawnRole::Mirror, EntityKind::Vehicle) == 0);
     CHECK(p.guestGame.count(SpawnRole::PlayerPuppet) == 0);
     CHECK(!p.guestGame.ents[storyPed].hidden);
+    int leftovers = 0;  // the pool is emptied too
+    for (auto& [h, e] : p.guestGame.ents) leftovers += e.ours;
+    CHECK(leftovers == 0);
     p.host->cleanup();
     CHECK(p.hostGame.count(SpawnRole::PlayerPuppet) == 0);
 }
@@ -1100,6 +1145,129 @@ static void testBandwidthAndLod() {
     }
 }
 
+
+static void testPoolHysteresisAndLod() {
+    Pair p;
+    p.config.npcRadius = 60;
+    p.hostGame.player.pos = {0, 0, 0};
+    p.guestGame.player.pos = {0, 0, 0};
+    const uint32_t kCow = joaat("a_c_cow");
+    // A cow wandering back and forth across the stream edge must not pop in and out.
+    EntityHandle edge = p.hostGame.addPed(kCow, {58, 0, 0});
+    float phase = 0;
+    p.perFrame = [&] {
+        phase += 0.016f;
+        p.hostGame.ents[edge].pos.x = 54.0f + 12.0f * std::sin(phase * 2.0f);  // 42..66 m, radius 60
+    };
+    p.start();
+    p.run(1500);
+    CHECK(p.guestGame.find(SpawnRole::Mirror, kCow) != 0);
+    int spawnsBefore = p.guestGame.spawns;
+    p.run(6000);
+    CHECK(p.guestGame.spawns == spawnsBefore);  // no churn at the boundary
+    CHECK(p.guestGame.find(SpawnRole::Mirror, kCow) != 0);
+    p.perFrame = nullptr;
+
+    // Leaves for real -> parked; a cow appears elsewhere -> the parked one is reused (no spawn).
+    p.hostGame.ents[edge].pos = {500, 0, 0};
+    p.run(500);
+    CHECK(p.guestGame.find(SpawnRole::Mirror, kCow) == 0);
+    int spawns = p.guestGame.spawns;
+    EntityHandle other = p.hostGame.addPed(kCow, {10, 10, 0});
+    p.hostGame.ents[other].outfit = 0xABCDu;
+    p.run(500);
+    EntityHandle reused = p.guestGame.find(SpawnRole::Mirror, kCow);
+    CHECK(reused != 0 && p.guestGame.spawns == spawns);
+    CHECK(distance(p.guestGame.ents[reused].pos, Vec3{10, 10, 0}) < 0.5f);
+    CHECK(p.guestGame.ents[reused].outfit == 0xABCDu);  // the host's look, not a random one
+    // The outfit changes on the host (story script dresses an NPC) -> follows.
+    p.hostGame.ents[other].outfit = 0x1234u;
+    p.run(1500);
+    CHECK(p.guestGame.ents[reused].outfit == 0x1234u);
+    // Unused pool entries are freed after a while.
+    p.hostGame.remove(other);
+    p.run(12000);
+    int parked = 0;
+    for (auto& [h, e] : p.guestGame.ents) parked += e.parked;
+    CHECK(parked == 0);
+
+    // CPU level of detail: a far walker is driven far less often than a near one, yet both stay on track.
+    Pair q;
+    q.config.npcRadius = 200;
+    q.hostGame.player.pos = {0, 0, 0};
+    q.guestGame.player.pos = {0, 0, 0};
+    EntityHandle nearWalker = q.hostGame.addPed(joaat("near"), {5, 0, 0});
+    EntityHandle farWalker = q.hostGame.addPed(joaat("far"), {120, 0, 0});
+    q.perFrame = [&] {
+        for (EntityHandle h : {nearWalker, farWalker}) {
+            q.hostGame.ents[h].pos.y += 1.5f * 0.016f;
+            q.hostGame.ents[h].vel = {0, 1.5f, 0};
+        }
+    };
+    q.start();
+    q.run(2000);
+    EntityHandle mn = q.guestGame.find(SpawnRole::Mirror, joaat("near"));
+    EntityHandle mf = q.guestGame.find(SpawnRole::Mirror, joaat("far"));
+    CHECK(mn && mf);
+    int queriesNear = q.guestGame.ents[mn].queries, queriesFar = q.guestGame.ents[mf].queries;
+    q.run(4000);
+    int workNear = q.guestGame.ents[mn].queries - queriesNear;
+    int workFar = q.guestGame.ents[mf].queries - queriesFar;
+    std::printf("  cpu lod: near mirror %d game queries, far mirror %d (4 s)\n", workNear, workFar);
+    CHECK(workFar * 3 <= workNear);
+    CHECK(distance(q.guestGame.ents[mf].pos, q.hostGame.ents[farWalker].pos) < 1.0f);
+    CHECK(distance(q.guestGame.ents[mn].pos, q.hostGame.ents[nearWalker].pos) < 1.0f);
+}
+
+static void testCutsceneRegroupAndAppearance() {
+    Pair p;
+    p.hostGame.player.pos = {0, 0, 0};
+    p.guestGame.player.pos = {800, 0, 0};
+    p.guestGame.playerOutfit = 0x5555u;
+    p.start();
+    p.run(1500);
+    EntityHandle guestPuppet = p.hostGame.find(SpawnRole::PlayerPuppet);
+    CHECK(guestPuppet && p.hostGame.ents[guestPuppet].outfit == 0x5555u);  // the guest's look
+    p.guestGame.playerOutfit = 0x6666u;  // changes clothes
+    p.run(2500);
+    CHECK(p.hostGame.ents[guestPuppet].outfit == 0x6666u);
+
+    // The host starts a mission far away: the guest is brought over and told why.
+    p.hostGame.player.flags = PF_InMission;
+    p.run(500);
+    CHECK(distance(p.guestGame.player.pos, p.hostGame.player.pos) < 3.0f);
+    std::string text;
+    bool sawMission = false;
+    while (p.guest->popNotice(text)) sawMission = sawMission || text.find("mission") != std::string::npos;
+    CHECK(sawMission);
+
+    // Cutscene: guest protected meanwhile; host rides off during it; regroup when it ends.
+    p.hostGame.player.flags = PF_InMission | PF_Cutscene;
+    p.run(400);
+    CHECK(p.guestGame.playerProtected && p.guest->status().peerInCutscene);
+    p.hostGame.player.pos = {0, 600, 0};
+    p.run(400);
+    CHECK(distance(p.guestGame.player.pos, p.hostGame.player.pos) > 100.0f);  // no teleport mid-scene
+    p.hostGame.player.flags = PF_InMission;
+    p.run(500);
+    CHECK(!p.guestGame.playerProtected);
+    CHECK(distance(p.guestGame.player.pos, p.hostGame.player.pos) < 3.0f);
+
+    // A standing player is sent at 5 Hz, a moving one at 30 Hz.
+    p.hostGame.player.flags = 0;
+    p.run(1500);
+    uint32_t idleRate = p.hostLink.sendRate();
+    p.perFrame = [&] {
+        p.hostGame.player.pos.x += 3 * 0.016f;
+        p.hostGame.player.vel = {3, 0, 0};
+    };
+    p.run(2500);
+    uint32_t movingRate = p.hostLink.sendRate();
+    p.perFrame = nullptr;
+    std::printf("  idle player: host sends %u B/s standing, %u B/s moving\n", idleRate, movingRate);
+    CHECK(idleRate * 2 < movingRate);
+}
+
 static void testUdpLoopback() {
     UdpSocket a, b;
     std::string error;
@@ -1134,6 +1302,8 @@ int main() {
         {"session: rides, vehicles, control transfer", testSessionRidesAndControl},
         {"session: tracking accuracy", testTrackingAccuracy},
         {"session: bandwidth and level of detail", testBandwidthAndLod},
+        {"session: pool, hysteresis, cpu lod, outfits", testPoolHysteresisAndLod},
+        {"session: cutscenes, regroup, appearance, idle rate", testCutsceneRegroupAndAppearance},
         {"udp loopback", testUdpLoopback},
     };
     for (const Test& t : tests) {

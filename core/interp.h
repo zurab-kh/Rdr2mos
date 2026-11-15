@@ -52,8 +52,11 @@ public:
         transits_[transitHead_++ % kWindow] = transit;
         transitCount_ = std::min<uint32_t>(transitCount_ + 1, kWindow);
         if (!samples_.empty()) {
+            // Senders slow down while nothing moves; those pauses say nothing about the update
+            // rate during movement, so they must not inflate the delay.
             float step = static_cast<float>(s.timeMs - samples_.back().timeMs);
-            interval_ = interval_ <= 0 ? step : interval_ + (step - interval_) * 0.1f;
+            if (interval_ <= 0) interval_ = std::min(step, 150.0f);
+            else if (step < interval_ * 2.5f) interval_ += (step - interval_) * 0.1f;
         }
         samples_.push_back(s);
         while (samples_.size() > 48) samples_.pop_front();

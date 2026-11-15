@@ -19,6 +19,9 @@ using namespace coop;
 namespace {
 
 HMODULE g_module = nullptr;
+// Script Hook restarts the script after every save load; this survives it so the co-op session
+// reconnects on its own instead of making the player press the key again.
+bool g_reconnect = false;
 
 std::string moduleDirectory() {
     char path[MAX_PATH] = {};
@@ -136,6 +139,8 @@ struct Settings {
         session.syncClock = ini.getBool("sync", "sync_clock", true);
         session.syncWeather = ini.getBool("sync", "sync_weather", true);
         session.softCorrection = ini.getBool("sync", "soft_correction", true);
+        session.autoRegroup = ini.getBool("sync", "auto_regroup", true);
+        session.regroupDistance = std::clamp(ini.getFloat("sync", "regroup_distance", 150.0f), 20.0f, 5000.0f);
         session.npcRadius = std::clamp(ini.getFloat("sync", "radius", 150.0f), 30.0f, 400.0f);
         session.maxPeds = std::clamp(ini.getInt("sync", "max_peds", 64), 0, 200);
         session.maxVehicles = std::clamp(ini.getInt("sync", "max_vehicles", 16), 0, 64);
@@ -159,9 +164,12 @@ public:
                 settings_.viaRelay ? "relay" : "direct", settings_.problem.empty() ? "" : " CONFIG ERROR: ",
                 settings_.problem.c_str());
 
-        bool wantAutoConnect = settings_.autoConnect;
+        bool wantAutoConnect = settings_.autoConnect || g_reconnect;
         for (;;) {
             uint32_t now = clockMs();
+            LARGE_INTEGER workStart;
+            QueryPerformanceCounter(&workStart);
+            uint32_t nativesBefore = native::g_nativeCalls;
             game_.frame(now);
 
             if (wantAutoConnect && game_.ready()) {
@@ -169,8 +177,12 @@ public:
                 connect(now);
             }
             if (toggle_.pressed()) {
-                if (online_) disconnect();
-                else connect(now);
+                if (online_) {
+                    disconnect();
+                    g_reconnect = false;
+                } else {
+                    connect(now);
+                }
             }
             if (teleport_.pressed() && session_) {
                 if (!session_->teleportToPeer()) notify(now, "Friend's position is not known yet");
@@ -180,7 +192,10 @@ public:
             if (online_) {
                 session_->tick(now);
                 trackLinkState(now);
+                std::string text;
+                while (session_->popNotice(text)) notify(now, text);
             }
+            measureWork(workStart, native::g_nativeCalls - nativesBefore);
             if (showHud_) drawHud(now);
             scriptWait(0);
         }
@@ -217,6 +232,7 @@ private:
         link_->start(&socket_, config, now);
         session_ = std::make_unique<CoopSession>(game_, *link_, settings_.session);
         online_ = true;
+        g_reconnect = true;
         lastState_ = Link::State::Idle;
         logLine("connecting (%s)", config.listen ? "listening" : config.remote.toString().c_str());
     }
@@ -244,6 +260,20 @@ private:
             logLine("link failed: %s", link_->error().c_str());
         }
         lastState_ = state;
+    }
+
+    // Average cost of the mod per frame (script time and native calls), shown on the HUD.
+    void measureWork(const LARGE_INTEGER& start, uint32_t natives) {
+        static const double ticksPerUs = [] {
+            LARGE_INTEGER f;
+            QueryPerformanceFrequency(&f);
+            return static_cast<double>(f.QuadPart) / 1e6;
+        }();
+        LARGE_INTEGER end;
+        QueryPerformanceCounter(&end);
+        double us = static_cast<double>(end.QuadPart - start.QuadPart) / ticksPerUs;
+        workUs_ += (us - workUs_) * 0.05;
+        natives_ += (natives - natives_) * 0.05;
     }
 
     void notify(uint32_t now, const std::string& text) {
@@ -290,10 +320,13 @@ private:
                 drawText(line, x, y += 0.026f, 0.28f, 220, 220, 220);
             }
             if (settings_.session.worldSync) {
-                std::snprintf(line, sizeof(line), settings_.role == Role::Guest ? "Host world: %d shown" : "World: %d streamed",
-                              st.syncedEntities);
+                std::snprintf(line, sizeof(line),
+                              settings_.role == Role::Guest ? "Host world: %d shown  |  mod %.2f ms, %.0f calls/frame"
+                                                            : "World: %d streamed  |  mod %.2f ms, %.0f calls/frame",
+                              st.syncedEntities, workUs_ / 1000.0, natives_);
                 drawText(line, x, y += 0.026f, 0.28f, 220, 220, 220);
             }
+            if (st.peerInCutscene) drawText("Host is in a cutscene", x, y += 0.026f, 0.28f, 240, 220, 120);
         }
         if (!notice_.empty() && static_cast<int32_t>(noticeUntil_ - now) > 0)
             drawText(notice_, x, y + 0.03f, 0.32f, 255, 255, 255);
@@ -310,6 +343,7 @@ private:
     Hotkey toggle_, teleport_, hud_;
     std::string notice_;
     uint32_t noticeUntil_ = 0;
+    double workUs_ = 0, natives_ = 0;
 };
 
 std::unique_ptr<App> g_app;

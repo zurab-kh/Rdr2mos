@@ -19,6 +19,10 @@ struct Vector3 {
     coop::Vec3 vec() const { return {x, y, z}; }
 };
 
+// Every native call goes through Script Hook, which looks the handler up by hash each time.
+// Counted so the HUD can show how much work the mod does per frame.
+inline uint32_t g_nativeCalls = 0;
+
 template <typename T>
 inline void push(T value) {
     static_assert(sizeof(T) <= sizeof(uint64_t), "native arguments are 64-bit slots");
@@ -28,12 +32,14 @@ inline void push(T value) {
 }
 template <typename R, typename... Args>
 inline R invoke(uint64_t hash, Args... args) {
+    ++g_nativeCalls;
     nativeInit(hash);
     (push(args), ...);
     return *reinterpret_cast<R*>(nativeCall());
 }
 template <typename... Args>
 inline void call(uint64_t hash, Args... args) {
+    ++g_nativeCalls;
     nativeInit(hash);
     (push(args), ...);
     nativeCall();
@@ -45,6 +51,7 @@ inline bool test(uint64_t hash, Args... args) { return invoke<int>(hash, args...
 inline int PLAYER_ID() { return invoke<int>(0x217E9DC48139933D); }
 inline Ped PLAYER_PED_ID() { return invoke<Ped>(0x096275889B8E0EE0); }
 inline bool IS_PLAYER_FREE_AIMING(int player) { return test(0x936F967D4BE1CE9D, player); }
+inline bool IS_PLAYER_CONTROL_ON(int player) { return test(0x7964097FCE4C244B, player); }
 inline Ped GET_MOUNT_OWNED_BY_PLAYER(int player) { return invoke<Ped>(0xF49F14462F0AE27C, player); }
 inline Ped GET_SADDLE_HORSE_FOR_PLAYER(int player) { return invoke<Ped>(0xB48050D326E9A2F3, player); }
 
@@ -94,6 +101,9 @@ inline void SET_PED_CROUCH_MOVEMENT(Ped ped, bool on) { call(0x7DE9692C6F64CFE8,
 inline void SET_PED_TO_RAGDOLL(Ped ped, int minMs, int maxMs) { call(0xAE99FB955581844A, ped, minMs, maxMs, 0, 0, 0, static_cast<const char*>(nullptr)); }
 inline int GET_VEHICLE_DRAFT_HORSE_IS_ATTACHED_TO(Ped horse) { return invoke<int>(0xE4770DA1B8FF4FD1, horse); }
 inline void SET_RANDOM_OUTFIT_VARIATION(Ped ped) { call(0x283978A15512B2FE, ped, 1); }
+inline Hash GET_PED_META_OUTFIT_HASH(Ped ped) { return invoke<Hash>(0x30569F348D126A5A, ped); }
+inline void EQUIP_META_PED_OUTFIT(Ped ped, Hash outfit) { call(0x1902C4CFCC5BE57C, ped, outfit); }
+inline void UPDATE_PED_VARIATION(Ped ped) { call(0xCC8CA3E88256E58F, ped, 0, 1, 1, 1, 0); }
 inline bool IS_PED_A_PLAYER(Ped ped) { return test(0x12534C348C6CB68B, ped); }
 inline bool IS_PED_HUMAN(Ped ped) { return test(0xB980061DA992779D, ped); }
 inline bool IS_PED_ON_MOUNT(Ped ped) { return test(0x460BC76A0E10655E, ped); }

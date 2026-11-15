@@ -17,6 +17,8 @@ const uint32_t kUnarmed = joaat("WEAPON_UNARMED");
 const uint32_t kFallbackAvatar = joaat("player_three");
 
 int g_peds[kMaxHandles];
+// Survives the script restart after a save load, so a protection we switched on is never left behind.
+bool g_protectionLeftOn = false;
 int g_vehicles[kMaxHandles];
 
 int collectPeds() { return std::clamp(worldGetAllPeds(g_peds, kMaxHandles), 0, kMaxHandles); }
@@ -34,12 +36,18 @@ float moveBlend(float speed, bool quadruped) {
 
 void Rdr2Game::frame(uint32_t nowMs) {
     nowMs_ = nowMs;
+    cache_.clear();
+    if (skip_.size() > 4096) skip_.clear();
     playerPed_ = n::PLAYER_PED_ID();
     playerMount_ = playerVehicle_ = 0;
     own_.clear();
     if (!playerPed_ || !n::DOES_ENTITY_EXIST(playerPed_)) {
         playerPed_ = 0;
         return;
+    }
+    if (g_protectionLeftOn && !protected_) {
+        n::SET_ENTITY_INVINCIBLE(playerPed_, false);
+        g_protectionLeftOn = false;
     }
     int player = n::PLAYER_ID();
     if (n::IS_PED_ON_MOUNT(playerPed_)) playerMount_ = n::GET_MOUNT(playerPed_);
@@ -107,7 +115,11 @@ LocalPlayer Rdr2Game::readLocalPlayer() {
     if (n::IS_ENTITY_DEAD(playerPed_)) s.flags |= PF_Dead;
     if (n::IS_PED_RAGDOLL(playerPed_)) s.flags |= PF_Ragdoll;
     if (n::GET_PED_CROUCH_MOVEMENT(playerPed_)) s.flags |= PF_Crouching;
-    if (n::GET_MISSION_FLAG()) s.flags |= PF_InMission;
+    if (n::GET_MISSION_FLAG()) {
+        s.flags |= PF_InMission;
+        // RDR2 plays its story scenes as scripted scenes during which the player has no control.
+        if (!n::IS_PLAYER_CONTROL_ON(player)) s.flags |= PF_Cutscene;
+    }
 
     // Aim point: where the last bullet landed, otherwise a point far along the camera direction.
     n::Vector3 impact{};
@@ -136,6 +148,32 @@ void Rdr2Game::teleportLocalPlayer(const Vec3& pos) {
 
 bool Rdr2Game::belongsToLocalPlayer(EntityHandle h) { return own_.count(h) != 0; }
 
+uint32_t Rdr2Game::localOutfit() { return playerPed_ ? n::GET_PED_META_OUTFIT_HASH(playerPed_) : 0; }
+
+void Rdr2Game::setLocalProtected(bool on) {
+    protected_ = on;
+    g_protectionLeftOn = on;
+    if (playerPed_) n::SET_ENTITY_INVINCIBLE(playerPed_, on);
+}
+
+bool Rdr2Game::skipPed(int ped) {
+    Skip& s = skip_[ped];
+    if (static_cast<int32_t>(nowMs_ - s.untilMs) >= 0) {
+        s.skip = n::IS_PED_A_PLAYER(ped) || n::GET_VEHICLE_DRAFT_HORSE_IS_ATTACHED_TO(ped) != 0;
+        s.untilMs = nowMs_ + 2000;
+    }
+    return s.skip;
+}
+
+bool Rdr2Game::skipVehicle(int veh) {
+    Skip& s = skip_[veh];
+    if (static_cast<int32_t>(nowMs_ - s.untilMs) >= 0) {
+        s.skip = n::IS_THIS_MODEL_A_TRAIN(n::GET_ENTITY_MODEL(veh));
+        s.untilMs = nowMs_ + 5000;
+    }
+    return s.skip;
+}
+
 void Rdr2Game::listNearby(const Vec3& a, const Vec3& b, float radius, std::vector<NearbyEntity>& out) {
     const float r2 = radius * radius;
     auto inRange = [&](const Vec3& p) {
@@ -147,7 +185,11 @@ void Rdr2Game::listNearby(const Vec3& a, const Vec3& b, float radius, std::vecto
         int ped = g_peds[i];
         if (!ped || own_.count(ped) || !n::DOES_ENTITY_EXIST(ped)) continue;
         Vec3 pos = n::GET_ENTITY_COORDS(ped);  // distance first: the cheapest way to drop most peds
-        if (!inRange(pos) || n::IS_PED_A_PLAYER(ped) || n::GET_VEHICLE_DRAFT_HORSE_IS_ATTACHED_TO(ped)) continue;
+        if (!inRange(pos) || skipPed(ped)) continue;
+        Cached& c = cached(ped);
+        c.have |= 3;
+        c.exists = true;
+        c.pos = pos;
         out.push_back({ped, EntityKind::Ped, pos});
     }
     int vehicles = collectVehicles();
@@ -155,7 +197,7 @@ void Rdr2Game::listNearby(const Vec3& a, const Vec3& b, float radius, std::vecto
         int veh = g_vehicles[i];
         if (!veh || vehicles_.count(veh) || !n::DOES_ENTITY_EXIST(veh)) continue;
         Vec3 pos = n::GET_ENTITY_COORDS(veh);
-        if (!inRange(pos) || n::IS_THIS_MODEL_A_TRAIN(n::GET_ENTITY_MODEL(veh))) continue;
+        if (!inRange(pos) || skipVehicle(veh)) continue;
         out.push_back({veh, EntityKind::Vehicle, pos});
     }
 }
@@ -185,6 +227,7 @@ void Rdr2Game::readEntity(EntityHandle h, EntityKind kind, EntityRead& out) {
         out.mount = n::GET_MOUNT(h);
     }
     if (n::IS_PED_RAGDOLL(h)) st.flags |= NF_Ragdoll;
+    st.outfit = n::GET_PED_META_OUTFIT_HASH(h);
     if (!n::IS_PED_HUMAN(h)) return;
     st.weapon = n::GET_PED_CURRENT_HELD_WEAPON(h);
     bool combat = n::IS_PED_IN_COMBAT(h, 0);
@@ -269,7 +312,44 @@ EntityHandle Rdr2Game::spawn(EntityKind kind, uint32_t model, const Vec3& pos, f
     return ped;
 }
 
+void Rdr2Game::prefetchModel(uint32_t model) {
+    if (n::IS_MODEL_VALID(model)) n::REQUEST_MODEL(model);
+}
+
+void Rdr2Game::hideDraftAnimals(int vehicle, bool hidden) {
+    for (int harness = 0; harness < 4; ++harness)
+        if (int horse = n::GET_PED_IN_DRAFT_HARNESS(vehicle, harness)) hide(horse, hidden);
+}
+
+void Rdr2Game::park(EntityHandle h) {
+    invalidate(h);
+    if (!n::DOES_ENTITY_EXIST(h)) return;
+    if (vehicles_.count(h)) {
+        n::SET_ENTITY_VELOCITY(h, Vec3{});
+        hideDraftAnimals(h, true);
+    } else {
+        if (n::IS_PED_ON_MOUNT(h)) n::REMOVE_PED_FROM_MOUNT(h);
+        if (n::IS_PED_IN_ANY_VEHICLE(h)) n::CLEAR_PED_TASKS_IMMEDIATELY(h);
+        else n::CLEAR_PED_TASKS(h);
+        npcShots_.erase(h);
+    }
+    hide(h, true);
+}
+
+void Rdr2Game::unpark(EntityHandle h, const Vec3& pos, float heading) {
+    invalidate(h);
+    n::SET_ENTITY_COORDS_AND_HEADING_NO_OFFSET(h, pos, heading);
+    hide(h, false);
+    if (vehicles_.count(h)) {
+        hideDraftAnimals(h, false);
+    } else {
+        n::SET_BLOCKING_OF_NON_TEMPORARY_EVENTS(h, true);  // still driven by us, not by its own AI
+        n::SET_ENTITY_HEALTH(h, n::GET_ENTITY_MAX_HEALTH(h), 0);
+    }
+}
+
 void Rdr2Game::remove(EntityHandle h) {
+    invalidate(h);
     auto blip = blips_.find(h);
     if (blip != blips_.end()) {
         n::REMOVE_BLIP(&blip->second);
@@ -296,25 +376,68 @@ void Rdr2Game::remove(EntityHandle h) {
     }
 }
 
-bool Rdr2Game::exists(EntityHandle h) { return h != 0 && n::DOES_ENTITY_EXIST(h); }
-bool Rdr2Game::isDead(EntityHandle h) { return n::IS_ENTITY_DEAD(h); }
-Vec3 Rdr2Game::position(EntityHandle h) { return n::GET_ENTITY_COORDS(h); }
-float Rdr2Game::heading(EntityHandle h) { return n::GET_ENTITY_HEADING(h); }
-int Rdr2Game::health(EntityHandle h) { return n::IS_ENTITY_DEAD(h) ? 0 : n::GET_ENTITY_HEALTH(h); }
+bool Rdr2Game::exists(EntityHandle h) {
+    if (h == 0) return false;
+    Cached& c = cached(h);
+    if (!(c.have & 1)) {
+        c.exists = n::DOES_ENTITY_EXIST(h);
+        c.have |= 1;
+    }
+    return c.exists;
+}
+bool Rdr2Game::isDead(EntityHandle h) {
+    Cached& c = cached(h);
+    if (!(c.have & 4)) {
+        c.dead = n::IS_ENTITY_DEAD(h);
+        c.have |= 4;
+    }
+    return c.dead;
+}
+Vec3 Rdr2Game::position(EntityHandle h) {
+    Cached& c = cached(h);
+    if (!(c.have & 2)) {
+        c.pos = n::GET_ENTITY_COORDS(h);
+        c.have |= 2;
+    }
+    return c.pos;
+}
+float Rdr2Game::heading(EntityHandle h) {
+    Cached& c = cached(h);
+    if (!(c.have & 8)) {
+        c.heading = n::GET_ENTITY_HEADING(h);
+        c.have |= 8;
+    }
+    return c.heading;
+}
+int Rdr2Game::health(EntityHandle h) {
+    Cached& c = cached(h);
+    if (!(c.have & 16)) {
+        c.health = isDead(h) ? 0 : n::GET_ENTITY_HEALTH(h);
+        c.have |= 16;
+    }
+    return c.health;
+}
 
 void Rdr2Game::setHealth(EntityHandle h, int health, int maxHealth) {
+    invalidate(h);
     if (maxHealth > 0 && n::GET_ENTITY_MAX_HEALTH(h) != maxHealth) n::SET_ENTITY_MAX_HEALTH(h, maxHealth);
     n::SET_ENTITY_HEALTH(h, health, 0);
 }
 
-void Rdr2Game::kill(EntityHandle h) { n::SET_ENTITY_HEALTH(h, 0, 0); }
+void Rdr2Game::kill(EntityHandle h) {
+    invalidate(h);
+    n::SET_ENTITY_HEALTH(h, 0, 0);
+}
 
 void Rdr2Game::teleport(EntityHandle h, const Vec3& pos, float heading) {
+    invalidate(h);
     n::SET_ENTITY_COORDS_AND_HEADING_NO_OFFSET(h, pos, heading);
 }
 
 void Rdr2Game::nudge(EntityHandle h, const Vec3& delta) {
-    n::SET_ENTITY_COORDS_NO_OFFSET(h, n::GET_ENTITY_COORDS(h) + delta);
+    Vec3 to = position(h) + delta;
+    n::SET_ENTITY_COORDS_NO_OFFSET(h, to);
+    cached(h).pos = to;
 }
 
 void Rdr2Game::moveTo(EntityHandle h, const Vec3& pos, float speed, float heading) {
@@ -328,6 +451,8 @@ void Rdr2Game::standStill(EntityHandle h, float heading) {
     n::SET_PED_DESIRED_HEADING(h, heading);
     n::TASK_STAND_STILL(h, -1);
 }
+
+void Rdr2Game::face(EntityHandle h, float heading) { n::SET_PED_DESIRED_HEADING(h, heading); }
 
 void Rdr2Game::aimAt(EntityHandle h, const Vec3& target) { n::TASK_AIM_GUN_AT_COORD(h, target, 1500); }
 
@@ -371,19 +496,28 @@ void Rdr2Game::setLabel(EntityHandle h, const char* name) {
     n::SET_PED_PROMPT_NAME(h, n::LITERAL_STRING(name));
 }
 
-void Rdr2Game::steerVehicle(EntityHandle h, const Vec3& velocity, float heading, float, float) {
+void Rdr2Game::setOutfit(EntityHandle h, uint32_t outfit) {
+    if (!outfit) return;
+    n::EQUIP_META_PED_OUTFIT(h, outfit);
+    n::UPDATE_PED_VARIATION(h);
+}
+
+void Rdr2Game::steerVehicle(EntityHandle h, const Vec3& velocity, float targetHeading, float, float, float dt) {
     n::SET_ENTITY_VELOCITY(h, velocity);
-    // Turn gradually; pitch and roll stay with the physics so wheels and hulls follow the ground.
-    float current = n::GET_ENTITY_HEADING(h);
-    float delta = angleDelta(current, heading);
-    if (std::fabs(delta) > 1.5f) {
+    // Turn gradually (frame-rate independent); pitch and roll stay with the physics so wheels and
+    // hulls follow the ground.
+    float current = heading(h);
+    float delta = angleDelta(current, targetHeading);
+    if (std::fabs(delta) > 1.0f) {
         Vec3 rot = n::GET_ENTITY_ROTATION(h);
-        rot.z = wrapHeading(current + delta * 0.25f);
+        rot.z = wrapHeading(current + delta * (1.0f - std::exp(-dt * 10.0f)));
         n::SET_ENTITY_ROTATION(h, rot);
+        invalidate(h);
     }
 }
 
 void Rdr2Game::damageNpc(EntityHandle npc, int amount, EntityHandle attacker) {
+    invalidate(npc);
     if (n::IS_ENTITY_DEAD(npc)) return;
     int before = n::GET_ENTITY_HEALTH(npc);
     if (attacker && !n::DOES_ENTITY_EXIST(attacker)) attacker = 0;
@@ -422,6 +556,7 @@ void Rdr2Game::hide(int h, bool hidden) {
 }
 
 ForeignAction Rdr2Game::removeForeign(EntityHandle h) {
+    invalidate(h);
     if (!n::DOES_ENTITY_EXIST(h)) return ForeignAction::Deleted;
     // Ambient population is deleted: hidden entities would still cost AI and physics time.
     // Entities owned by a story script are only hidden, so the script does not break.
