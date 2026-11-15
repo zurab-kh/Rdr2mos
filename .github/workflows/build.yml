@@ -1,0 +1,50 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    name: Tests + relay (Linux), plugin (MinGW cross-build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchains
+        run: sudo apt-get update && sudo apt-get install -y ninja-build g++-mingw-w64-x86-64
+      - name: Build and test (native)
+        run: |
+          cmake -S . -B build -G Ninja
+          cmake --build build
+          ctest --test-dir build --output-on-failure
+      - name: Cross-build Windows binaries
+        run: |
+          cmake -S . -B build-win -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-x86_64.cmake
+          cmake --build build-win
+          mkdir -p dist
+          cp build-win/plugin/RDR2Coop.asi plugin/RDR2Coop.ini build-win/rdr2coop-relay.exe build/rdr2coop-relay dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RDR2Coop-mingw
+          path: dist/
+
+  windows:
+    name: Plugin + tests (MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Build and test
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+          ctest --test-dir build --output-on-failure
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RDR2Coop-msvc
+          path: |
+            build/plugin/RDR2Coop.asi
+            build/plugin/RDR2Coop.ini
+            build/rdr2coop-relay.exe
