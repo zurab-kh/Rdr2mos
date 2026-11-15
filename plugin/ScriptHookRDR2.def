@@ -10,3 +10,4 @@ EXPORTS
     "?nativePush64@@YAX_K@Z"
     "?nativeCall@@YAPEA_KXZ"
     "?worldGetAllPeds@@YAHPEAHH@Z"
+    "?worldGetAllVehicles@@YAHPEAHH@Z"

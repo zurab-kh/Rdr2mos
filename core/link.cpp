@@ -39,7 +39,7 @@ void Link::stop() {
         ByteWriter w;
         writePacketHeader(w, PacketType::Bye);
         w.u16(sessionKey());
-        socket_->sendTo(remote_, w.data.data(), w.data.size());
+        transmit(remote_, w.data.data(), w.data.size());
     }
     state_ = State::Idle;
     resetSession();
@@ -101,7 +101,7 @@ void Link::sendHello(const Endpoint& to, uint32_t nowMs) {
     ByteWriter w;
     writePacketHeader(w, PacketType::Hello);
     write(w, config_.local);
-    socket_->sendTo(to, w.data.data(), w.data.size());
+    transmit(to, w.data.data(), w.data.size());
     lastHelloMs_ = nowMs;
     helloSent_ = true;
 }
@@ -110,18 +110,20 @@ void Link::sendRegister(uint32_t nowMs) {
     ByteWriter w;
     writePacketHeader(w, PacketType::RelayRegister);
     w.str(config_.room);
-    socket_->sendTo(config_.remote, w.data.data(), w.data.size());
+    transmit(config_.remote, w.data.data(), w.data.size());
     lastRegisterMs_ = nowMs;
     registerSent_ = true;
 }
 
 void Link::update(uint32_t nowMs) {
     if (!socket_ || state_ == State::Idle || state_ == State::Failed) return;
+    updateRates(nowMs);
 
     uint8_t buffer[2048];
     Endpoint from;
     int size;
     while ((size = socket_->recvFrom(from, buffer, sizeof(buffer))) >= 0) {
+        bytesIn_ += static_cast<uint32_t>(size);
         handleDatagram(from, buffer, static_cast<size_t>(size), nowMs);
         if (state_ == State::Failed) return;
     }
@@ -237,6 +239,21 @@ void Link::handleData(ByteReader& r, uint32_t nowMs) {
     }
 }
 
+void Link::transmit(const Endpoint& to, const uint8_t* data, size_t size) {
+    if (socket_->sendTo(to, data, size)) bytesOut_ += static_cast<uint32_t>(size);
+}
+
+void Link::updateRates(uint32_t nowMs) {
+    uint32_t elapsed = nowMs - rateStartMs_;
+    if (elapsed < 1000) return;
+    if (elapsed < 3000) {
+        sendRate_ = static_cast<uint32_t>(uint64_t(bytesOut_) * 1000 / elapsed);
+        receiveRate_ = static_cast<uint32_t>(uint64_t(bytesIn_) * 1000 / elapsed);
+    }
+    bytesOut_ = bytesIn_ = 0;
+    rateStartMs_ = nowMs;
+}
+
 void Link::flush(uint32_t nowMs) {
     if (!socket_ || state_ != State::Connected) return;
 
@@ -247,7 +264,7 @@ void Link::flush(uint32_t nowMs) {
         lastPingMs_ = nowMs;
     }
 
-    ByteWriter w;
+    ByteWriter& w = packet_;
     size_t records = 0;
     auto begin = [&] {
         w.data.clear();
@@ -257,7 +274,7 @@ void Link::flush(uint32_t nowMs) {
         records = 0;
     };
     auto sendPacket = [&] {
-        socket_->sendTo(remote_, w.data.data(), w.data.size());
+        transmit(remote_, w.data.data(), w.data.size());
         lastSendMs_ = nowMs;
         ackDirty_ = false;
     };

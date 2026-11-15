@@ -1,4 +1,8 @@
 // Wire protocol shared by the game plugin, the relay server and the tests.
+//
+// Bandwidth matters more than CPU here, so world state is sent as compact, field-masked
+// entity updates: positions as 2 cm steps relative to a per-packet anchor, headings as
+// 16-bit angles, velocities as 0.25 m/s steps, and only the fields that changed.
 #pragma once
 #include <cstdint>
 #include <string>
@@ -8,9 +12,10 @@
 namespace coop {
 
 constexpr uint16_t kMagic = 0x4352;  // "RC"
-constexpr uint8_t kProtocolVersion = 1;
+constexpr uint8_t kProtocolVersion = 2;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr size_t kMaxDatagram = 1200;  // stays below any sane path MTU
+constexpr size_t kMaxMessage = 1100;   // payload budget for one unreliable message
 
 enum class PacketType : uint8_t {
     Hello = 1,
@@ -21,18 +26,24 @@ enum class PacketType : uint8_t {
 };
 
 enum class Role : uint8_t {
-    Host = 0,   // owns the story world: missions, NPCs, clock
+    Host = 0,   // owns the story world: missions, NPCs, vehicles, clock, weather
     Guest = 1,  // joins the host's world
 };
 
 enum class Msg : uint8_t {
     PlayerState = 1,
-    WorldSnapshot = 2,
+    EntitySnapshot = 2,
     Damage = 3,
     WorldInfo = 4,
     Ping = 5,
     Pong = 6,
 };
+
+// References to things in the host's world. Entity ids are assigned by the host.
+constexpr uint16_t kRefNone = 0;
+constexpr uint16_t kRefHostPlayer = 0xFFFE;
+constexpr uint16_t kRefGuestPlayer = 0xFFFD;
+constexpr uint16_t kMaxEntityId = 0xFFF0;
 
 struct HelloInfo {
     Role role = Role::Host;
@@ -54,66 +65,100 @@ enum PlayerFlags : uint16_t {
 
 struct PlayerState {
     uint32_t timeMs = 0;       // sender clock
-    Vec3 pos;                  // the mount's position while PF_OnMount is set
+    Vec3 pos;                  // the mount's / vehicle's position while riding or driving
     Vec3 vel;
     float heading = 0;
     Vec3 aim;                  // world point the player is aiming at
     uint16_t health = 0;
     uint16_t maxHealth = 0;
     uint32_t weapon = 0;
-    uint32_t mountModel = 0;
     uint16_t flags = 0;
+    // PF_OnMount: a host-world entity id, or kRefNone + model for the player's own horse.
+    uint16_t mountRef = kRefNone;
+    uint32_t mountModel = 0;
+    // PF_InVehicle: same idea; seat -1 is the driver.
+    uint16_t vehicleRef = kRefNone;
+    uint32_t vehicleModel = 0;
+    int8_t seat = -1;
 };
 
-enum NpcFlags : uint8_t {
+enum class EntityKind : uint8_t { Ped = 0, Vehicle = 1 };
+
+enum EntityFields : uint8_t {
+    EF_Pos = 1 << 0,
+    EF_Heading = 1 << 1,
+    EF_Tilt = 1 << 2,      // pitch + roll (vehicles)
+    EF_Vel = 1 << 3,
+    EF_Health = 1 << 4,
+    EF_State = 1 << 5,     // flags, weapon, mount/vehicle/target references
+    EF_Static = 1 << 6,    // kind + model
+    EF_FarPos = 1 << 7,    // wire only: position sent as full floats
+};
+
+enum EntityFlags : uint8_t {
     NF_Dead = 1 << 0,
     NF_Shooting = 1 << 1,
     NF_InCombat = 1 << 2,
-    NF_TargetsGuest = 1 << 3,  // fighting the guest rather than the host
-    NF_Ragdoll = 1 << 4,
+    NF_Ragdoll = 1 << 3,
+    NF_Aiming = 1 << 4,
 };
 
-struct NpcState {
-    uint16_t id = 0;           // host-assigned, never 0
+struct EntityState {
+    uint16_t id = 0;           // host-assigned, 1..kMaxEntityId
+    uint8_t fields = 0;        // which of the groups below are meaningful
+    // EF_Static
+    EntityKind kind = EntityKind::Ped;
     uint32_t model = 0;
+    // EF_Pos / EF_Heading / EF_Tilt / EF_Vel
     Vec3 pos;
     float heading = 0;
-    float speed = 0;
+    float pitch = 0, roll = 0;
+    Vec3 vel;
+    // EF_Health
     int16_t health = 0;
+    // EF_State
     uint8_t flags = 0;
-    uint16_t mountId = 0;      // id of the NPC this one rides, 0 if on foot
     uint32_t weapon = 0;
+    uint16_t mountRef = kRefNone;
+    uint16_t vehicleRef = kRefNone;
+    int8_t seat = -1;
+    uint16_t targetRef = kRefNone;
 };
-constexpr size_t kNpcWireSize = 30;
-constexpr size_t kMaxNpcsPerPacket = 32;
 
-struct WorldSnapshot {
+struct EntitySnapshot {
     uint32_t timeMs = 0;
-    std::vector<NpcState> npcs;
+    Vec3 anchor;                       // positions are encoded relative to this point
+    std::vector<EntityState> entities;
+    std::vector<uint16_t> removed;     // ids that no longer exist / left the streamed area
 };
-
-constexpr uint16_t kTargetPlayer = 0;  // Damage::target meaning "you, the peer player"
 
 struct Damage {
-    uint16_t target = kTargetPlayer;   // NPC id (guest -> host) or kTargetPlayer
+    uint16_t target = kRefNone;        // host-world entity id (guest -> host), or a player ref
     uint16_t amount = 0;
 };
 
 struct WorldInfo {
     uint8_t hour = 0, minute = 0, second = 0;
-    uint8_t worldSync = 0;     // host is streaming its NPCs; the guest should show only those
+    uint8_t worldSync = 0;     // host is streaming its world; the guest should show only that
+    uint32_t weather = 0;      // weather type hash, 0 = unknown
 };
 
 void write(ByteWriter& w, const HelloInfo& v);
 bool read(ByteReader& r, HelloInfo& v);
 void write(ByteWriter& w, const PlayerState& v);
 bool read(ByteReader& r, PlayerState& v);
-void write(ByteWriter& w, const WorldSnapshot& v);
-bool read(ByteReader& r, WorldSnapshot& v);
+void write(ByteWriter& w, const EntitySnapshot& v);
+bool read(ByteReader& r, EntitySnapshot& v);
 void write(ByteWriter& w, const Damage& v);
 bool read(ByteReader& r, Damage& v);
 void write(ByteWriter& w, const WorldInfo& v);
 bool read(ByteReader& r, WorldInfo& v);
+
+// Bytes one entity takes on the wire with the given anchor.
+size_t encodedSize(const EntityState& e, const Vec3& anchor);
+// Splits entities (and removals) into as many snapshot messages as needed to stay under maxBytes each.
+void encodeSnapshots(uint32_t timeMs, const Vec3& anchor, const std::vector<EntityState>& entities,
+                     const std::vector<uint16_t>& removed, size_t maxBytes, std::vector<std::vector<uint8_t>>& out);
 
 template <typename T>
 std::vector<uint8_t> encode(const T& v) {
@@ -122,9 +167,13 @@ std::vector<uint8_t> encode(const T& v) {
     return std::move(w.data);
 }
 template <typename T>
+bool decode(const uint8_t* data, size_t size, T& v) {
+    ByteReader r(data, size);
+    return read(r, v) && r.remaining() == 0;
+}
+template <typename T>
 bool decode(const std::vector<uint8_t>& bytes, T& v) {
-    ByteReader r(bytes.data(), bytes.size());
-    return read(r, v);
+    return decode(bytes.data(), bytes.size(), v);
 }
 
 // Every datagram starts with this 4-byte header.

@@ -47,6 +47,9 @@ public:
     uint32_t epoch() const { return epoch_; }
     // Relay mode: players currently in the room (0 = relay not answering yet).
     int relayPeers() const { return relayPeers_; }
+    // Traffic over the last second, in bytes per second (UDP payload, without IP/UDP headers).
+    uint32_t sendRate() const { return sendRate_; }
+    uint32_t receiveRate() const { return receiveRate_; }
 
 private:
     struct Record {
@@ -68,6 +71,8 @@ private:
     void beginConnecting(uint32_t nowMs);
     void resetSession();
     void fail(const std::string& why);
+    void transmit(const Endpoint& to, const uint8_t* data, size_t size);
+    void updateRates(uint32_t nowMs);
     uint16_t sessionKey() const;
 
     IDatagramSocket* socket_ = nullptr;
@@ -79,6 +84,8 @@ private:
     uint32_t epoch_ = 0;
     int pingMs_ = -1;
     int relayPeers_ = 0;
+    uint32_t bytesOut_ = 0, bytesIn_ = 0, sendRate_ = 0, receiveRate_ = 0, rateStartMs_ = 0;
+    ByteWriter packet_;  // reused for every outgoing data packet
 
     uint32_t lastReceiveMs_ = 0;
     uint32_t lastSendMs_ = 0;

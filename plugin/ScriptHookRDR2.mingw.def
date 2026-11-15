@@ -10,3 +10,4 @@ EXPORTS
     sh_nativePush64 == "?nativePush64@@YAX_K@Z"
     sh_nativeCall == "?nativeCall@@YAPEA_KXZ"
     sh_worldGetAllPeds == "?worldGetAllPeds@@YAHPEAHH@Z"
+    sh_worldGetAllVehicles == "?worldGetAllVehicles@@YAHPEAHH@Z"

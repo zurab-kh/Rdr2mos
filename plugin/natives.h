@@ -62,6 +62,14 @@ inline void SET_ENTITY_HEALTH(Entity e, int health, Entity killer) { call(0xAC27
 inline void SET_ENTITY_MAX_HEALTH(Entity e, int value) { call(0x166E7CF68597D8B5, e, value); }
 inline void SET_ENTITY_COORDS(Entity e, coop::Vec3 p) { call(0x06843DA7060A026B, e, p.x, p.y, p.z, 0, 0, 0, 0); }
 inline void SET_ENTITY_COORDS_NO_OFFSET(Entity e, coop::Vec3 p) { call(0x239A3351AC1DA385, e, p.x, p.y, p.z, 0, 0, 0); }
+inline void SET_ENTITY_COORDS_AND_HEADING_NO_OFFSET(Entity e, coop::Vec3 p, float heading) {
+    call(0x0918E3565C20F03C, e, p.x, p.y, p.z, heading, 0, 0);
+}
+inline coop::Vec3 GET_ENTITY_ROTATION(Entity e) { return invoke<Vector3>(0xE09CAF86C32CB48F, e, 2).vec(); }
+inline void SET_ENTITY_ROTATION(Entity e, coop::Vec3 r) { call(0x9CC8314DFEDE441E, e, r.x, r.y, r.z, 2, 1); }
+inline void SET_ENTITY_VELOCITY(Entity e, coop::Vec3 v) { call(0x1C99BB7B6E96D16F, e, v.x, v.y, v.z); }
+inline bool IS_ENTITY_A_MISSION_ENTITY(Entity e) { return test(0x138190F64DB4BBD1, e); }
+inline bool IS_ENTITY_A_PED(Entity e) { return test(0xCF8176912DDA4EA5, e); }
 inline void SET_ENTITY_HEADING(Entity e, float heading) { call(0xCF2B9C0645C4651B, e, heading); }
 inline void SET_ENTITY_AS_MISSION_ENTITY(Entity e) { call(0xDC19C288082E586E, e, 1, 1); }
 inline void SET_ENTITY_INVINCIBLE(Entity e, bool on) { call(0xA5C38736C426FCB8, e, on ? 1 : 0); }
@@ -78,6 +86,13 @@ inline Ped CREATE_PED(Hash model, coop::Vec3 p, float heading) {
     return invoke<Ped>(0xD49F9B0955C367DE, model, p.x, p.y, p.z, heading, 0, 0, 0, 0);
 }
 inline void DELETE_PED(Ped* ped) { call(0xCC0EF140F99365C5, ped); }
+inline bool IS_PED_WEAPON_READY_TO_SHOOT(Ped ped) { return test(0xB80CA294F2F26749, ped); }
+inline Entity GET_CURRENT_TARGET_FOR_PED(Ped ped) { return invoke<Entity>(0xCD66FEA29400A0B5, ped); }
+inline void SET_PED_INTO_VEHICLE(Ped ped, int vehicle, int seat) { call(0xF75B0D629E1C063D, ped, vehicle, seat); }
+inline int GET_VEHICLE_PED_IS_IN(Ped ped) { return invoke<int>(0x9A9112A0FE9A4713, ped, 0); }
+inline void SET_PED_CROUCH_MOVEMENT(Ped ped, bool on) { call(0x7DE9692C6F64CFE8, ped, on ? 1 : 0, 0, 0); }
+inline void SET_PED_TO_RAGDOLL(Ped ped, int minMs, int maxMs) { call(0xAE99FB955581844A, ped, minMs, maxMs, 0, 0, 0, static_cast<const char*>(nullptr)); }
+inline int GET_VEHICLE_DRAFT_HORSE_IS_ATTACHED_TO(Ped horse) { return invoke<int>(0xE4770DA1B8FF4FD1, horse); }
 inline void SET_RANDOM_OUTFIT_VARIATION(Ped ped) { call(0x283978A15512B2FE, ped, 1); }
 inline bool IS_PED_A_PLAYER(Ped ped) { return test(0x12534C348C6CB68B, ped); }
 inline bool IS_PED_HUMAN(Ped ped) { return test(0xB980061DA992779D, ped); }
@@ -107,12 +122,20 @@ inline void SET_SCENARIO_HUMAN_DENSITY_MULTIPLIER_THIS_FRAME(float m) { call(0x2
 inline void SET_SCENARIO_ANIMAL_DENSITY_MULTIPLIER_THIS_FRAME(float m) { call(0xDB48E99F8E064E56, m); }
 
 // --- VEHICLE
+inline int CREATE_VEHICLE(Hash model, coop::Vec3 p, float heading) {
+    return invoke<int>(0xAF35D0D2583051B0, model, p.x, p.y, p.z, heading, 0, 0, 0, 0);
+}
+inline void DELETE_VEHICLE(int* vehicle) { call(0xE20A909D8C4A70F8, vehicle); }
+inline Ped GET_PED_IN_VEHICLE_SEAT(int vehicle, int seat) { return invoke<Ped>(0xBB40DD2270B65366, vehicle, seat); }
+inline Ped GET_PED_IN_DRAFT_HARNESS(int vehicle, int harness) { return invoke<Ped>(0xA8BA0BAE0173457B, vehicle, harness); }
+inline bool IS_THIS_MODEL_A_TRAIN(Hash model) { return test(0xFC08C8F8C1EDF174, model); }
 inline void SET_VEHICLE_DENSITY_MULTIPLIER_THIS_FRAME(float m) { call(0x606374EBFC27B133, m); }
 inline void SET_RANDOM_VEHICLE_DENSITY_MULTIPLIER_THIS_FRAME(float m) { call(0x1F91D44490E1EA0C, m); }
 inline void SET_PARKED_VEHICLE_DENSITY_MULTIPLIER_THIS_FRAME(float m) { call(0xFEDFA97638D61D4A, m); }
 
 // --- TASK
 inline void CLEAR_PED_TASKS(Ped ped) { call(0xE1EF3C1216AFF2CD, ped, 1, 1); }
+inline void CLEAR_PED_TASKS_IMMEDIATELY(Ped ped) { call(0xAAA34F8A7CB32098, ped, 0, 0); }
 inline void TASK_STAND_STILL(Ped ped, int timeMs) { call(0x919BE13EED931959, ped, timeMs); }
 inline void TASK_GO_STRAIGHT_TO_COORD(Ped ped, coop::Vec3 p, float moveBlend, float finalHeading) {
     call(0xD76B57B44F1E6F8B, ped, p.x, p.y, p.z, moveBlend, -1, finalHeading, 0.2f, 0);
@@ -146,6 +169,10 @@ inline int GET_CLOCK_SECONDS() { return invoke<int>(0xB6101ABE62B5F080); }
 inline void SET_CLOCK_TIME(int h, int m, int s) { call(0x3A52C59FFB2DEED8, h, m, s); }
 inline bool GET_MISSION_FLAG() { return test(0xB15CD1CF58771DE1); }
 inline bool GET_IS_LOADING_SCREEN_ACTIVE() { return test(0x71D4BF5890659B0C); }
+inline uint32_t GET_PREV_WEATHER_TYPE_HASH_NAME() { return invoke<uint32_t>(0x4BEB42AEBCA732E9); }
+inline void SET_WEATHER_TYPE(Hash weather, float transitionSeconds) {
+    call(0x59174F1AFE095B5A, weather, 1, 1, 1, transitionSeconds, 0);
+}
 inline const char* LITERAL_STRING(const char* text) { return invoke<const char*>(0xFA925AC00EB830B9, 10, "LITERAL_STRING", text); }
 
 // --- MAP / HUD

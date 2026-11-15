@@ -2,6 +2,7 @@
 // ScriptHookRDR2 plugin entry point: configuration, hotkeys, HUD and the per-frame loop.
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <memory>
@@ -51,6 +52,19 @@ int parseKey(std::string name) {
     }
     if (name.size() == 1 && ((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= '0' && name[0] <= '9'))) return name[0];
     return 0;
+}
+
+// Millisecond clock with sub-millisecond precision. GetTickCount() only advances every
+// 10-16 ms, which would show up as visible stutter in the interpolation.
+uint32_t clockMs() {
+    static const double ticksPerMs = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return static_cast<double>(f.QuadPart) / 1000.0;
+    }();
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return static_cast<uint32_t>(static_cast<uint64_t>(c.QuadPart / ticksPerMs));
 }
 
 bool gameHasFocus() {
@@ -120,11 +134,11 @@ struct Settings {
         session.worldSync = ini.getBool("sync", "world_sync", true);
         session.friendlyFire = ini.getBool("sync", "friendly_fire", false);
         session.syncClock = ini.getBool("sync", "sync_clock", true);
-        session.npcRadius = ini.getFloat("sync", "npc_radius", 120.0f);
-        session.maxNpcs = ini.getInt("sync", "max_npcs", 48);
-        if (session.npcRadius < 20.0f) session.npcRadius = 20.0f;
-        if (session.maxNpcs < 0) session.maxNpcs = 0;
-        if (session.maxNpcs > 128) session.maxNpcs = 128;
+        session.syncWeather = ini.getBool("sync", "sync_weather", true);
+        session.softCorrection = ini.getBool("sync", "soft_correction", true);
+        session.npcRadius = std::clamp(ini.getFloat("sync", "radius", 150.0f), 30.0f, 400.0f);
+        session.maxPeds = std::clamp(ini.getInt("sync", "max_peds", 64), 0, 200);
+        session.maxVehicles = std::clamp(ini.getInt("sync", "max_vehicles", 16), 0, 64);
 
         toggleKey = ini.get("keys", "toggle", "F7");
         teleportKey = ini.get("keys", "teleport_to_friend", "F8");
@@ -147,7 +161,7 @@ public:
 
         bool wantAutoConnect = settings_.autoConnect;
         for (;;) {
-            uint32_t now = GetTickCount();
+            uint32_t now = clockMs();
             game_.frame(now);
 
             if (wantAutoConnect && game_.ready()) {
@@ -265,17 +279,19 @@ private:
             if (!link_->error().empty()) drawText(link_->error(), x, y += 0.026f, 0.28f, 255, 110, 90);
         } else {
             const SessionStatus& st = session_->status();
-            std::snprintf(line, sizeof(line), "Co-op: %s  |  ping %d ms", link_->peer().name.c_str(),
-                          link_->pingMs() < 0 ? 0 : link_->pingMs());
+            std::snprintf(line, sizeof(line), "Co-op: %s  |  ping %d ms  |  up %.1f / down %.1f KB/s",
+                          link_->peer().name.c_str(), link_->pingMs() < 0 ? 0 : link_->pingMs(),
+                          link_->sendRate() / 1024.0f, link_->receiveRate() / 1024.0f);
             drawText(line, x, y, 0.30f, 140, 230, 140);
             if (st.peerVisible || st.peerDistance > 0) {
-                std::snprintf(line, sizeof(line), "%.0f m away%s%s  [%s] teleport", st.peerDistance,
-                              st.peerDead ? "  |  DEAD" : "", st.peerInMission ? "  |  in mission" : "",
+                std::snprintf(line, sizeof(line), "%.0f m away%s%s  |  smoothing %d ms  [%s] teleport", st.peerDistance,
+                              st.peerDead ? "  |  DEAD" : "", st.peerInMission ? "  |  in mission" : "", st.bufferMs,
                               settings_.teleportKey.c_str());
                 drawText(line, x, y += 0.026f, 0.28f, 220, 220, 220);
             }
-            if (settings_.role == Role::Guest && settings_.session.worldSync) {
-                std::snprintf(line, sizeof(line), "Host world: %d NPCs synced", st.syncedNpcs);
+            if (settings_.session.worldSync) {
+                std::snprintf(line, sizeof(line), settings_.role == Role::Guest ? "Host world: %d shown" : "World: %d streamed",
+                              st.syncedEntities);
                 drawText(line, x, y += 0.026f, 0.28f, 220, 220, 220);
             }
         }
