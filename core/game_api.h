@@ -4,6 +4,7 @@
 // Performance contract: listNearby() is called often and must be cheap (handle + position).
 // The expensive readEntity() is only called for entities whose update is due.
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -109,6 +110,12 @@ public:
     // Peds and vehicles within `radius` of either point. Excludes the local player's own peds,
     // draft animals (they belong to their vehicle) and trains.
     virtual void listNearby(const Vec3& a, const Vec3& b, float radius, std::vector<NearbyEntity>& out) = 0;
+    // The same for any number of points (the world owner and every other player). An entity near
+    // several of them may be listed more than once. The default asks listNearby() for each pair of
+    // points; a game that walks its entity pools should do it in one pass.
+    virtual void listNearbyAny(const Vec3* points, size_t count, float radius, std::vector<NearbyEntity>& out) {
+        for (size_t i = 0; i < count; i += 2) listNearby(points[i], points[i + 1 < count ? i + 1 : i], radius, out);
+    }
     virtual void readEntity(EntityHandle h, EntityKind kind, EntityRead& out) = 0;
     // Every ped and vehicle in the local world (guest: used to clear out the local population).
     virtual void listForeign(std::vector<ForeignEntity>& out) = 0;
@@ -125,6 +132,14 @@ public:
     virtual void park(EntityHandle h) = 0;
     virtual void unpark(EntityHandle h, const Vec3& pos, float heading) = 0;
     virtual void remove(EntityHandle h) = 0;
+    // Turns an entity the mod created into an ordinary entity of the local world, left where it
+    // is: the horse or wagon the player is on when the world it was copied from goes away (the
+    // world owner left, or removed the original). Return false if that is not possible; the
+    // session then removes it as before.
+    virtual bool adopt(EntityHandle h) {
+        (void)h;
+        return false;
+    }
     virtual bool exists(EntityHandle h) = 0;
     virtual bool isDead(EntityHandle h) = 0;
     virtual Vec3 position(EntityHandle h) = 0;

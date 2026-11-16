@@ -8,9 +8,12 @@
 //    sent, and idle entities only send a keyframe once a second.
 //  * Damage is routed by the server to whoever owns the victim.
 //  * Control can move across: if someone drives the owner's wagon or rides the owner's horse, the
-//    owner moves the real one from that player's stream.
+//    owner moves the real one from that player's stream, and so does everybody else with their
+//    copy. A seat in another player's own wagon is referred to by that player, so it stays one
+//    wagon in every game; a ride whose original goes away (owner left) stays with its rider.
 //  * Shared story: each player's own copies of mission NPCs are linked to the owner's.
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -72,8 +75,11 @@ public:
 
 private:
     struct Mover {
-        enum Mode { None, Idle, Moving } mode = None;
-        uint32_t lastTaskMs = 0;
+        enum Mode { None, Idle, Settle, Moving } mode = None;
+        uint32_t lastTaskMs = 0, settleSinceMs = 0, lastCheckMs = 0;
+        Vec3 restPos;           // standing still: the spot and heading of the last check
+        float restHeading = 0;
+        bool still = false;     // ... and it was on that spot, facing that way
         uint32_t lastFaceMs = 0;
         Vec3 lastGoal;
         float lastSpeed = 0;
@@ -157,19 +163,32 @@ private:
     void restoreWorld();
     void notice(const std::string& text);
 
-    void movePed(EntityHandle h, Mover& m, const MotionSample& target, float dt, uint32_t nowMs);
+    void movePed(EntityHandle h, Mover& m, const MotionBuffer& motion, const MotionSample& target, float dt, uint32_t nowMs);
     void steerVehicle(EntityHandle h, Mover& m, const MotionSample& target, float dt);
-    void forwardDamage(EntityHandle h, int& expectedHealth, uint16_t target, bool onlyLocalPlayer = false);
+    void forwardDamage(EntityHandle h, int& expectedHealth, uint16_t target);
     Vec3 refPosition(uint16_t ref, bool& found);
     EntityHandle resolveRef(uint16_t ref);
+    EntityHandle resolveVehicle(uint16_t ref);
     uint16_t refOf(EntityHandle h);
     bool isSessionEntity(EntityHandle h) const;
     bool inPool(EntityHandle h) const;
+    // The local player rides it or drives it.
+    bool localRides(EntityHandle h) const {
+        return h && (h == local_.mount || (h == local_.vehicle && local_.state.seat == -1));
+    }
+    // Another player's puppet rides it or sits in it.
+    bool puppetUses(EntityHandle h) const {
+        for (const auto& entry : puppets_)
+            if (h == entry.second.ridingOn || h == entry.second.seatedIn) return true;
+        return false;
+    }
+    bool puppetDrives(EntityHandle h) const { return std::find(driven_.begin(), driven_.end(), h) != driven_.end(); }
     Puppet* puppetByPed(EntityHandle h);
     void destroyPuppet(Puppet& p);
     void destroyMirror(Mirror& m, bool recycle);
     EntityHandle obtain(EntityKind kind, uint32_t model, const Vec3& pos, float heading);
     void flushPool(uint32_t nowMs, bool all);
+    EntityHandle takeOverOwnVehicle(uint32_t model, const Vec3& pos);
     uint16_t allocateId();
     bool isOwner() const { return myId_ != 0 && myId_ == owner_; }
 
@@ -190,10 +209,13 @@ private:
     std::map<uint8_t, Puppet> puppets_;
 
     LocalPlayer local_;
+    EntityHandle localPed_ = 0;  // the local player's ped this frame
+    EntityHandle ownVehicle_ = 0; // the last vehicle of our own world we sat in
     bool haveLocal_ = false;
     uint32_t lastStateMs_ = 0;
     uint16_t lastSentFlags_ = 0;
     bool lastSentMoving_ = false;
+    uint32_t lastMovingMs_ = 0;
     uint32_t lastOutfitCheckMs_ = 0, sentOutfit_ = 0;
     bool appearanceSent_ = false;
     uint32_t lastWorldMs_ = 0, lastInfoMs_ = 0, lastForeignMs_ = 0;
@@ -212,18 +234,32 @@ private:
     std::vector<Parked> pool_;
     bool ownerWorldSync_ = false;
     std::vector<MissionEntity> missionLocal_;
+    struct BindCandidate {
+        float d2;
+        Mirror* mirror;
+        size_t local;  // into missionLocal_
+    };
+    std::vector<BindCandidate> bindPairs_;
     uint32_t lastMissionScanMs_ = 0;
 
     // scratch buffers reused every tick
     std::vector<NearbyEntity> nearby_;
-    std::vector<std::pair<float, size_t>> order_;
-    std::vector<Vec3> viewers_;
+    struct Candidate {
+        float rank;            // distance that decides who gets streamed first
+        float viewerDistance;  // to the nearest other player
+        size_t index;          // into nearby_
+    };
+    std::vector<Candidate> order_;
+    std::vector<Vec3> points_;  // the owner, then every other player
     std::vector<EntityState> outgoing_;
     std::vector<uint16_t> removedIds_;
     std::vector<std::vector<uint8_t>> packets_;
     std::vector<ForeignEntity> foreign_;
     std::vector<Mirror*> spawnQueue_;
     std::vector<uint32_t> prefetched_;
+    std::vector<EntityHandle> driven_;  // shared entities other players steer this frame (their puppets move them)
+    std::vector<StorySync::Peer> peers_;
+    EntitySnapshot snapshot_;           // decoded snapshots reuse its entity list
 };
 
 }  // namespace coop

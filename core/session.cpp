@@ -8,6 +8,7 @@ namespace coop {
 namespace {
 constexpr uint32_t kPlayerIntervalMs = 33;       // ~30 Hz own character
 constexpr uint32_t kIdlePlayerIntervalMs = 200;  // standing still: 5 Hz is plenty
+constexpr uint32_t kStopRepeatMs = 250;          // after stopping, the full rate continues this long
 constexpr uint32_t kWorldIntervalMs = 66;        // ~15 Hz world tick; entities update every 1, 2 or 4 ticks
 constexpr uint32_t kInfoIntervalMs = 2000;
 constexpr uint32_t kKeyframeMs = 1000;           // every streamed entity is fully refreshed this often
@@ -25,6 +26,8 @@ constexpr uint32_t kPoolKeepMs = 10000;
 constexpr uint32_t kBindWaitMs = 2500;           // shared story: wait this long for our own copy before a stand-in
 constexpr uint32_t kMissionScanMs = 250;
 constexpr float kBindDistance = 35.0f;
+constexpr float kLeadMs = 500.0f;                // walking peds head for where they will be this much later
+constexpr uint32_t kIdleRecheckMs = 500;         // a ped standing where it should is looked at this often
 
 constexpr int kGroupPos = 0, kGroupHeading = 1, kGroupTilt = 2, kGroupVel = 3, kGroupHealth = 4, kGroupState = 5,
               kGroupStatic = 6;
@@ -89,14 +92,15 @@ void CoopSession::tick(uint32_t nowMs) {
     handleMessages(nowMs);
     if (myId_ && haveRoster_ && game_.ready()) {
         ++frame_;
+        localPed_ = game_.localPlayerPed();
         sendLocalState(nowMs);
         sendAppearance(nowMs);
         if (isOwner()) sendWorld(nowMs);
         updatePuppets(nowMs, dt);
-        std::vector<StorySync::Peer> peers;
+        peers_.clear();
         for (const auto& [id, p] : puppets_)
-            if (p.haveState) peers.push_back({id, p.state.flags, p.state.pos});
-        story_.tick(nowMs, local_.state, peers, owner_, myId_);
+            if (p.haveState) peers_.push_back({id, p.state.flags, p.state.pos});
+        story_.tick(nowMs, local_.state, peers_, owner_, myId_);
         status_.holding = story_.holding();
         status_.spectating = story_.spectating();
         status_.missionMismatch = story_.missionMismatch();
@@ -159,6 +163,8 @@ void CoopSession::cleanup() {
     lastStateMs_ = 0;
     lastSentFlags_ = 0;
     lastSentMoving_ = false;
+    lastMovingMs_ = 0;
+    ownVehicle_ = localPed_ = 0;
     lastOutfitCheckMs_ = sentOutfit_ = 0;
     appearanceSent_ = false;
     story_.reset();
@@ -207,16 +213,31 @@ CoopSession::Puppet* CoopSession::puppetByPed(EntityHandle h) {
     return nullptr;
 }
 
+// A vehicle reference that may also name a player: their own vehicle, which exists as a copy in
+// every game (a puppet vehicle elsewhere, the real one in their game).
+EntityHandle CoopSession::resolveVehicle(uint16_t ref) {
+    if (!isPlayerRef(ref)) return resolveRef(ref);
+    uint8_t id = playerOfRef(ref);
+    if (id == myId_) return ownVehicle_ && game_.exists(ownVehicle_) ? ownVehicle_ : 0;
+    auto it = puppets_.find(id);
+    return it != puppets_.end() && it->second.ownVehicle && game_.exists(it->second.ownVehicle) ? it->second.ownVehicle : 0;
+}
+
 uint16_t CoopSession::refOf(EntityHandle h) {
     if (!h) return kRefNone;
-    if (h == game_.localPlayerPed()) return playerRef(myId_);
-    if (Puppet* p = puppetByPed(h)) return playerRef(p->id);
+    if (h == localPed_) return playerRef(myId_);
     if (isOwner()) {
         auto it = streamed_.find(h);
-        return it != streamed_.end() ? it->second.id : kRefNone;
+        if (it != streamed_.end()) return it->second.id;
+    } else {
+        auto it = mirrorByHandle_.find(h);
+        if (it != mirrorByHandle_.end()) return it->second;
     }
-    auto it = mirrorByHandle_.find(h);
-    return it != mirrorByHandle_.end() ? it->second : kRefNone;
+    // A player's own vehicle (ours, or a puppet's) is named after the player.
+    if (h == ownVehicle_) return playerRef(myId_);
+    for (const auto& [id, p] : puppets_)
+        if (h == p.ped || h == p.ownVehicle) return playerRef(id);
+    return kRefNone;
 }
 
 Vec3 CoopSession::refPosition(uint16_t ref, bool& found) {
@@ -274,6 +295,21 @@ EntityHandle CoopSession::obtain(EntityKind kind, uint32_t model, const Vec3& po
     return game_.spawn(kind, model, pos, heading, SpawnRole::Mirror);
 }
 
+// The world owner got out of a vehicle of its own: from now on it streams it as part of the world.
+// Our puppet copy of it (maybe with us or others in it) simply becomes the mirror, instead of a
+// second wagon appearing on top of it.
+EntityHandle CoopSession::takeOverOwnVehicle(uint32_t model, const Vec3& pos) {
+    for (auto& [id, p] : puppets_) {
+        EntityHandle h = p.ownVehicle;
+        if (!h || p.ownVehicleModel != model || p.seatedIn == h || !game_.exists(h)) continue;
+        if (distanceSq(game_.position(h), pos) > 16.0f) continue;
+        p.ownVehicle = 0;
+        p.ownVehicleUnusedMs = 0;
+        return h;
+    }
+    return 0;
+}
+
 void CoopSession::flushPool(uint32_t nowMs, bool all) {
     for (auto it = pool_.begin(); it != pool_.end();) {
         if (all || nowMs - it->sinceMs > kPoolKeepMs) {
@@ -310,8 +346,11 @@ void CoopSession::destroyMirror(Mirror& m, bool recycle) {
     if (m.handle) {
         mirrorByHandle_.erase(m.handle);
         if (game_.exists(m.handle)) {
-            // Live entities are parked for reuse: the next mirror of the same model appears instantly.
-            if (recycle && pool_.size() < kPoolSize && !game_.isDead(m.handle)) {
+            if (localRides(m.handle) && game_.adopt(m.handle)) {
+                // The original is gone, but the player is on this one: it stays, as part of our
+                // own game, instead of vanishing under them.
+            } else if (recycle && pool_.size() < kPoolSize && !game_.isDead(m.handle)) {
+                // Live entities are parked for reuse: the next mirror of the same model appears instantly.
                 game_.park(m.handle);
                 pool_.push_back(Parked{m.handle, m.st.kind, m.st.model, lastTickMs_});
             } else {
@@ -424,8 +463,8 @@ void CoopSession::handleMessages(uint32_t nowMs) {
                 break;
             }
             case Msg::EntitySnapshot: {
-                EntitySnapshot snap;
-                if (!isOwner() && decode(payload, snap)) onSnapshot(snap, nowMs);
+                // Decoded into a reused snapshot: its entity list keeps its capacity across messages.
+                if (!isOwner() && decode(payload, snapshot_)) onSnapshot(snapshot_, nowMs);
                 break;
             }
             case Msg::Damage: {
@@ -534,15 +573,25 @@ void CoopSession::sendLocalState(uint32_t nowMs) {
     local_ = game_.readLocalPlayer();
     haveLocal_ = true;
     PlayerState& s = local_.state;
+    s.flags |= story_.extraFlags();
+    // The last vehicle of our own that we sat in (not a copy of someone else's): the others may
+    // still sit in it after we got out.
+    if (local_.vehicle && !mirrorByHandle_.count(local_.vehicle) && !isSessionEntity(local_.vehicle))
+        ownVehicle_ = local_.vehicle;
+    else if (ownVehicle_ && !game_.exists(ownVehicle_))
+        ownVehicle_ = 0;
     // Full rate while anything happens, 5 Hz while standing still. Discrete changes (first shot,
-    // mounting, starting to move) go out immediately instead of waiting for the next tick.
+    // mounting, starting to move) go out immediately instead of waiting for the next tick. A stop
+    // keeps the full rate a moment longer: if the stopping update is lost, the next one follows
+    // at once instead of leaving the others to guess for a fifth of a second.
     bool moving = horizontalSpeed(s.vel) > 0.15f || std::fabs(s.vel.z) > 0.5f ||
                   (s.flags & (PF_Aiming | PF_Shooting | PF_Ragdoll)) != 0;
-    uint32_t interval = moving || lastSentMoving_ ? kPlayerIntervalMs : kIdlePlayerIntervalMs;
+    if (moving) lastMovingMs_ = nowMs ? nowMs : 1;
+    bool active = moving || (lastMovingMs_ && nowMs - lastMovingMs_ < kStopRepeatMs);
+    uint32_t interval = active ? kPlayerIntervalMs : kIdlePlayerIntervalMs;
     bool due = first || nowMs - lastStateMs_ >= interval;
     if (!due && s.flags == lastSentFlags_ && moving == lastSentMoving_) return;
     lastSentMoving_ = moving;
-    s.flags |= story_.extraFlags();
     s.timeMs = nowMs;
     s.mountRef = kRefNone;
     s.vehicleRef = kRefNone;
@@ -551,8 +600,11 @@ void CoopSession::sendLocalState(uint32_t nowMs) {
         if (s.mountRef > kMaxEntityId) s.mountRef = kRefNone;
     }
     if (s.flags & PF_InVehicle) {
+        // A shared-world vehicle by its id, or a seat in another player's own vehicle by that
+        // player's reference (their copy of it exists in every game), or our own (kRefNone + model).
         s.vehicleRef = refOf(local_.vehicle);
-        if (s.vehicleRef > kMaxEntityId) s.vehicleRef = kRefNone;
+        if (s.vehicleRef > kMaxEntityId && !(isPlayerRef(s.vehicleRef) && playerOfRef(s.vehicleRef) != myId_))
+            s.vehicleRef = kRefNone;
     }
     lastStateMs_ = nowMs;
     lastSentFlags_ = s.flags;
@@ -579,55 +631,52 @@ void CoopSession::sendWorld(uint32_t nowMs) {
     if (!config_.worldSync || (lastWorldMs_ != 0 && nowMs - lastWorldMs_ < kWorldIntervalMs)) return;
     lastWorldMs_ = nowMs ? nowMs : 1;
 
-    // Everybody else looks at the world from their own position.
+    // Everybody else looks at the world from their own position. points_[0] is the owner.
     Vec3 hostPos = local_.state.pos;
-    viewers_.clear();
+    points_.clear();
+    points_.push_back(hostPos);
     for (const auto& [id, p] : puppets_)
-        if (p.haveState) viewers_.push_back(p.state.pos);
-    if (viewers_.empty()) {
+        if (p.haveState) points_.push_back(p.state.pos);
+    if (points_.size() == 1) {
         // Nobody to stream to; the server keeps what was sent before.
         status_.syncedEntities = 0;
         return;
     }
-    auto viewerDistance = [&](const Vec3& pos) {
-        float best = 1e30f;
-        for (const Vec3& v : viewers_) best = std::min(best, distance(pos, v));
-        return best;
-    };
 
+    // One query for all the points (the default runs one per pair); duplicates are merged below.
     nearby_.clear();
     float reach = config_.npcRadius + kStreamHysteresis;
-    for (const Vec3& v : viewers_) {
-        // One query around the owner and each player (the game merges duplicates below).
-        game_.listNearby(hostPos, v, reach, nearby_);
+    game_.listNearbyAny(points_.data(), points_.size(), reach, nearby_);
+    if (points_.size() > 2) {
+        std::sort(nearby_.begin(), nearby_.end(), [](const NearbyEntity& a, const NearbyEntity& b) { return a.handle < b.handle; });
+        nearby_.erase(std::unique(nearby_.begin(), nearby_.end(),
+                                  [](const NearbyEntity& a, const NearbyEntity& b) { return a.handle == b.handle; }),
+                      nearby_.end());
     }
-    std::sort(nearby_.begin(), nearby_.end(), [](const NearbyEntity& a, const NearbyEntity& b) { return a.handle < b.handle; });
-    nearby_.erase(std::unique(nearby_.begin(), nearby_.end(),
-                              [](const NearbyEntity& a, const NearbyEntity& b) { return a.handle == b.handle; }),
-                  nearby_.end());
 
     // Closest to a viewer first; keep at most maxPeds / maxVehicles. Hysteresis keeps entities at
     // the edge (of the radius or of the budget) from popping in and out every tick.
     order_.clear();
     for (size_t i = 0; i < nearby_.size(); ++i) {
-        if (isSessionEntity(nearby_[i].handle)) continue;
-        bool streamed = streamed_.count(nearby_[i].handle) != 0;
-        float dv = viewerDistance(nearby_[i].pos);
-        float range = std::min(dv, distance(nearby_[i].pos, hostPos));
-        if (!streamed && range > config_.npcRadius) continue;
-        float d = std::min(dv, distance(nearby_[i].pos, hostPos) + 15.0f);
-        order_.emplace_back(streamed ? d - 10.0f : d, i);
+        const NearbyEntity& n = nearby_[i];
+        if (isSessionEntity(n.handle)) continue;
+        bool streamed = streamed_.count(n.handle) != 0;
+        float viewer2 = 1e30f;
+        for (size_t k = 1; k < points_.size(); ++k) viewer2 = std::min(viewer2, distanceSq(n.pos, points_[k]));
+        float dv = std::sqrt(viewer2), dh = distance(n.pos, hostPos);
+        if (!streamed && std::min(dv, dh) > config_.npcRadius) continue;
+        float d = std::min(dv, dh + 15.0f);
+        order_.push_back({streamed ? d - 10.0f : d, dv, i});
     }
-    std::sort(order_.begin(), order_.end());
+    std::sort(order_.begin(), order_.end(), [](const Candidate& a, const Candidate& b) { return a.rank < b.rank; });
 
     for (auto& [h, s] : streamed_) s.seen = false;
     int peds = 0, vehicles = 0;
-    for (const auto& [d, index] : order_) {
-        const NearbyEntity& n = nearby_[index];
+    for (const Candidate& cand : order_) {
+        const NearbyEntity& n = nearby_[cand.index];
         int& count = n.kind == EntityKind::Vehicle ? vehicles : peds;
         int cap = n.kind == EntityKind::Vehicle ? config_.maxVehicles : config_.maxPeds;
-        bool mustKeep = n.handle == local_.vehicle;
-        for (const auto& [id, p] : puppets_) mustKeep = mustKeep || n.handle == p.ridingOn || n.handle == p.seatedIn;
+        bool mustKeep = n.handle == local_.vehicle || puppetUses(n.handle);
         if (count >= cap && !mustKeep) continue;
         ++count;
         auto it = streamed_.find(n.handle);
@@ -645,10 +694,23 @@ void CoopSession::sendWorld(uint32_t nowMs) {
             continue;  // handle recycled by the game as a different kind; it will be replaced below
         }
         it->second.seen = true;
-        it->second.viewerDistance = viewerDistance(n.pos);
+        it->second.viewerDistance = cand.viewerDistance;
     }
 
     for (auto it = streamed_.begin(); it != streamed_.end();) {
+        if (!it->second.seen && (puppetUses(it->first) || game_.belongsToLocalPlayer(it->first)) &&
+            game_.exists(it->first)) {
+            // A shared entity stays shared while we or another player use it, even though the game
+            // stops listing what the local player uses: if we take a wagon everybody sees, they
+            // keep seeing that one (with us on it) instead of it vanishing for a copy.
+            Vec3 at = game_.position(it->first);
+            float viewer2 = 1e30f;
+            for (size_t k = 1; k < points_.size(); ++k) viewer2 = std::min(viewer2, distanceSq(at, points_[k]));
+            if (std::min(viewer2, distanceSq(at, hostPos)) <= reach * reach) {
+                it->second.seen = true;
+                it->second.viewerDistance = std::sqrt(viewer2);
+            }
+        }
         if (it->second.seen) {
             ++it;
             continue;
@@ -687,9 +749,9 @@ void CoopSession::streamEntity(Streamed& s, uint32_t nowMs) {
     EntityState cur = read.state;
     cur.kind = s.kind;
     cur.mountRef = refOf(read.mount);
-    cur.vehicleRef = refOf(read.vehicle);
+    cur.vehicleRef = refOf(read.vehicle);  // a player ref: sitting in that player's own vehicle
     if (cur.mountRef > kMaxEntityId) cur.mountRef = kRefNone;
-    if (cur.vehicleRef > kMaxEntityId) cur.vehicleRef = kRefNone;
+    if (cur.vehicleRef > kMaxEntityId && !isPlayerRef(cur.vehicleRef)) cur.vehicleRef = kRefNone;
     cur.targetRef = refOf(read.target);
 
     EntityState& sent = s.sent;
@@ -744,11 +806,21 @@ void CoopSession::streamEntity(Streamed& s, uint32_t nowMs) {
 
 // ---------------------------------------------------------------- driving
 
-void CoopSession::movePed(EntityHandle h, Mover& m, const MotionSample& t, float dt, uint32_t nowMs) {
+void CoopSession::movePed(EntityHandle h, Mover& m, const MotionBuffer& motion, const MotionSample& t, float dt,
+                          uint32_t nowMs) {
+    float speed = horizontalSpeed(t.vel);
+    // Standing on its spot, facing the right way, and the stream says the same as before: nothing
+    // to do but look now and then whether the local game pushed it away.
+    if (m.mode == Mover::Idle && m.still && speed < 0.35f && nowMs - m.lastCheckMs < kIdleRecheckMs &&
+        distanceSq(t.pos, m.restPos) < 0.0025f && std::fabs(angleDelta(m.restHeading, t.heading)) < 2.0f)
+        return;
+    m.lastCheckMs = nowMs;
+    m.restPos = t.pos;
+    m.restHeading = t.heading;
+    m.still = false;
     Vec3 pos = game_.position(h);
     Vec3 err = t.pos - pos;
     float dist = length(err);
-    float speed = horizontalSpeed(t.vel);
     float snap = 5.0f + speed * 0.5f;  // faster movers (horses) get more slack before a warp
     if ((m.mode == Mover::None && dist > 1.0f) || dist > snap) {
         game_.teleport(h, t.pos, t.heading);
@@ -756,31 +828,72 @@ void CoopSession::movePed(EntityHandle h, Mover& m, const MotionSample& t, float
         m.lastTaskMs = nowMs;
         return;
     }
-    if (speed < 0.35f && dist < 0.5f) {
-        if (m.mode != Mover::Idle) {
-            game_.standStill(h, t.heading);
-            m.mode = Mover::Idle;
-            m.lastTaskMs = nowMs;
-        } else if (nowMs - m.lastFaceMs >= 100 && std::fabs(angleDelta(game_.heading(h), t.heading)) > 4.0f) {
-            game_.face(h, t.heading);  // turn on the spot smoothly, following the stream
-            m.lastFaceMs = nowMs;
+    Vec3 goal;
+    float want;
+    if (speed < 0.35f) {
+        // At rest. Standing still is entered only close to the spot and left only well away from
+        // it, so a ped does not shuffle; a ped that stopped short takes a step onto the spot first
+        // (for a while at most: some spots cannot be reached exactly).
+        bool settled = m.mode == Mover::Idle ? dist < 0.6f
+                                             : dist < 0.15f || (m.mode == Mover::Settle && nowMs - m.settleSinceMs > 1500);
+        if (settled) {
+            if (m.mode != Mover::Idle) {
+                game_.standStill(h, t.heading);
+                m.mode = Mover::Idle;
+                m.lastTaskMs = nowMs;
+            } else if (std::fabs(angleDelta(game_.heading(h), t.heading)) > 4.0f) {
+                if (nowMs - m.lastFaceMs >= 100) {
+                    game_.face(h, t.heading);  // turn on the spot smoothly, following the stream
+                    m.lastFaceMs = nowMs;
+                }
+            } else {
+                m.still = true;
+            }
+            return;
         }
-        return;
+        if (m.mode != Mover::Settle) {
+            m.mode = Mover::Settle;
+            m.settleSinceMs = nowMs;
+            m.lastTaskMs = nowMs - 1000;  // re-task now
+        }
+        goal = t.pos;
+        want = std::clamp(dist * 2.0f, 0.6f, 1.6f);
+    } else {
+        if (m.mode != Mover::Moving) m.lastTaskMs = nowMs - 1000;
+        m.mode = Mover::Moving;
+        // Head for where the entity will be in a moment, on its real path (the jitter buffer holds
+        // the next part of it), so the ped never stops between updates and does not cut curves.
+        // Speed follows the stream, a little faster while behind and slower while ahead.
+        Vec3 dir{t.vel.x / speed, t.vel.y / speed, 0};
+        float along = err.x * dir.x + err.y * dir.y;  // > 0: the ped is behind
+        MotionSample ahead = motion.predict(kLeadMs);
+        // A sharp turn within that time: aim at the corner first, or the ped cuts across it.
+        MotionSample mid = motion.predict(kLeadMs * 0.5f);
+        Vec3 first{mid.pos.x - t.pos.x, mid.pos.y - t.pos.y, 0}, second{ahead.pos.x - mid.pos.x, ahead.pos.y - mid.pos.y, 0};
+        float l1 = length(first), l2 = length(second);
+        if (l1 > 0.1f && l2 > 0.1f && first.x * second.x + first.y * second.y < 0.85f * l1 * l2) ahead = mid;
+        goal = ahead.pos;
+        // Ahead of where it should be: slow down, but never turn back (unless the path stops there).
+        float forward = (goal.x - pos.x) * dir.x + (goal.y - pos.y) * dir.y;
+        if (forward < 0.6f && horizontalSpeed(ahead.vel) > 0.35f) goal = goal + dir * (0.6f - forward);
+        want = std::max(speed + std::clamp(along * 1.5f, -0.5f * speed, 0.5f * speed + 0.5f), 0.5f);
     }
-    // Head for where the entity will be shortly, so it never stops between updates, and
-    // walk a little faster while behind to close the gap.
-    Vec3 goal = t.pos + Vec3{t.vel.x, t.vel.y, 0} * 0.5f;
-    float want = std::max(speed, 0.8f) * (1.0f + std::clamp(dist * 0.3f, 0.0f, 0.6f));
-    bool retask = m.mode != Mover::Moving || nowMs - m.lastTaskMs >= 500 || distance(goal, m.lastGoal) > 1.0f ||
-                  std::fabs(want - m.lastSpeed) > 0.25f * std::max(m.lastSpeed, 1.0f);
+    // A new task only when it says something different: another direction, another speed, or the
+    // old goal is about to be reached (the ped would stop there).
+    Vec3 toNew{goal.x - pos.x, goal.y - pos.y, 0}, toOld{m.lastGoal.x - pos.x, m.lastGoal.y - pos.y, 0};
+    float newLen = length(toNew), oldLen = length(toOld);
+    float turn = newLen > 1e-3f && oldLen > 1e-3f
+                     ? (toNew.x * toOld.x + toNew.y * toOld.y) / (newLen * oldLen)
+                     : -1.0f;  // cosine of the change of direction
+    bool retask = nowMs - m.lastTaskMs >= 500 || turn < 0.995f || oldLen < 0.4f * newLen ||
+                  std::fabs(want - m.lastSpeed) > 0.15f * std::max(m.lastSpeed, 1.0f);
     if (retask) {
         game_.moveTo(h, goal, want, t.heading);
-        m.mode = Mover::Moving;
         m.lastTaskMs = nowMs;
         m.lastGoal = goal;
         m.lastSpeed = want;
     }
-    if (config_.softCorrection && dist > 0.35f) {
+    if (config_.softCorrection && dist > 0.35f && m.mode == Mover::Moving) {
         Vec3 flat{err.x, err.y, 0};
         game_.nudge(h, flat * std::min(1.0f, dt * 3.0f));
     }
@@ -804,19 +917,17 @@ void CoopSession::steerVehicle(EntityHandle h, Mover& m, const MotionSample& t, 
     game_.steerVehicle(h, t.vel + pull, t.heading, t.pitch, t.roll, dt);
 }
 
-void CoopSession::forwardDamage(EntityHandle h, int& expectedHealth, uint16_t target, bool onlyLocalPlayer) {
+void CoopSession::forwardDamage(EntityHandle h, int& expectedHealth, uint16_t target) {
     int current = game_.health(h);
     if (current < expectedHealth) {
         bool byLocalPlayer = game_.wasDamagedByLocalPlayer(h);
         bool forward;
-        if (onlyLocalPlayer) {
-            // A linked mission NPC also fights with its own AI here; the owner simulates the same
-            // fight, so only our own hits count. The rest is undone by the owner's health.
+        if (!isPlayerRef(target)) {
+            // A copy of an owner's NPC lost health. Only our own hits count: everything else that
+            // happens to it here (a linked mission NPC fighting with its own AI, a fall after a
+            // correction, a collision with another copy) the owner simulates with the real one,
+            // so passing it on would count it twice. The owner's health undoes the rest.
             forward = byLocalPlayer;
-        } else if (!isPlayerRef(target)) {
-            // A mirror lost health. Remote characters only fire blanks here, so whatever hurt it
-            // was our doing: tell the owner, whose real NPC it is.
-            forward = true;
         } else if (isOwner()) {
             // The owner's NPCs hurt other players' puppets for real; the owner only with friendly fire.
             forward = !byLocalPlayer || config_.friendlyFire;
@@ -834,6 +945,7 @@ void CoopSession::forwardDamage(EntityHandle h, int& expectedHealth, uint16_t ta
 // ---------------------------------------------------------------- other players' characters
 
 void CoopSession::updatePuppets(uint32_t nowMs, float dt) {
+    driven_.clear();
     status_.peerVisible = false;
     status_.peerInCutscene = false;
     const Puppet* nearest = nullptr;
@@ -907,9 +1019,12 @@ void CoopSession::updatePuppet(Puppet& p, uint32_t nowMs, float dt) {
 
     // --- what the player is sitting on: a shared entity, or one of their own
     EntityHandle wantMount = 0, wantVehicle = 0;
-    bool controlsShared = false;  // they steer an entity of the shared world (the owner moves it)
+    // They steer an entity of the shared world. The owner moves the real one from their stream, and
+    // every other game moves its copy from their stream too: fresher than the owner's echo of it
+    // (one network hop instead of three) and exactly the motion the puppet itself shows.
+    bool controlsShared = false;
     if (s.flags & PF_InVehicle) {
-        wantVehicle = resolveRef(s.vehicleRef);
+        wantVehicle = resolveVehicle(s.vehicleRef);
         if (!wantVehicle && s.vehicleRef == kRefNone && s.vehicleModel) {
             if (p.ownVehicle && p.ownVehicleModel != s.vehicleModel) {
                 game_.remove(p.ownVehicle);
@@ -920,8 +1035,8 @@ void CoopSession::updatePuppet(Puppet& p, uint32_t nowMs, float dt) {
                 p.ownVehicleModel = s.vehicleModel;
             }
             wantVehicle = p.ownVehicle;
-        } else if (wantVehicle && s.seat == -1) {
-            controlsShared = isOwner();
+        } else if (wantVehicle && s.seat == -1 && !isPlayerRef(s.vehicleRef)) {
+            controlsShared = !(local_.vehicle == wantVehicle && local_.state.seat == -1) && !puppetDrives(wantVehicle);
         }
     } else if (s.flags & PF_OnMount) {
         wantMount = resolveRef(s.mountRef);
@@ -940,9 +1055,10 @@ void CoopSession::updatePuppet(Puppet& p, uint32_t nowMs, float dt) {
             }
             wantMount = p.ownMount;
         } else if (wantMount) {
-            controlsShared = isOwner();
+            controlsShared = local_.mount != wantMount && !puppetDrives(wantMount);
         }
     }
+    if (controlsShared) driven_.push_back(wantVehicle ? wantVehicle : wantMount);
 
     if (wantVehicle != p.seatedIn || (wantVehicle && s.seat != p.seat)) {
         if (p.ridingOn) {
@@ -962,6 +1078,9 @@ void CoopSession::updatePuppet(Puppet& p, uint32_t nowMs, float dt) {
         p.ridingOn = wantMount;
         p.mover = p.bodyMover = Mover{};
     }
+    // A shared entity is already where it should be (more or less): take it over smoothly instead
+    // of snapping it onto the puppet's stream, which runs a little earlier or later than the world's.
+    if (controlsShared && p.bodyMover.mode == Mover::None) p.bodyMover.mode = Mover::Moving;
     // Own rides that are no longer used disappear after a while (or at once if far away).
     auto expire = [&](EntityHandle& h, uint32_t& unusedSince, bool inUse) {
         if (!h) return;
@@ -977,7 +1096,7 @@ void CoopSession::updatePuppet(Puppet& p, uint32_t nowMs, float dt) {
         }
     };
     expire(p.ownMount, p.ownMountUnusedMs, p.ridingOn == p.ownMount);
-    expire(p.ownVehicle, p.ownVehicleUnusedMs, p.seatedIn == p.ownVehicle);
+    expire(p.ownVehicle, p.ownVehicleUnusedMs, p.seatedIn == p.ownVehicle || local_.vehicle == p.ownVehicle);
 
     if (s.weapon != p.weapon) {
         game_.setWeapon(p.ped, s.weapon);
@@ -997,7 +1116,7 @@ void CoopSession::updatePuppet(Puppet& p, uint32_t nowMs, float dt) {
     if (p.seatedIn) {
         if (p.seat == -1 && (ownRide || controlsShared)) steerVehicle(p.seatedIn, p.bodyMover, target, dt);
     } else if (p.ridingOn) {
-        if (ownRide || controlsShared) movePed(p.ridingOn, p.bodyMover, target, dt, nowMs);
+        if (ownRide || controlsShared) movePed(p.ridingOn, p.bodyMover, p.motion, target, dt, nowMs);
     }
     bool shooting = (s.flags & PF_Shooting) != 0;
     bool aiming = (s.flags & PF_Aiming) != 0;
@@ -1017,7 +1136,7 @@ void CoopSession::updatePuppet(Puppet& p, uint32_t nowMs, float dt) {
             game_.teleport(p.ped, target.pos, target.heading);  // keep a shooting puppet from drifting away
     } else {
         p.aimingTask = false;
-        if (onFoot && !p.ragdolled) movePed(p.ped, p.mover, target, dt, nowMs);
+        if (onFoot && !p.ragdolled) movePed(p.ped, p.mover, p.motion, target, dt, nowMs);
     }
 }
 
@@ -1033,28 +1152,34 @@ void CoopSession::bindMissionEntities(uint32_t nowMs) {
     // Pair each owner mission entity with our own copy: the copy keeps its AI and its role in our
     // mission, while health, death and position follow the owner. A mission objective like
     // "kill them all" therefore completes in every game.
+    // Copies of the same NPC type are paired closest first over all of them, so the pairing does
+    // not depend on the order the mirrors happen to be visited in (that could pair an enemy with
+    // the copy of its neighbour, which then slides across to where it should be).
+    bindPairs_.clear();
+    const float reach2 = kBindDistance * kBindDistance;
     for (auto& [id, m] : mirrors_) {
         if (m.bound || !m.st.script || !m.haveStatic || !m.havePos) continue;
-        const MissionEntity* best = nullptr;
-        float bestDistance = kBindDistance;
-        for (const MissionEntity& e : missionLocal_) {
+        if (localRides(m.handle)) continue;  // not while the player is on the stand-in
+        for (size_t i = 0; i < missionLocal_.size(); ++i) {
+            const MissionEntity& e = missionLocal_[i];
             if (e.kind != m.st.kind || e.model != m.st.model || e.script != m.st.script) continue;
-            if (mirrorByHandle_.count(e.handle) || isSessionEntity(e.handle)) continue;
-            float d = distance(e.pos, m.st.pos);
-            if (d < bestDistance) {
-                bestDistance = d;
-                best = &e;
-            }
+            float d2 = distanceSq(e.pos, m.st.pos);
+            if (d2 < reach2) bindPairs_.push_back({d2, &m, i});
         }
-        if (!best || !game_.exists(best->handle)) continue;
+    }
+    std::sort(bindPairs_.begin(), bindPairs_.end(), [](const BindCandidate& a, const BindCandidate& b) { return a.d2 < b.d2; });
+    for (const BindCandidate& c : bindPairs_) {
+        Mirror& m = *c.mirror;
+        const MissionEntity& e = missionLocal_[c.local];
+        if (m.bound || mirrorByHandle_.count(e.handle) || isSessionEntity(e.handle) || !game_.exists(e.handle)) continue;
         if (m.handle) destroyMirror(m, true);  // replace the stand-in shown so far
-        m.handle = best->handle;
+        m.handle = e.handle;
         m.bound = true;
         m.mover = Mover{};
         m.lastUpdateMs = 0;
         m.deadSinceMs = 0;
         m.outfitApplied = m.st.outfit;  // it is the real one: already dressed by its script
-        mirrorByHandle_[m.handle] = id;
+        mirrorByHandle_[m.handle] = m.id;
         game_.setHarmless(m.handle, true);
         m.expectedHealth = game_.health(m.handle);
     }
@@ -1080,12 +1205,26 @@ void CoopSession::updateMirrors(uint32_t nowMs, float dt) {
     int shown = 0;
     for (auto it = mirrors_.begin(); it != mirrors_.end();) {
         Mirror& m = it->second;
-        if (nowMs - m.lastHeardMs > kMirrorTimeoutMs) {  // the owner stopped mentioning it
+        // The owner stopped mentioning it (what we ride or drive waits: our game moves it anyway,
+        // and an explicit removal or a new world still ends it).
+        if (nowMs - m.lastHeardMs > kMirrorTimeoutMs && !localRides(m.handle)) {
             destroyMirror(m, true);
             it = mirrors_.erase(it);
             continue;
         }
         ++it;
+        // CPU level of detail: what is far from us is updated every 2nd or 4th frame (staggered by
+        // id so the work spreads evenly). Motion is time-based, so nothing slows down. Skipped
+        // frames cost nothing, not even a look whether the entity still exists.
+        if (m.handle && !m.bound && m.lastUpdateMs) {
+            float range = distance(m.st.pos, view);
+            uint32_t every = range < 35.0f ? 1u : range < 80.0f ? 2u : 4u;
+            if (m.st.kind == EntityKind::Vehicle) every = std::min(every, 2u);  // physics drifts if left alone longer
+            if ((frame_ + m.id) % every != 0) {
+                ++shown;
+                continue;
+            }
+        }
         if (m.handle && !game_.exists(m.handle)) {
             mirrorByHandle_.erase(m.handle);
             m.handle = 0;
@@ -1106,7 +1245,8 @@ void CoopSession::updateMirrors(uint32_t nowMs, float dt) {
             m.lastUpdateMs = nowMs;
             MotionSample t = m.motion.sample(nowMs);
             if (m.st.kind == EntityKind::Vehicle) {
-                if (!(local_.vehicle == m.handle && local_.state.seat == -1)) steerVehicle(m.handle, m.mover, t, step);
+                if (!(local_.vehicle == m.handle && local_.state.seat == -1) && !puppetDrives(m.handle))
+                    steerVehicle(m.handle, m.mover, t, step);
                 continue;
             }
             if (m.st.flags & NF_Dead) {
@@ -1114,7 +1254,7 @@ void CoopSession::updateMirrors(uint32_t nowMs, float dt) {
                 m.expectedHealth = 0;
                 continue;
             }
-            forwardDamage(m.handle, m.expectedHealth, m.id, true);
+            forwardDamage(m.handle, m.expectedHealth, m.id);
             if (game_.isDead(m.handle)) {
                 if (!m.deadSinceMs) m.deadSinceMs = nowMs ? nowMs : 1;
                 else if (nowMs - m.deadSinceMs > kRespawnGraceMs && m.st.health > 0) {
@@ -1129,25 +1269,20 @@ void CoopSession::updateMirrors(uint32_t nowMs, float dt) {
                 game_.setHealth(m.handle, m.st.health, 0);
                 m.expectedHealth = game_.health(m.handle);
             }
-            if (local_.mount != m.handle) followBound(m.handle, t, step);
+            if (local_.mount != m.handle && !puppetDrives(m.handle)) followBound(m.handle, t, step);
             continue;
         }
         if (m.st.outfit && m.st.outfit != m.outfitApplied && m.st.kind == EntityKind::Ped) {
             game_.setOutfit(m.handle, m.st.outfit);
             m.outfitApplied = m.st.outfit;
         }
-        // CPU level of detail: what is far from us is updated every 2nd or 4th frame (staggered by
-        // id so the work spreads evenly). Motion is time-based, so nothing slows down.
-        float range = distance(m.st.pos, view);
-        uint32_t every = range < 35.0f ? 1u : range < 80.0f ? 2u : 4u;
-        if (m.st.kind == EntityKind::Vehicle) every = std::min(every, 2u);  // physics drifts if left alone longer
-        if ((frame_ + m.id) % every != 0 && m.lastUpdateMs) continue;
         float step = m.lastUpdateMs ? std::clamp((nowMs - m.lastUpdateMs) / 1000.0f, 0.0f, 0.25f) : dt;
         m.lastUpdateMs = nowMs;
         if (m.st.kind == EntityKind::Vehicle) {
             MotionSample t = m.motion.sample(nowMs);
-            // We are driving it: our game moves it and the owner follows.
-            if (local_.vehicle == m.handle && local_.state.seat == -1) continue;
+            // We are driving it: our game moves it and the owner follows. Another player drives it:
+            // their puppet moves it.
+            if ((local_.vehicle == m.handle && local_.state.seat == -1) || puppetDrives(m.handle)) continue;
             steerVehicle(m.handle, m.mover, t, step);
         } else {
             updateMirrorPed(m, nowMs, step);
@@ -1173,7 +1308,8 @@ void CoopSession::updateMirrors(uint32_t nowMs, float dt) {
         --budget;
         MotionSample t = m->motion.empty() ? MotionSample{} : m->motion.sample(nowMs);
         Vec3 pos = m->motion.empty() ? m->st.pos : t.pos;
-        m->handle = obtain(m->st.kind, m->st.model, pos, m->st.heading);
+        m->handle = m->st.kind == EntityKind::Vehicle ? takeOverOwnVehicle(m->st.model, pos) : 0;
+        if (!m->handle) m->handle = obtain(m->st.kind, m->st.model, pos, m->st.heading);
         if (!m->handle) continue;
         mirrorByHandle_[m->handle] = m->id;
         m->weapon = 0xFFFFFFFFu;  // force weapon / outfit to be applied (pooled entities keep old ones)
@@ -1210,7 +1346,7 @@ void CoopSession::updateMirrorPed(Mirror& m, uint32_t nowMs, float dt) {
     }
 
     // Seats and saddles follow the owner's references.
-    EntityHandle vehicle = resolveRef(m.st.vehicleRef);
+    EntityHandle vehicle = resolveVehicle(m.st.vehicleRef);
     EntityHandle mount = vehicle ? 0 : resolveRef(m.st.mountRef);
     if (vehicle != m.seatedIn || (vehicle && m.seat != m.st.seat)) {
         if (m.ridingOn) {
@@ -1250,10 +1386,10 @@ void CoopSession::updateMirrorPed(Mirror& m, uint32_t nowMs, float dt) {
         m.mover.mode = Mover::None;
     }
 
-    // We ride this horse: our game moves it.
-    bool weRide = local_.mount == m.handle;
+    // We ride this horse: our game moves it. Another player rides it: their puppet moves it.
+    bool weRide = local_.mount == m.handle || puppetDrives(m.handle);
     bool standingShooter = (shooting || aiming) && horizontalSpeed(t.vel) < 1.0f;
-    if (!m.seatedIn && !m.ridingOn && !weRide && !m.ragdolled && !standingShooter) movePed(m.handle, m.mover, t, dt, nowMs);
+    if (!m.seatedIn && !m.ridingOn && !weRide && !m.ragdolled && !standingShooter) movePed(m.handle, m.mover, m.motion, t, dt, nowMs);
 }
 
 void CoopSession::clearForeign(uint32_t nowMs) {
