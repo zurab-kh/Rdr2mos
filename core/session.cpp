@@ -6,23 +6,23 @@
 namespace coop {
 
 namespace {
-constexpr uint32_t kPlayerIntervalMs = 33;   // ~30 Hz own character
-constexpr uint32_t kWorldIntervalMs = 66;    // ~15 Hz world tick; entities update every 1, 2 or 4 ticks
+constexpr uint32_t kPlayerIntervalMs = 33;       // ~30 Hz own character
+constexpr uint32_t kIdlePlayerIntervalMs = 200;  // standing still: 5 Hz is plenty
+constexpr uint32_t kWorldIntervalMs = 66;        // ~15 Hz world tick; entities update every 1, 2 or 4 ticks
 constexpr uint32_t kInfoIntervalMs = 2000;
-constexpr uint32_t kKeyframeMs = 1000;       // every streamed entity is fully refreshed this often
-constexpr uint32_t kRedundancyMs = 200;      // a change is repeated this long, covering lost packets
+constexpr uint32_t kKeyframeMs = 1000;           // every streamed entity is fully refreshed this often
+constexpr uint32_t kRedundancyMs = 200;          // a change is repeated this long, covering lost packets
 constexpr uint32_t kRemovalResendMs = 300;
 constexpr uint32_t kMirrorTimeoutMs = 3000;
 constexpr uint32_t kForeignScanMs = 500;
 constexpr uint32_t kRespawnGraceMs = 1500;
 constexpr uint32_t kOwnRideKeepMs = 30000;
-constexpr int kSpawnsPerFrame = 3;
-constexpr uint32_t kIdlePlayerIntervalMs = 200;  // standing still: 5 Hz is plenty
 constexpr uint32_t kOutfitCheckMs = 2000;
+constexpr int kSpawnsPerFrame = 3;
 constexpr float kStreamHysteresis = 20.0f;       // entities leave the stream this much further out than they enter
 constexpr size_t kPoolSize = 24;
 constexpr uint32_t kPoolKeepMs = 10000;
-constexpr uint32_t kBindWaitMs = 2500;      // shared story: wait this long for the local copy before showing a mirror
+constexpr uint32_t kBindWaitMs = 2500;           // shared story: wait this long for our own copy before a stand-in
 constexpr uint32_t kMissionScanMs = 250;
 constexpr float kBindDistance = 35.0f;
 
@@ -33,7 +33,7 @@ float horizontalSpeed(const Vec3& v) { return std::sqrt(v.x * v.x + v.y * v.y); 
 
 // Remote characters fire "blanks": their shots are aimed above the target so the bullets the
 // local game simulates do not hit anything. Real damage only travels through Damage messages,
-// decided by the machine that owns the shooter, which keeps both worlds in agreement.
+// decided by the machine that owns the shooter, which keeps all worlds in agreement.
 Vec3 blankTarget(Vec3 p) {
     p.z += 1.8f;
     return p;
@@ -44,12 +44,12 @@ Vec3 forwardPoint(const Vec3& pos, float heading, float dist) {
     return {pos.x - std::sin(rad) * dist, pos.y + std::cos(rad) * dist, pos.z + 1.0f};
 }
 
-// How often (in world ticks) an entity is refreshed, by distance to the guest.
-uint32_t updateInterval(float guestDistance, const EntityState& st) {
-    if (st.flags & (NF_Shooting | NF_InCombat | NF_Aiming)) return guestDistance < 60.0f ? 1 : 2;
-    if (st.kind == EntityKind::Vehicle && length(st.vel) > 3.0f) return guestDistance < 80.0f ? 1 : 2;
-    if (guestDistance < 30.0f) return 1;
-    if (guestDistance < 80.0f) return 2;
+// How often (in world ticks) an entity is refreshed, by distance to the nearest other player.
+uint32_t updateInterval(float viewerDistance, const EntityState& st) {
+    if (st.flags & (NF_Shooting | NF_InCombat | NF_Aiming)) return viewerDistance < 60.0f ? 1 : 2;
+    if (st.kind == EntityKind::Vehicle && length(st.vel) > 3.0f) return viewerDistance < 80.0f ? 1 : 2;
+    if (viewerDistance < 30.0f) return 1;
+    if (viewerDistance < 80.0f) return 2;
     return 4;
 }
 }  // namespace
@@ -58,47 +58,6 @@ CoopSession::CoopSession(IGame& game, Link& link, const SessionConfig& config)
     : game_(game), link_(link), config_(config), story_(game, link, config_, [this](const std::string& t) { notice(t); }) {
     nearby_.reserve(512);
     outgoing_.reserve(128);
-}
-
-void CoopSession::tick(uint32_t nowMs) {
-    float dt = lastTickMs_ ? std::clamp(static_cast<float>(nowMs - lastTickMs_) / 1000.0f, 0.0f, 0.25f) : 0.016f;
-    lastTickMs_ = nowMs;
-
-    link_.update(nowMs);
-    if (!link_.connected()) {
-        if (active_) cleanup();
-        return;
-    }
-    if (link_.epoch() != epoch_) {  // new or re-established session: start from a clean slate
-        cleanup();
-        epoch_ = link_.epoch();
-    }
-    active_ = true;
-
-    bool ready = game_.ready();
-    handleMessages(nowMs);
-    if (ready) {
-        ++frame_;
-        sendLocalState(nowMs);
-        sendAppearance(nowMs);
-        if (isHost()) sendWorld(nowMs);
-        updatePuppet(nowMs, dt);
-        story_.tick(nowMs, local_.state, puppet_.haveState ? &puppet_.state : nullptr, status_.peerDistance);
-        status_.holding = story_.holding();
-        status_.spectating = story_.spectating();
-        status_.missionMismatch = story_.missionMismatch();
-        status_.saveProgress = story_.saveProgress();
-        if (!isHost()) {
-            if (config_.worldSync && hostWorldSync_) {
-                game_.suppressAmbientPopulation();
-                updateMirrors(nowMs, dt);
-                clearForeign(nowMs);
-            } else if (!mirrors_.empty() || !hidden_.empty()) {
-                restoreWorld();
-            }
-        }
-    }
-    link_.flush(nowMs);
 }
 
 bool CoopSession::popNotice(std::string& out) {
@@ -110,6 +69,72 @@ bool CoopSession::popNotice(std::string& out) {
 
 void CoopSession::notice(const std::string& text) {
     if (notices_.size() < 8) notices_.push_back(text);
+}
+
+void CoopSession::tick(uint32_t nowMs) {
+    float dt = lastTickMs_ ? std::clamp(static_cast<float>(nowMs - lastTickMs_) / 1000.0f, 0.0f, 0.25f) : 0.016f;
+    lastTickMs_ = nowMs;
+
+    link_.update(nowMs);
+    if (!link_.connected()) {
+        if (active_) cleanup();
+        return;
+    }
+    if (link_.epoch() != linkEpoch_) {  // new connection to the server: start from a clean slate
+        cleanup();
+        linkEpoch_ = link_.epoch();
+    }
+    active_ = true;
+
+    handleMessages(nowMs);
+    if (myId_ && haveRoster_ && game_.ready()) {
+        ++frame_;
+        sendLocalState(nowMs);
+        sendAppearance(nowMs);
+        if (isOwner()) sendWorld(nowMs);
+        updatePuppets(nowMs, dt);
+        std::vector<StorySync::Peer> peers;
+        for (const auto& [id, p] : puppets_)
+            if (p.haveState) peers.push_back({id, p.state.flags, p.state.pos});
+        story_.tick(nowMs, local_.state, peers, owner_, myId_);
+        status_.holding = story_.holding();
+        status_.spectating = story_.spectating();
+        status_.missionMismatch = story_.missionMismatch();
+        status_.saveProgress = story_.saveProgress();
+        if (!isOwner()) {
+            if (config_.worldSync && ownerWorldSync_) {
+                game_.suppressAmbientPopulation();
+                updateMirrors(nowMs, dt);
+                clearForeign(nowMs);
+            } else if (!mirrors_.empty() || !hidden_.empty()) {
+                restoreWorld();
+            }
+        }
+    }
+    link_.flush(nowMs);
+}
+
+// The world as shared with the others (owner side and mirror side); players are kept.
+void CoopSession::resetWorld() {
+    restoreWorld();
+    streamed_.clear();
+    handleById_.clear();
+    removals_.clear();
+    ownerWorldSync_ = false;
+    lastWorldMs_ = lastInfoMs_ = lastForeignMs_ = 0;
+    missionLocal_.clear();
+    lastMissionScanMs_ = 0;
+    for (auto& [id, p] : puppets_) {
+        // Seats and saddles referred to the old world.
+        if (p.ridingOn && p.ridingOn != p.ownMount) {
+            if (p.ped && game_.exists(p.ped)) game_.setMount(p.ped, 0);
+            p.ridingOn = 0;
+        }
+        if (p.seatedIn && p.seatedIn != p.ownVehicle) {
+            if (p.ped && game_.exists(p.ped)) game_.setVehicle(p.ped, 0, -1);
+            p.seatedIn = 0;
+        }
+    }
 }
 
 void CoopSession::restoreWorld() {
@@ -124,31 +149,42 @@ void CoopSession::restoreWorld() {
 }
 
 void CoopSession::cleanup() {
-    destroyPuppet();
-    puppet_ = Puppet{};
-    restoreWorld();
-    streamed_.clear();
-    handleById_.clear();
-    removals_.clear();
-    hostWorldSync_ = false;
+    for (auto& [id, p] : puppets_) destroyPuppet(p);
+    puppets_.clear();
+    resetWorld();
+    myId_ = owner_ = 0;
+    worldEpoch_ = 0;
+    haveRoster_ = false;
     haveLocal_ = false;
-    lastStateMs_ = lastWorldMs_ = lastInfoMs_ = lastForeignMs_ = 0;
+    lastStateMs_ = 0;
     lastSentFlags_ = 0;
     lastSentMoving_ = false;
     lastOutfitCheckMs_ = sentOutfit_ = 0;
     appearanceSent_ = false;
     story_.reset();
-    missionLocal_.clear();
-    lastMissionScanMs_ = 0;
+    std::string denied = status_.denied;
     status_ = SessionStatus{};
+    status_.denied = denied;
     active_ = false;
 }
 
 bool CoopSession::teleportToPeer() {
-    if (!puppet_.haveState || !game_.ready()) return false;
-    Vec3 p = puppet_.state.pos;
-    p.x += 1.5f;
-    game_.teleportLocalPlayer(p);
+    if (!game_.ready()) return false;
+    const Puppet* target = nullptr;
+    auto owner = puppets_.find(owner_);
+    if (owner != puppets_.end() && owner->second.haveState) target = &owner->second;
+    if (!target) {
+        float best = 1e30f;
+        for (const auto& [id, p] : puppets_)
+            if (p.haveState && distance(p.state.pos, local_.state.pos) < best) {
+                best = distance(p.state.pos, local_.state.pos);
+                target = &p;
+            }
+    }
+    if (!target) return false;
+    Vec3 pos = target->state.pos;
+    pos.x += 1.5f;
+    game_.teleportLocalPlayer(pos);
     return true;
 }
 
@@ -156,7 +192,7 @@ bool CoopSession::teleportToPeer() {
 
 EntityHandle CoopSession::resolveRef(uint16_t ref) {
     if (ref == kRefNone || ref > kMaxEntityId) return 0;
-    if (isHost()) {
+    if (isOwner()) {
         auto it = handleById_.find(ref);
         return it != handleById_.end() && game_.exists(it->second) ? it->second : 0;
     }
@@ -164,11 +200,18 @@ EntityHandle CoopSession::resolveRef(uint16_t ref) {
     return it != mirrors_.end() && it->second.handle && game_.exists(it->second.handle) ? it->second.handle : 0;
 }
 
+CoopSession::Puppet* CoopSession::puppetByPed(EntityHandle h) {
+    if (!h) return nullptr;
+    for (auto& [id, p] : puppets_)
+        if (p.ped == h) return &p;
+    return nullptr;
+}
+
 uint16_t CoopSession::refOf(EntityHandle h) {
     if (!h) return kRefNone;
-    if (isHost()) {
-        if (h == game_.localPlayerPed()) return kRefHostPlayer;
-        if (h == puppet_.ped) return kRefGuestPlayer;
+    if (h == game_.localPlayerPed()) return playerRef(myId_);
+    if (Puppet* p = puppetByPed(h)) return playerRef(p->id);
+    if (isOwner()) {
         auto it = streamed_.find(h);
         return it != streamed_.end() ? it->second.id : kRefNone;
     }
@@ -178,13 +221,17 @@ uint16_t CoopSession::refOf(EntityHandle h) {
 
 Vec3 CoopSession::refPosition(uint16_t ref, bool& found) {
     found = true;
-    bool guestIsLocal = !isHost();
-    if (ref == kRefGuestPlayer || ref == kRefHostPlayer) {
-        bool local = (ref == kRefGuestPlayer) == guestIsLocal;
-        if (local) return local_.state.pos;
-        if (puppet_.ped && game_.exists(puppet_.ped)) return game_.position(puppet_.ped);
-        found = puppet_.haveState;
-        return puppet_.state.pos;
+    if (isPlayerRef(ref)) {
+        uint8_t id = playerOfRef(ref);
+        if (id == myId_) return local_.state.pos;
+        auto it = puppets_.find(id);
+        if (it == puppets_.end()) {
+            found = false;
+            return {};
+        }
+        if (it->second.ped && game_.exists(it->second.ped)) return game_.position(it->second.ped);
+        found = it->second.haveState;
+        return it->second.state.pos;
     }
     EntityHandle h = resolveRef(ref);
     found = h != 0;
@@ -192,7 +239,10 @@ Vec3 CoopSession::refPosition(uint16_t ref, bool& found) {
 }
 
 bool CoopSession::isSessionEntity(EntityHandle h) const {
-    return h && (h == puppet_.ped || h == puppet_.ownMount || h == puppet_.ownVehicle || inPool(h));
+    if (!h) return false;
+    for (const auto& [id, p] : puppets_)
+        if (h == p.ped || h == p.ownMount || h == p.ownVehicle) return true;
+    return inPool(h);
 }
 
 bool CoopSession::inPool(EntityHandle h) const {
@@ -200,6 +250,17 @@ bool CoopSession::inPool(EntityHandle h) const {
         if (p.handle == h) return true;
     return false;
 }
+
+uint16_t CoopSession::allocateId() {
+    for (int tries = 0; tries < kMaxEntityId; ++tries) {
+        uint16_t id = nextId_;
+        nextId_ = nextId_ >= kMaxEntityId ? 1 : static_cast<uint16_t>(nextId_ + 1);
+        if (!handleById_.count(id)) return id;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------- entity lifetime
 
 EntityHandle CoopSession::obtain(EntityKind kind, uint32_t model, const Vec3& pos, float heading) {
     for (size_t i = 0; i < pool_.size(); ++i) {
@@ -224,31 +285,21 @@ void CoopSession::flushPool(uint32_t nowMs, bool all) {
     }
 }
 
-uint16_t CoopSession::allocateId() {
-    for (int tries = 0; tries < kMaxEntityId; ++tries) {
-        uint16_t id = nextId_;
-        nextId_ = nextId_ >= kMaxEntityId ? 1 : static_cast<uint16_t>(nextId_ + 1);
-        if (!handleById_.count(id)) return id;
-    }
-    return 0;
-}
-
-// ---------------------------------------------------------------- teardown helpers
-
-void CoopSession::destroyPuppet() {
-    for (EntityHandle h : {puppet_.ped, puppet_.ownMount, puppet_.ownVehicle})
+void CoopSession::destroyPuppet(Puppet& p) {
+    for (EntityHandle h : {p.ped, p.ownMount, p.ownVehicle})
         if (h && game_.exists(h)) game_.remove(h);
-    puppet_.ped = puppet_.ownMount = puppet_.ownVehicle = 0;
-    puppet_.ridingOn = puppet_.seatedIn = 0;
-    puppet_.weapon = 0;
-    puppet_.deadSinceMs = 0;
-    puppet_.crouched = puppet_.ragdolled = puppet_.aimingTask = false;
-    puppet_.mover = puppet_.bodyMover = Mover{};
+    p.ped = p.ownMount = p.ownVehicle = 0;
+    p.ridingOn = p.seatedIn = 0;
+    p.weapon = 0;
+    p.deadSinceMs = 0;
+    p.crouched = p.ragdolled = p.aimingTask = false;
+    p.mover = p.bodyMover = Mover{};
+    p.outfitApplied = 0;
 }
 
 void CoopSession::destroyMirror(Mirror& m, bool recycle) {
     if (m.bound) {
-        // Never delete the guest's own mission entity: just stop driving it.
+        // Never delete our own mission entity: just stop driving it.
         mirrorByHandle_.erase(m.handle);
         if (game_.exists(m.handle)) game_.setHarmless(m.handle, false);
         m.handle = 0;
@@ -279,62 +330,131 @@ void CoopSession::destroyMirror(Mirror& m, bool recycle) {
 
 // ---------------------------------------------------------------- incoming
 
+void CoopSession::onRoster(const Roster& roster) {
+    owner_ = roster.worldOwner;
+    if (!haveRoster_ || roster.worldEpoch != worldEpoch_) resetWorld();  // a different world from now on
+    worldEpoch_ = roster.worldEpoch;
+    haveRoster_ = true;
+    // Puppets of players who left go away; newcomers get one when their state arrives.
+    for (auto it = puppets_.begin(); it != puppets_.end();) {
+        bool present = std::any_of(roster.players.begin(), roster.players.end(), [&](const RosterEntry& e) { return e.id == it->first; });
+        if (!present) {
+            destroyPuppet(it->second);
+            it = puppets_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    status_.players = static_cast<int>(roster.players.size());
+    status_.worldOwner = isOwner();
+    status_.ownerName.clear();
+    for (const RosterEntry& e : roster.players) {
+        if (e.id == owner_) status_.ownerName = e.name;
+        if (e.id == myId_) continue;
+        Puppet& p = puppets_[e.id];
+        p.id = e.id;
+        p.name = e.name;
+        p.avatar = e.avatar;
+    }
+}
+
 void CoopSession::handleMessages(uint32_t nowMs) {
     Msg type;
     std::vector<uint8_t> payload;
     while (link_.poll(type, payload)) {
+        // Messages relayed from another player start with that player's id.
+        uint8_t from = 0;
+        const uint8_t* body = payload.data();
+        size_t bodySize = payload.size();
+        bool relayed = type == Msg::PlayerState || type == Msg::Appearance || type == Msg::Damage ||
+                       type == Msg::Camera || type == Msg::Waypoint;
+        if (relayed) {
+            if (payload.empty()) continue;
+            from = payload[0];
+            ++body;
+            --bodySize;
+        }
         switch (type) {
+            case Msg::Welcome: {
+                Welcome w;
+                if (!decode(payload, w)) break;
+                myId_ = w.playerId;
+                mode_ = w.storyMode;
+                story_.setMode(mode_);
+                story_.setCampaignHasSave(w.hasCampaignSave != 0);
+                status_.welcomed = true;
+                status_.playerId = myId_;
+                status_.storyMode = mode_;
+                status_.campaignHasSave = w.hasCampaignSave != 0;
+                status_.denied.clear();
+                break;
+            }
+            case Msg::Denied: {
+                Denied d;
+                if (decode(payload, d)) status_.denied = d.reason;
+                break;
+            }
+            case Msg::Roster: {
+                Roster r;
+                if (decode(payload, r)) onRoster(r);
+                break;
+            }
             case Msg::PlayerState: {
                 PlayerState s;
-                if (!decode(payload, s)) break;
-                if (puppet_.haveState && static_cast<int32_t>(s.timeMs - puppet_.state.timeMs) <= 0) break;
-                puppet_.state = s;
-                puppet_.haveState = true;
+                if (!decode(body, bodySize, s) || from == myId_) break;
+                auto it = puppets_.find(from);
+                if (it == puppets_.end()) break;  // not in the roster (yet)
+                Puppet& p = it->second;
+                if (p.haveState && static_cast<int32_t>(s.timeMs - p.state.timeMs) <= 0) break;
+                p.state = s;
+                p.haveState = true;
                 MotionSample sample;
                 sample.timeMs = s.timeMs;
                 sample.pos = s.pos;
                 sample.vel = s.vel;
                 sample.hasVel = true;
                 sample.heading = s.heading;
-                puppet_.motion.push(sample, nowMs);
+                p.motion.push(sample, nowMs);
+                break;
+            }
+            case Msg::Appearance: {
+                Appearance a;
+                auto it = puppets_.find(from);
+                if (decode(body, bodySize, a) && it != puppets_.end()) it->second.outfit = a.outfit;
                 break;
             }
             case Msg::EntitySnapshot: {
                 EntitySnapshot snap;
-                if (!isHost() && decode(payload, snap)) onSnapshot(snap, nowMs);
+                if (!isOwner() && decode(payload, snap)) onSnapshot(snap, nowMs);
                 break;
             }
             case Msg::Damage: {
                 Damage d;
-                if (!decode(payload, d) || d.amount == 0 || !game_.ready()) break;
-                bool toMe = isHost() ? d.target == kRefHostPlayer : d.target == kRefGuestPlayer;
-                if (toMe) {
+                if (!decode(body, bodySize, d) || d.amount == 0 || !game_.ready()) break;
+                if (d.target == playerRef(myId_)) {
                     game_.damageLocalPlayer(d.amount);
-                } else if (isHost()) {
+                } else if (isOwner() && !isPlayerRef(d.target)) {
                     EntityHandle victim = resolveRef(d.target);
-                    if (victim) game_.damageNpc(victim, d.amount, puppet_.ped);
+                    auto attacker = puppets_.find(from);
+                    if (victim) game_.damageNpc(victim, d.amount, attacker != puppets_.end() ? attacker->second.ped : 0);
                 }
-                break;
-            }
-            case Msg::Story:
-            case Msg::Camera:
-            case Msg::Waypoint:
-            case Msg::SaveRequest:
-            case Msg::SaveChunk:
-                story_.handle(type, payload, nowMs);
-                break;
-            case Msg::Appearance: {
-                Appearance a;
-                if (decode(payload, a)) puppet_.outfit = a.outfit;
                 break;
             }
             case Msg::WorldInfo: {
                 WorldInfo info;
-                if (isHost() || !decode(payload, info)) break;
-                hostWorldSync_ = info.worldSync != 0;
+                if (isOwner() || !decode(payload, info)) break;
+                ownerWorldSync_ = info.worldSync != 0;
                 if (game_.ready()) game_.applyWorldInfo(info, config_.syncClock, config_.syncWeather);
                 break;
             }
+            case Msg::Camera:
+            case Msg::Waypoint:
+                story_.handle(type, from, body, bodySize, nowMs);
+                break;
+            case Msg::StoryCommand:
+            case Msg::SaveChunk:
+                story_.handle(type, 0, payload.data(), payload.size(), nowMs);
+                break;
             default:
                 break;
         }
@@ -354,7 +474,7 @@ void CoopSession::onSnapshot(const EntitySnapshot& snap, uint32_t nowMs) {
         m.lastHeardMs = nowMs;
         if (e.fields & EF_Static) {
             if (m.haveStatic && (m.st.model != e.model || m.st.kind != e.kind)) {
-                destroyMirror(m, true);  // the host reused the id for something else
+                destroyMirror(m, true);  // the owner reused the id for something else
                 m.motion.clear();
                 m.havePos = m.haveVel = false;
             }
@@ -459,20 +579,43 @@ void CoopSession::sendWorld(uint32_t nowMs) {
     if (!config_.worldSync || (lastWorldMs_ != 0 && nowMs - lastWorldMs_ < kWorldIntervalMs)) return;
     lastWorldMs_ = nowMs ? nowMs : 1;
 
+    // Everybody else looks at the world from their own position.
     Vec3 hostPos = local_.state.pos;
-    Vec3 guestPos = puppet_.haveState ? puppet_.state.pos : hostPos;
-    nearby_.clear();
-    game_.listNearby(hostPos, guestPos, config_.npcRadius + kStreamHysteresis, nearby_);
+    viewers_.clear();
+    for (const auto& [id, p] : puppets_)
+        if (p.haveState) viewers_.push_back(p.state.pos);
+    if (viewers_.empty()) {
+        // Nobody to stream to; the server keeps what was sent before.
+        status_.syncedEntities = 0;
+        return;
+    }
+    auto viewerDistance = [&](const Vec3& pos) {
+        float best = 1e30f;
+        for (const Vec3& v : viewers_) best = std::min(best, distance(pos, v));
+        return best;
+    };
 
-    // Closest to the guest first; keep at most maxPeds / maxVehicles. Hysteresis keeps entities at
+    nearby_.clear();
+    float reach = config_.npcRadius + kStreamHysteresis;
+    for (const Vec3& v : viewers_) {
+        // One query around the owner and each player (the game merges duplicates below).
+        game_.listNearby(hostPos, v, reach, nearby_);
+    }
+    std::sort(nearby_.begin(), nearby_.end(), [](const NearbyEntity& a, const NearbyEntity& b) { return a.handle < b.handle; });
+    nearby_.erase(std::unique(nearby_.begin(), nearby_.end(),
+                              [](const NearbyEntity& a, const NearbyEntity& b) { return a.handle == b.handle; }),
+                  nearby_.end());
+
+    // Closest to a viewer first; keep at most maxPeds / maxVehicles. Hysteresis keeps entities at
     // the edge (of the radius or of the budget) from popping in and out every tick.
     order_.clear();
     for (size_t i = 0; i < nearby_.size(); ++i) {
         if (isSessionEntity(nearby_[i].handle)) continue;
         bool streamed = streamed_.count(nearby_[i].handle) != 0;
-        float range = std::min(distance(nearby_[i].pos, guestPos), distance(nearby_[i].pos, hostPos));
+        float dv = viewerDistance(nearby_[i].pos);
+        float range = std::min(dv, distance(nearby_[i].pos, hostPos));
         if (!streamed && range > config_.npcRadius) continue;
-        float d = std::min(distance(nearby_[i].pos, guestPos), distance(nearby_[i].pos, hostPos) + 15.0f);
+        float d = std::min(dv, distance(nearby_[i].pos, hostPos) + 15.0f);
         order_.emplace_back(streamed ? d - 10.0f : d, i);
     }
     std::sort(order_.begin(), order_.end());
@@ -483,7 +626,8 @@ void CoopSession::sendWorld(uint32_t nowMs) {
         const NearbyEntity& n = nearby_[index];
         int& count = n.kind == EntityKind::Vehicle ? vehicles : peds;
         int cap = n.kind == EntityKind::Vehicle ? config_.maxVehicles : config_.maxPeds;
-        bool mustKeep = n.handle == local_.vehicle || n.handle == puppet_.ridingOn || n.handle == puppet_.seatedIn;
+        bool mustKeep = n.handle == local_.vehicle;
+        for (const auto& [id, p] : puppets_) mustKeep = mustKeep || n.handle == p.ridingOn || n.handle == p.seatedIn;
         if (count >= cap && !mustKeep) continue;
         ++count;
         auto it = streamed_.find(n.handle);
@@ -501,10 +645,9 @@ void CoopSession::sendWorld(uint32_t nowMs) {
             continue;  // handle recycled by the game as a different kind; it will be replaced below
         }
         it->second.seen = true;
-        it->second.guestDistance = distance(n.pos, guestPos);
+        it->second.viewerDistance = viewerDistance(n.pos);
     }
 
-    // Whatever was not picked this tick has gone (deleted, out of range, or over budget).
     for (auto it = streamed_.begin(); it != streamed_.end();) {
         if (it->second.seen) {
             ++it;
@@ -527,7 +670,7 @@ void CoopSession::sendWorld(uint32_t nowMs) {
             it = removals_.erase(it);
             continue;
         }
-        if (!handleById_.count(it->first)) removedIds_.push_back(it->first);  // skip ids already reused
+        if (!handleById_.count(it->first)) removedIds_.push_back(it->first);
         ++it;
     }
     status_.syncedEntities = static_cast<int>(streamed_.size());
@@ -572,7 +715,7 @@ void CoopSession::streamEntity(Streamed& s, uint32_t nowMs) {
                         cur.vehicleRef != sent.vehicleRef || cur.seat != sent.seat || cur.targetRef != sent.targetRef;
     if (changed(kGroupState, stateDiffers)) out.fields |= EF_State;
 
-    // Remember what the guest now has. Fields under threshold keep their old value, so slow
+    // Remember what the others now have. Fields under threshold keep their old value, so slow
     // drift still accumulates until it is worth sending.
     if (out.fields & EF_Pos) sent.pos = cur.pos;
     if (out.fields & EF_Heading) sent.heading = cur.heading;
@@ -592,8 +735,8 @@ void CoopSession::streamEntity(Streamed& s, uint32_t nowMs) {
 
     if (key) s.lastKeyMs = s.fresh ? nowMs - (s.id * 97u) % kKeyframeMs : nowMs;  // stagger keyframes
     s.fresh = false;
-    // While the guest watches the host's scene through the camera, the scene gets the full rate.
-    uint32_t ticks = updateInterval(s.guestDistance, cur);
+    // While someone watches the owner's scene through the camera, the scene gets the full rate.
+    uint32_t ticks = updateInterval(s.viewerDistance, cur);
     if (story_.boostStreaming() && distance(cur.pos, local_.state.pos) < 60.0f) ticks = 1;
     s.nextDueMs = nowMs + ticks * kWorldIntervalMs - 5;
     if (out.fields) outgoing_.push_back(out);
@@ -667,15 +810,15 @@ void CoopSession::forwardDamage(EntityHandle h, int& expectedHealth, uint16_t ta
         bool byLocalPlayer = game_.wasDamagedByLocalPlayer(h);
         bool forward;
         if (onlyLocalPlayer) {
-            // A linked mission NPC also fights with its own AI here; the host simulates the same
-            // fight, so only the guest's own hits count. The rest is undone by the host's health.
+            // A linked mission NPC also fights with its own AI here; the owner simulates the same
+            // fight, so only our own hits count. The rest is undone by the owner's health.
             forward = byLocalPlayer;
-        } else if (target != kRefGuestPlayer && target != kRefHostPlayer) {
-            // A mirror lost health on the guest. Remote characters only fire blanks here, so
-            // whatever hurt it was the guest's doing: tell the host, who owns the real NPC.
+        } else if (!isPlayerRef(target)) {
+            // A mirror lost health. Remote characters only fire blanks here, so whatever hurt it
+            // was our doing: tell the owner, whose real NPC it is.
             forward = true;
-        } else if (isHost()) {
-            // The host's NPCs hurt the guest's puppet for real; the host player only with friendly fire.
+        } else if (isOwner()) {
+            // The owner's NPCs hurt other players' puppets for real; the owner only with friendly fire.
             forward = !byLocalPlayer || config_.friendlyFire;
         } else {
             forward = byLocalPlayer && config_.friendlyFire;
@@ -688,34 +831,53 @@ void CoopSession::forwardDamage(EntityHandle h, int& expectedHealth, uint16_t ta
     expectedHealth = current;
 }
 
-// ---------------------------------------------------------------- the friend's character
+// ---------------------------------------------------------------- other players' characters
 
-void CoopSession::updatePuppet(uint32_t nowMs, float dt) {
+void CoopSession::updatePuppets(uint32_t nowMs, float dt) {
     status_.peerVisible = false;
-    if (!puppet_.haveState) return;
-    Puppet& p = puppet_;
+    status_.peerInCutscene = false;
+    const Puppet* nearest = nullptr;
+    float best = 1e30f;
+    for (auto& [id, p] : puppets_) {
+        updatePuppet(p, nowMs, dt);
+        if (!p.haveState) continue;
+        if (p.state.flags & PF_Cutscene) status_.peerInCutscene = true;
+        float d = distance(local_.state.pos, p.state.pos);
+        if (d < best) {
+            best = d;
+            nearest = &p;
+        }
+    }
+    if (nearest) {
+        status_.peerVisible = nearest->ped != 0;
+        status_.peerName = nearest->name;
+        status_.peerPos = nearest->state.pos;
+        status_.peerDistance = best;
+        status_.peerDead = (nearest->state.flags & PF_Dead) != 0;
+        status_.peerInMission = (nearest->state.flags & PF_InMission) != 0;
+        status_.bufferMs = static_cast<int>(nearest->motion.delayMs());
+    }
+}
+
+void CoopSession::updatePuppet(Puppet& p, uint32_t nowMs, float dt) {
+    if (!p.haveState) return;
     const PlayerState& s = p.state;
-    status_.peerPos = s.pos;
-    status_.peerDistance = haveLocal_ ? distance(local_.state.pos, s.pos) : 0;
-    status_.peerDead = (s.flags & PF_Dead) != 0;
-    status_.peerInMission = (s.flags & PF_InMission) != 0;
-    status_.peerInCutscene = (s.flags & PF_Cutscene) != 0;
-    uint16_t peerRef = isHost() ? kRefGuestPlayer : kRefHostPlayer;
+    uint16_t ref = playerRef(p.id);
 
     if (p.ped && !game_.exists(p.ped)) {  // the game removed it behind our back
         p.ped = 0;
         p.ridingOn = p.seatedIn = 0;
         p.weapon = 0;
         p.mover = Mover{};
+        p.outfitApplied = 0;
     }
     if (p.ownMount && !game_.exists(p.ownMount)) p.ownMount = 0;
     if (p.ownVehicle && !game_.exists(p.ownVehicle)) p.ownVehicle = 0;
     if (!p.ped) {
-        const std::string& avatar = link_.peer().avatar;
-        p.ped = game_.spawn(EntityKind::Ped, joaat(avatar.c_str()), s.pos, s.heading, SpawnRole::PlayerPuppet);
+        p.ped = game_.spawn(EntityKind::Ped, joaat(p.avatar.c_str()), s.pos, s.heading, SpawnRole::PlayerPuppet);
         if (!p.ped) return;
         game_.setHealth(p.ped, std::max<int>(s.health, 1), s.maxHealth);
-        game_.setLabel(p.ped, link_.peer().name.c_str());
+        game_.setLabel(p.ped, p.name.c_str());
         p.expectedHealth = game_.health(p.ped);
         p.outfitApplied = 0;
     }
@@ -723,20 +885,18 @@ void CoopSession::updatePuppet(uint32_t nowMs, float dt) {
         game_.setOutfit(p.ped, p.outfit);
         p.outfitApplied = p.outfit;
     }
-    status_.peerVisible = true;
     MotionSample target = p.motion.sample(nowMs);
-    status_.bufferMs = static_cast<int>(p.motion.delayMs());
 
     if (s.flags & PF_Dead) {
         if (!game_.isDead(p.ped)) game_.kill(p.ped);
         p.expectedHealth = 0;
         return;
     }
-    forwardDamage(p.ped, p.expectedHealth, peerRef);
+    forwardDamage(p.ped, p.expectedHealth, ref);
     if (game_.isDead(p.ped)) {
         // Dead here but alive for its owner (they respawned, or survived the hit): recreate it.
         if (!p.deadSinceMs) p.deadSinceMs = nowMs ? nowMs : 1;
-        else if (nowMs - p.deadSinceMs > kRespawnGraceMs) destroyPuppet();
+        else if (nowMs - p.deadSinceMs > kRespawnGraceMs) destroyPuppet(p);
         return;
     }
     p.deadSinceMs = 0;
@@ -745,9 +905,9 @@ void CoopSession::updatePuppet(uint32_t nowMs, float dt) {
         p.expectedHealth = game_.health(p.ped);
     }
 
-    // --- what the friend is sitting on: a shared entity, or one of their own
+    // --- what the player is sitting on: a shared entity, or one of their own
     EntityHandle wantMount = 0, wantVehicle = 0;
-    bool controlsShared = false;  // they steer an entity of the shared world (host side moves it)
+    bool controlsShared = false;  // they steer an entity of the shared world (the owner moves it)
     if (s.flags & PF_InVehicle) {
         wantVehicle = resolveRef(s.vehicleRef);
         if (!wantVehicle && s.vehicleRef == kRefNone && s.vehicleModel) {
@@ -761,7 +921,7 @@ void CoopSession::updatePuppet(uint32_t nowMs, float dt) {
             }
             wantVehicle = p.ownVehicle;
         } else if (wantVehicle && s.seat == -1) {
-            controlsShared = isHost();
+            controlsShared = isOwner();
         }
     } else if (s.flags & PF_OnMount) {
         wantMount = resolveRef(s.mountRef);
@@ -780,7 +940,7 @@ void CoopSession::updatePuppet(uint32_t nowMs, float dt) {
             }
             wantMount = p.ownMount;
         } else if (wantMount) {
-            controlsShared = isHost();
+            controlsShared = isOwner();
         }
     }
 
@@ -861,18 +1021,18 @@ void CoopSession::updatePuppet(uint32_t nowMs, float dt) {
     }
 }
 
-// ---------------------------------------------------------------- the host's world, on the guest
+// ---------------------------------------------------------------- the owner's world, everywhere else
 
 void CoopSession::bindMissionEntities(uint32_t nowMs) {
-    if (config_.storyMode != StoryMode::Shared || nowMs - lastMissionScanMs_ < kMissionScanMs) return;
+    if (mode_ != StoryMode::Shared || nowMs - lastMissionScanMs_ < kMissionScanMs) return;
     lastMissionScanMs_ = nowMs;
     missionLocal_.clear();
     game_.listMissionEntities(missionLocal_);
     if (missionLocal_.empty()) return;
-    // Both games run the same mission script, which creates the same NPCs (same model, same place).
-    // Pair each host mission entity with the guest's own copy: the copy keeps its AI and its role in
-    // the guest's mission, while health, death and position follow the host. A mission objective
-    // like "kill them all" therefore completes in both games.
+    // All games run the same mission script, which creates the same NPCs (same model, same place).
+    // Pair each owner mission entity with our own copy: the copy keeps its AI and its role in our
+    // mission, while health, death and position follow the owner. A mission objective like
+    // "kill them all" therefore completes in every game.
     for (auto& [id, m] : mirrors_) {
         if (m.bound || !m.st.script || !m.haveStatic || !m.havePos) continue;
         const MissionEntity* best = nullptr;
@@ -901,7 +1061,7 @@ void CoopSession::bindMissionEntities(uint32_t nowMs) {
 }
 
 void CoopSession::followBound(EntityHandle h, const MotionSample& t, float dt) {
-    // The local AI animates it; only keep it where the host's copy is.
+    // The local AI animates it; only keep it where the owner's copy is.
     Vec3 err = t.pos - game_.position(h);
     float dist = length(err);
     if (dist > 12.0f) {
@@ -915,12 +1075,12 @@ void CoopSession::followBound(EntityHandle h, const MotionSample& t, float dt) {
 void CoopSession::updateMirrors(uint32_t nowMs, float dt) {
     spawnQueue_.clear();
     bindMissionEntities(nowMs);
-    const bool shared = config_.storyMode == StoryMode::Shared;
+    const bool shared = mode_ == StoryMode::Shared;
     const Vec3 view = story_.viewPoint(local_.state.pos);
     int shown = 0;
     for (auto it = mirrors_.begin(); it != mirrors_.end();) {
         Mirror& m = it->second;
-        if (nowMs - m.lastHeardMs > kMirrorTimeoutMs) {  // the host stopped mentioning it
+        if (nowMs - m.lastHeardMs > kMirrorTimeoutMs) {  // the owner stopped mentioning it
             destroyMirror(m, true);
             it = mirrors_.erase(it);
             continue;
@@ -929,6 +1089,7 @@ void CoopSession::updateMirrors(uint32_t nowMs, float dt) {
         if (m.handle && !game_.exists(m.handle)) {
             mirrorByHandle_.erase(m.handle);
             m.handle = 0;
+            m.bound = false;
             m.ridingOn = m.seatedIn = 0;
             m.weapon = 0;
             m.mover = Mover{};
@@ -949,7 +1110,7 @@ void CoopSession::updateMirrors(uint32_t nowMs, float dt) {
                 continue;
             }
             if (m.st.flags & NF_Dead) {
-                if (!game_.isDead(m.handle)) game_.kill(m.handle);  // the guest's mission sees the kill
+                if (!game_.isDead(m.handle)) game_.kill(m.handle);  // our mission sees the kill
                 m.expectedHealth = 0;
                 continue;
             }
@@ -957,7 +1118,7 @@ void CoopSession::updateMirrors(uint32_t nowMs, float dt) {
             if (game_.isDead(m.handle)) {
                 if (!m.deadSinceMs) m.deadSinceMs = nowMs ? nowMs : 1;
                 else if (nowMs - m.deadSinceMs > kRespawnGraceMs && m.st.health > 0) {
-                    game_.revive(m.handle, m.st.health);  // the host says it survived
+                    game_.revive(m.handle, m.st.health);  // the owner says it survived
                     m.expectedHealth = game_.health(m.handle);
                     m.deadSinceMs = 0;
                 }
@@ -975,8 +1136,8 @@ void CoopSession::updateMirrors(uint32_t nowMs, float dt) {
             game_.setOutfit(m.handle, m.st.outfit);
             m.outfitApplied = m.st.outfit;
         }
-        // CPU level of detail: what is far from the guest is updated every 2nd or 4th frame
-        // (staggered by id so the work spreads evenly). Motion is time-based, so nothing slows down.
+        // CPU level of detail: what is far from us is updated every 2nd or 4th frame (staggered by
+        // id so the work spreads evenly). Motion is time-based, so nothing slows down.
         float range = distance(m.st.pos, view);
         uint32_t every = range < 35.0f ? 1u : range < 80.0f ? 2u : 4u;
         if (m.st.kind == EntityKind::Vehicle) every = std::min(every, 2u);  // physics drifts if left alone longer
@@ -985,7 +1146,7 @@ void CoopSession::updateMirrors(uint32_t nowMs, float dt) {
         m.lastUpdateMs = nowMs;
         if (m.st.kind == EntityKind::Vehicle) {
             MotionSample t = m.motion.sample(nowMs);
-            // The guest is driving it: the guest's game moves it and the host follows.
+            // We are driving it: our game moves it and the owner follows.
             if (local_.vehicle == m.handle && local_.state.seat == -1) continue;
             steerVehicle(m.handle, m.mover, t, step);
         } else {
@@ -1002,7 +1163,8 @@ void CoopSession::updateMirrors(uint32_t nowMs, float dt) {
     for (Mirror* m : spawnQueue_) {
         if (budget <= 0) {
             // Over this frame's budget: at least get the model streaming so it spawns instantly later.
-            if (prefetched_.size() < 8 && std::find(prefetched_.begin(), prefetched_.end(), m->st.model) == prefetched_.end()) {
+            if (prefetched_.size() < 8 &&
+                std::find(prefetched_.begin(), prefetched_.end(), m->st.model) == prefetched_.end()) {
                 game_.prefetchModel(m->st.model);
                 prefetched_.push_back(m->st.model);
             }
@@ -1036,7 +1198,7 @@ void CoopSession::updateMirrorPed(Mirror& m, uint32_t nowMs, float dt) {
     }
     forwardDamage(m.handle, m.expectedHealth, m.id);
     if (game_.isDead(m.handle)) {
-        // We killed it locally; if the host disagrees for long enough, bring it back.
+        // We killed it locally; if the owner disagrees for long enough, bring it back.
         if (!m.deadSinceMs) m.deadSinceMs = nowMs ? nowMs : 1;
         else if (nowMs - m.deadSinceMs > kRespawnGraceMs) destroyMirror(m, false);
         return;
@@ -1047,7 +1209,7 @@ void CoopSession::updateMirrorPed(Mirror& m, uint32_t nowMs, float dt) {
         m.expectedHealth = game_.health(m.handle);
     }
 
-    // Seats and saddles follow the host's references.
+    // Seats and saddles follow the owner's references.
     EntityHandle vehicle = resolveRef(m.st.vehicleRef);
     EntityHandle mount = vehicle ? 0 : resolveRef(m.st.mountRef);
     if (vehicle != m.seatedIn || (vehicle && m.seat != m.st.seat)) {
@@ -1088,11 +1250,10 @@ void CoopSession::updateMirrorPed(Mirror& m, uint32_t nowMs, float dt) {
         m.mover.mode = Mover::None;
     }
 
-    // The guest rides this horse: the guest's game moves it.
-    bool guestRides = local_.mount == m.handle;
+    // We ride this horse: our game moves it.
+    bool weRide = local_.mount == m.handle;
     bool standingShooter = (shooting || aiming) && horizontalSpeed(t.vel) < 1.0f;
-    if (!m.seatedIn && !m.ridingOn && !guestRides && !m.ragdolled && !standingShooter)
-        movePed(m.handle, m.mover, t, dt, nowMs);
+    if (!m.seatedIn && !m.ridingOn && !weRide && !m.ragdolled && !standingShooter) movePed(m.handle, m.mover, t, dt, nowMs);
 }
 
 void CoopSession::clearForeign(uint32_t nowMs) {
@@ -1106,11 +1267,10 @@ void CoopSession::clearForeign(uint32_t nowMs) {
     game_.listForeign(foreign_);
     for (const ForeignEntity& f : foreign_) {
         if (ours(f.handle) || hidden_.count(f.handle)) continue;
-        if (f.mission && config_.storyMode == StoryMode::Shared) continue;  // the guest's own mission needs them
         if (f.draftOf && ours(f.draftOf)) continue;  // horses pulling one of our wagons
+        if (f.mission && mode_ == StoryMode::Shared) continue;  // our own mission needs them
         if (game_.removeForeign(f.handle) == ForeignAction::Hidden) hidden_.insert(f.handle);
     }
-    // Forget hidden entities the game has removed in the meantime.
     for (auto it = hidden_.begin(); it != hidden_.end();) it = game_.exists(*it) ? std::next(it) : hidden_.erase(it);
 }
 

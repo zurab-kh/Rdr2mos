@@ -1,16 +1,14 @@
-// Story synchronisation: keeps two story playthroughs in step.
+// Story synchronisation, player side. The server makes the decisions (see server.cpp); this
+// part reports what happens in our game and carries out what the server asks for.
 //
-// Shared story (both play the same save):
-//  * the guest is brought to where the host started a mission and told to start it too;
-//  * cutscene barrier: both watch their own (real) cutscene; whoever finishes first has their world
-//    frozen until the other is done, so gameplay resumes together;
-//  * if one player dies in a mission, the other's mission is failed too and both retry the checkpoint;
-//  * the mission each side plays is compared, so a mismatch is reported instead of silently diverging;
-//  * the host's save can be copied to the guest with one key.
-// Host world (the guest visits the host's world):
-//  * the guest watches the host's scenes through the host's camera, protected meanwhile;
-//  * the guest is regrouped with the host when a mission starts or a scene ends far away.
-// Both: map waypoints are shared.
+//  * reports which mission we play and our deaths in missions;
+//  * obeys the server: hold (cutscene barrier: world frozen until the others are done), release,
+//    fail the mission (after any running scene), regroup at the mission start, notices;
+//  * host world: watches the world owner's scenes through the owner's camera;
+//  * protected while another player is in a scene;
+//  * shares map waypoints;
+//  * campaign saves: the world owner's new saves go to the server automatically, and anyone can
+//    download the campaign save into a free local slot.
 #pragma once
 #include <cstdint>
 #include <functional>
@@ -25,35 +23,39 @@ namespace coop {
 
 class StorySync {
 public:
+    struct Peer {
+        uint8_t id = 0;
+        uint16_t flags = 0;
+        Vec3 pos;
+    };
+
     StorySync(IGame& game, Link& link, const SessionConfig& config, std::function<void(const std::string&)> notify);
 
     void setSaveStore(ISaveStore* store) { store_ = store; }
+    void setMode(StoryMode mode) { mode_ = mode; }
+    void setCampaignHasSave(bool has) { campaignHasSave_ = has; }
 
-    // Call every frame after the friend's state was updated. `peer` is null until it is known.
-    void tick(uint32_t nowMs, const PlayerState& local, const PlayerState* peer, float peerDistance);
-    // Returns true if the message was a story message (and handled).
-    bool handle(Msg type, const std::vector<uint8_t>& payload, uint32_t nowMs);
+    // Call every frame. `peers` are the other players we know the state of.
+    void tick(uint32_t nowMs, const PlayerState& local, const std::vector<Peer>& peers, uint8_t worldOwner, uint8_t me);
+    // Story messages: StoryCommand, Camera, Waypoint, SaveChunk. `from` is the sending player for relayed ones.
+    void handle(Msg type, uint8_t from, const uint8_t* data, size_t size, uint32_t nowMs);
     // Releases everything the story layer holds on to (frozen world, camera, protection, map marker).
     void reset();
 
-    // Guest: ask for the host's save. Returns false if not possible right now.
-    bool requestHostSave();
+    bool requestCampaignSave();
+    bool uploadLatestSave();
 
     uint16_t extraFlags() const { return holding_ ? PF_Holding : 0; }
     bool holding() const { return holding_; }
     bool spectating() const { return spectating_; }
-    // Host: stream the scene around the host at full rate (the guest is watching through the camera).
+    // World owner: stream the scene at full rate (someone watches it through the camera).
     bool boostStreaming() const { return boost_; }
-    // Where the local player is looking from (camera while spectating), for level of detail.
     Vec3 viewPoint(const Vec3& localPos) const { return spectating_ ? camPos_ : localPos; }
-    int saveProgress() const { return saveProgress_; }  // -1 = no transfer, 0..100
+    int saveProgress() const { return saveProgress_; }
     bool missionMismatch() const { return mismatch_; }
 
 private:
-    bool isHost() const { return link_.local().role == Role::Host; }
-    bool shared() const { return config_.storyMode == StoryMode::Shared; }
-    void startHold(uint32_t nowMs, const char* why);
-    void releaseHold(const char* why);
+    void releaseHold(const std::string& why);
     void sendSaveChunks();
     void receiveSaveChunk(const SaveChunk& c);
 
@@ -62,38 +64,33 @@ private:
     const SessionConfig& config_;
     std::function<void(const std::string&)> notify_;
     ISaveStore* store_ = nullptr;
+    StoryMode mode_ = StoryMode::Shared;
 
     bool first_ = true;
-    uint16_t prevLocal_ = 0, prevPeer_ = 0;
-    uint32_t localMissionStartMs_ = 0;
-
-    // mission identity
-    uint32_t lastScriptCheckMs_ = 0, sentScript_ = 0, peerScript_ = 0;
+    uint16_t prevLocal_ = 0;
+    PlayerState local_;
+    uint32_t lastScriptCheckMs_ = 0, sentScript_ = 0;
     bool mismatch_ = false;
-    // deaths
-    uint32_t lastOwnDeathMs_ = 0;
-    bool haveDied_ = false;
-    bool pendingFail_ = false;     // friend died while we watch a scene: fail once it is over
-    bool causedByFriend_ = false;  // our next death is the friend's mission failure: do not report it back
-    // protection / regroup
+    bool pendingFail_ = false, causedByServer_ = false;
     bool protected_ = false;
-    bool regroupPending_ = false, regroupToStart_ = false;
-    Vec3 missionStartPos_;
-    uint32_t joinHintMs_ = 0;
-    // barrier
     bool holding_ = false;
-    uint32_t holdStartMs_ = 0, peerReadySinceMs_ = 0;
+    uint32_t holdStartMs_ = 0;
     // spectator camera
     MotionBuffer camMotion_{60, 250};
     float camFov_ = 50.0f;
     uint32_t lastCamMs_ = 0, lastCamSentMs_ = 0;
+    uint8_t camFrom_ = 0;
     bool spectating_ = false, boost_ = false;
     Vec3 camPos_;
     // waypoints
     uint32_t lastWaypointCheckMs_ = 0;
     bool localWaypoint_ = false, friendWaypoint_ = false;
     Vec3 localWaypointPos_, friendWaypointPos_;
-    // save transfer
+    // saves
+    uint32_t lastStampCheckMs_ = 0;
+    uint64_t lastStamp_ = 0;
+    bool stampKnown_ = false;
+    bool campaignHasSave_ = true;
     std::vector<uint8_t> saveData_;
     size_t saveOffset_ = 0;
     uint32_t saveCrc_ = 0;

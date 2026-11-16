@@ -1,9 +1,12 @@
-// Tests for the portable core: protocol, link, relay, interpolation and the co-op session,
+// Tests for the portable core: protocol, link, server, interpolation and the co-op session,
 // driven against a simulated game world and an in-memory network with latency, jitter and loss.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <functional>
 #include <map>
 #include <memory>
@@ -14,7 +17,7 @@
 #include "config.h"
 #include "interp.h"
 #include "link.h"
-#include "relay.h"
+#include "server.h"
 #include "session.h"
 
 using namespace coop;
@@ -422,7 +425,6 @@ public:
 // ---------------------------------------------------------------- helpers
 static const Endpoint kHostAddr{0x0A000001, 27960};
 static const Endpoint kGuestAddr{0x0A000002, 40000};
-static const Endpoint kRelayAddr{0x0A000009, 27960};
 
 static LinkConfig hostConfig() {
     LinkConfig c;
@@ -441,37 +443,110 @@ static LinkConfig guestConfig() {
     return c;
 }
 
-struct Pair {
+class MemorySaveStore : public ISaveStore {
+public:
+    std::vector<uint8_t> latest;
+    uint64_t stamp = 0;
+    std::vector<std::vector<uint8_t>> written;
+    uint64_t latestStamp() override { return latest.empty() ? 0 : stamp; }
+    bool readLatest(std::vector<uint8_t>& data, std::string& name) override {
+        if (latest.empty()) return false;
+        data = latest;
+        name = "SRDR30003";
+        return true;
+    }
+    bool writeCopy(const std::vector<uint8_t>& data, std::string& placedAs, std::string&) override {
+        written.push_back(data);
+        placedAs = "SRDR30007";
+        return true;
+    }
+};
+
+static const Endpoint kServerAddr{0x0A000009, 27960};
+
+// One player: game, link to the server, session.
+struct Player {
+    MemoryNetwork::Socket* sock = nullptr;
+    Link link;
+    FakeGame game;
+    MemorySaveStore saves;
+    std::unique_ptr<CoopSession> session;
+    LinkConfig linkConfig;
+
+    void connect(MemoryNetwork& net, uint32_t ip, const std::string& name, const std::string& avatar, bool wantsWorld,
+                 const SessionConfig& config, uint32_t now, const std::string& campaign = "default",
+                 const std::string& password = "") {
+        if (!sock) sock = net.open(ip, 40000);
+        linkConfig = LinkConfig{};
+        linkConfig.remote = kServerAddr;
+        linkConfig.local.role = Role::Guest;
+        linkConfig.local.name = name;
+        linkConfig.local.avatar = avatar;
+        linkConfig.local.campaign = campaign;
+        linkConfig.local.password = password;
+        linkConfig.local.wantsWorld = wantsWorld ? 1 : 0;
+        link.start(sock, linkConfig, now);
+        session = std::make_unique<CoopSession>(game, link, config);
+        session->setSaveStore(&saves);
+    }
+};
+
+// A server with any number of players on a simulated network.
+struct Cluster {
     MemoryNetwork net;
-    MemoryNetwork::Socket* hostSock = net.open(kHostAddr.ip, kHostAddr.port);
-    MemoryNetwork::Socket* guestSock = net.open(kGuestAddr.ip, kGuestAddr.port);
-    Link hostLink, guestLink;
-    FakeGame hostGame, guestGame;
+    MemoryNetwork::Socket* serverSock = net.open(kServerAddr.ip, kServerAddr.port);
+    MemoryStorage storage;
+    ServerConfig serverConfig;
+    std::unique_ptr<Server> server;
     SessionConfig config;
-    std::unique_ptr<CoopSession> host, guest;
+    std::vector<std::unique_ptr<Player>> extra;
+    std::vector<Player*> players;
     uint32_t now = 1000;
     std::function<void()> perFrame;
-    StoryMode hostStory = StoryMode::Shared, guestStory = StoryMode::Shared;
 
-    void start() {
+    void startServer() {
         net.now = now;
-        LinkConfig hc = hostConfig(), gc = guestConfig();
-        hc.local.storyMode = hostStory;
-        gc.local.storyMode = guestStory;
-        hostLink.start(hostSock, hc, now);
-        guestLink.start(guestSock, gc, now);
-        host = std::make_unique<CoopSession>(hostGame, hostLink, config);
-        guest = std::make_unique<CoopSession>(guestGame, guestLink, config);
+        if (!server) server = std::make_unique<Server>(*serverSock, serverConfig, storage);
+    }
+    Player& join(const std::string& name, bool wantsWorld = false, const std::string& campaign = "default",
+                 const std::string& password = "") {
+        startServer();
+        extra.push_back(std::make_unique<Player>());
+        Player& p = *extra.back();
+        p.connect(net, 0x0A000100u + static_cast<uint32_t>(extra.size()), name, "player_" + name, wantsWorld, config, now,
+                  campaign, password);
+        players.push_back(&p);
+        return p;
     }
     void run(uint32_t ms) {
         for (uint32_t end = now + ms; now < end; now += 16) {
             net.now = now;
             if (perFrame) perFrame();
-            host->tick(now);
-            guest->tick(now);
-            hostGame.simulate(0.016f);
-            guestGame.simulate(0.016f);
+            if (server) server->pump(now);
+            for (Player* p : players)
+                if (p->session) p->session->tick(now);
+            for (Player* p : players) p->game.simulate(0.016f);
         }
+    }
+};
+
+// The classic two-player setup: the host owns the world, the guest joins it.
+struct Pair : Cluster {
+    Player hostP, guestP;
+    FakeGame& hostGame = hostP.game;
+    FakeGame& guestGame = guestP.game;
+    Link& hostLink = hostP.link;
+    Link& guestLink = guestP.link;
+    std::unique_ptr<CoopSession>& host = hostP.session;
+    std::unique_ptr<CoopSession>& guest = guestP.session;
+
+    void start() {
+        startServer();
+        hostP.connect(net, 0x0A000001, "Arthur", "player_zero", true, config, now);
+        players.push_back(&hostP);
+        run(100);  // the host is in first and owns the world
+        guestP.connect(net, 0x0A000002, "John", "player_three", false, config, now);
+        players.push_back(&guestP);
     }
 };
 
@@ -522,7 +597,7 @@ static void testProtocol() {
     far.flags = NF_Shooting;
     far.vehicleRef = 6;
     far.seat = 2;
-    far.targetRef = kRefGuestPlayer;
+    far.targetRef = playerRef(2);
     far.pitch = 9.0f;
     far.roll = -4.5f;
     snap.entities = {near, far};
@@ -536,7 +611,7 @@ static void testProtocol() {
     CHECK(std::abs(back.entities[0].vel.y + 2.5f) < 0.01f);
     CHECK(back.entities[0].fields == near.fields);
     CHECK(back.entities[1].pos.x == -2000.0f && back.entities[1].kind == EntityKind::Vehicle);
-    CHECK(back.entities[1].targetRef == kRefGuestPlayer && back.entities[1].seat == 2 && back.entities[1].health == 321);
+    CHECK(back.entities[1].targetRef == playerRef(2) && back.entities[1].seat == 2 && back.entities[1].health == 321);
     CHECK(std::abs(back.entities[1].pitch - 9.0f) < 0.01f && std::abs(back.entities[1].roll + 4.5f) < 0.01f);
 
     // Splitting respects the size budget and loses nothing.
@@ -765,70 +840,9 @@ static void testLinkReconnectAndRoleClash() {
     CHECK(host.state() == Link::State::Connecting && !host.error().empty());
 }
 
-static void testRelay() {
-    MemoryNetwork net;
-    auto* relaySock = net.open(kRelayAddr.ip, kRelayAddr.port);
-    auto* a = net.open(kHostAddr.ip, 5000);
-    auto* b = net.open(kGuestAddr.ip, 6000);
-    auto* c = net.open(0x0A000003, 7000);
-    Relay relay(*relaySock);
-
-    LinkConfig hc = hostConfig();
-    hc.listen = false;
-    hc.viaRelay = true;
-    hc.remote = kRelayAddr;
-    hc.room = "blackwater";
-    LinkConfig gc = guestConfig();
-    gc.viaRelay = true;
-    gc.remote = kRelayAddr;
-    gc.room = "blackwater";
-
-    Link host, guest, intruder;
-    host.start(a, hc, 0);
-    guest.start(b, gc, 0);
-    uint32_t now = 0;
-    auto run = [&](uint32_t ms) {
-        for (uint32_t end = now + ms; now < end; now += 16) {
-            net.now = now;
-            relay.pump(now);
-            host.update(now);
-            guest.update(now);
-            intruder.update(now);
-            host.flush(now);
-            guest.flush(now);
-        }
-    };
-    run(2000);
-    CHECK(host.connected() && guest.connected());
-    CHECK(host.relayPeers() == 2);
-    CHECK(relay.roomCount() == 1 && relay.clientCount() == 2);
-
-    host.send(Msg::WorldInfo, WorldInfo{1, 2, 3, 1, 0}, true);
-    run(300);
-    Msg type;
-    std::vector<uint8_t> payload;
-    bool got = false;
-    while (guest.poll(type, payload)) got = got || type == Msg::WorldInfo;
-    CHECK(got);
-
-    intruder.start(c, gc, now);
-    run(1500);
-    CHECK(intruder.state() == Link::State::Failed);
-    CHECK(host.connected() && guest.connected());
-
-    net.unplug(a);
-    net.unplug(b);
-    for (uint32_t end = now + 20000; now < end; now += 100) {
-        net.now = now;
-        relay.pump(now);
-    }
-    CHECK(relay.roomCount() == 0 && relay.clientCount() == 0);
-}
-
 static void testSessionSharedWorld() {
     Pair p;  // host-world story mode: the guest's own story entities are hidden while visiting
-    p.config.storyMode = StoryMode::HostWorld;
-    p.hostStory = p.guestStory = StoryMode::HostWorld;
+    p.serverConfig.storyMode = StoryMode::HostWorld;
     const uint32_t kOutlaw = joaat("g_m_m_uniduster_01");
     const uint32_t kHorse = joaat("a_c_horse_morgan_bay");
     const uint32_t kWagon = joaat("wagon02x");
@@ -1126,7 +1140,7 @@ static void testTrackingAccuracy() {
     for (int i = 0; i < 600; ++i) {
         p.run(16);
         // Compare against where the guest was one smoothing delay + latency ago.
-        int lag = (p.host->status().bufferMs + 75) / 16;
+        int lag = (p.host->status().bufferMs + 100) / 16;  // + network and server hop
         if (static_cast<int>(history.size()) <= lag) continue;
         float err = distance(p.hostGame.ents[puppet].pos, history[history.size() - 1 - lag]);
         maxErr = std::max(maxErr, err);
@@ -1260,8 +1274,7 @@ static void testPoolHysteresisAndLod() {
 
 static void testCutsceneRegroupAndAppearance() {
     Pair p;
-    p.config.storyMode = StoryMode::HostWorld;
-    p.hostStory = p.guestStory = StoryMode::HostWorld;
+    p.serverConfig.storyMode = StoryMode::HostWorld;
     p.hostGame.player.pos = {0, 0, 0};
     p.guestGame.player.pos = {800, 0, 0};
     p.guestGame.playerOutfit = 0x5555u;
@@ -1310,22 +1323,7 @@ static void testCutsceneRegroupAndAppearance() {
 }
 
 
-class MemorySaveStore : public ISaveStore {
-public:
-    std::vector<uint8_t> latest;
-    std::vector<std::vector<uint8_t>> written;
-    bool readLatest(std::vector<uint8_t>& data, std::string& name) override {
-        if (latest.empty()) return false;
-        data = latest;
-        name = "SRDR30003";
-        return true;
-    }
-    bool writeCopy(const std::vector<uint8_t>& data, std::string& placedAs, std::string&) override {
-        written.push_back(data);
-        placedAs = "SRDR30007";
-        return true;
-    }
-};
+
 
 static bool sawNotice(CoopSession& s, const char* needle) {
     std::string text;
@@ -1394,24 +1392,25 @@ static void testSharedStoryMissionEntities() {
 
 static void testSharedStoryFlow() {
     Pair p;
-    MemorySaveStore hostSaves, guestSaves;
+    MemorySaveStore hostSaves;
     std::mt19937 rng(3);
     for (int i = 0; i < 300000; ++i) hostSaves.latest.push_back(static_cast<uint8_t>(rng()));
     p.hostGame.player.pos = {0, 0, 0};
     p.guestGame.player.pos = {100, 0, 0};
     p.net.loss = 0.05;
     p.net.latencyMs = 40;
+    p.hostP.saves = hostSaves;
+    p.hostP.saves.stamp = 1;
     p.start();
-    p.host->setSaveStore(&hostSaves);
-    p.guest->setSaveStore(&guestSaves);
-    p.run(1500);
+    p.run(5000);
 
-    // One key: the guest gets the host's save.
-    CHECK(p.guest->requestHostSave());
+    // The host's save is put on the server; one key and the guest has it.
+    CHECK(p.storage.saves["default"].size() == 1);
+    CHECK(p.guest->requestCampaignSave());
     p.run(200);
     CHECK(p.guest->status().saveProgress >= 0);
     p.run(8000);
-    CHECK(guestSaves.written.size() == 1 && guestSaves.written[0] == hostSaves.latest);
+    CHECK(p.guestP.saves.written.size() == 1 && p.guestP.saves.written[0] == hostSaves.latest);
     CHECK(sawNotice(*p.guest, "SRDR30007"));
     CHECK(p.hostGame.find(SpawnRole::PlayerPuppet) != 0);  // the game kept running meanwhile
 
@@ -1452,7 +1451,7 @@ static void testSharedStoryFlow() {
     p.guestGame.playerHealth = 0;
     p.run(800);
     CHECK(p.hostGame.playerHealth == 0);
-    CHECK(sawNotice(*p.host, "restarts for both"));
+    CHECK(sawNotice(*p.host, "restarts"));
     p.hostGame.playerHealth = 200;
     p.guestGame.playerHealth = 200;
     p.run(1000);
@@ -1511,19 +1510,12 @@ static void testSharedStoryFlow() {
     p.run(300);
     CHECK(!p.guestGame.held && !p.guestGame.playerProtected && !p.guestGame.friendWaypoint);
 
-    // Both players must use the same story mode.
-    Pair q;
-    q.guestStory = StoryMode::HostWorld;
-    q.start();
-    q.run(1500);
-    CHECK(!q.guestLink.connected() && q.guestLink.error().find("story") != std::string::npos);
 }
 
 static void testSpectatorCamera() {
     // Host world: the guest watches the host's scene through the host's camera.
     Pair p;
-    p.config.storyMode = StoryMode::HostWorld;
-    p.hostStory = p.guestStory = StoryMode::HostWorld;
+    p.serverConfig.storyMode = StoryMode::HostWorld;
     p.hostGame.player.pos = {0, 0, 0};
     p.guestGame.player.pos = {50, 0, 0};
     p.start();
@@ -1555,6 +1547,215 @@ static void testSpectatorCamera() {
     CHECK(distance(p.guestGame.player.pos, Vec3{50, 0, 0}) < 0.5f);
 }
 
+
+static void dropPlayer(Cluster& c, Player& p) {
+    p.link.stop();
+    c.players.erase(std::remove(c.players.begin(), c.players.end(), &p), c.players.end());
+}
+
+static bool journalHas(Cluster& c, const char* campaign, const char* needle) {
+    for (const auto& line : c.storage.journals[campaign])
+        if (line.find(needle) != std::string::npos) return true;
+    return false;
+}
+
+static void testServerAdmission() {
+    Cluster c;
+    c.serverConfig.password = "secret";
+    c.serverConfig.maxPlayers = 2;
+    Player& a = c.join("A", true, "alpha", "secret");
+    Player& wrong = c.join("B", false, "alpha", "nope");
+    Player& d = c.join("D", false, "beta", "secret");
+    c.run(1500);
+    CHECK(a.session->status().welcomed && a.session->status().worldOwner);
+    CHECK(!wrong.session->status().welcomed && wrong.session->status().denied == "wrong password");
+    CHECK(d.session->status().worldOwner);  // owns the world of its own campaign
+    CHECK(a.session->status().players == 1 && d.session->status().players == 1);
+    CHECK(a.game.count(SpawnRole::PlayerPuppet) == 0);  // campaigns do not see each other
+
+    Player& e = c.join("E", false, "alpha", "secret");
+    c.run(800);
+    Player& f = c.join("F", false, "alpha", "secret");
+    c.run(1500);
+    CHECK(e.session->status().welcomed && e.session->status().players == 2 && !e.session->status().worldOwner);
+    CHECK(e.session->status().ownerName == "A");
+    CHECK(!f.session->status().welcomed && f.session->status().denied == "campaign is full");
+    // The same name twice in one campaign gets told apart.
+    c.join("D", false, "beta", "secret");
+    c.run(1500);
+    EntityHandle other = d.game.find(SpawnRole::PlayerPuppet);
+    CHECK(other && d.game.ents[other].label == "D 2");
+}
+
+static void testServerThreePlayers() {
+    const uint32_t kOutlaw = joaat("g_m_m_uniduster_01"), kCow = joaat("a_c_cow");
+    Cluster c;
+    Player& owner = c.join("Owner", true);
+    c.run(200);
+    EntityHandle outlaw = owner.game.addPed(kOutlaw, {10, 0, 0});
+    owner.game.addPed(kCow, {-10, 5, 0});
+    Player& b = c.join("B");
+    b.game.player.pos = {5, 0, 0};
+    c.run(2000);
+    // A late joiner sees the world at once, from the server's copy (an idle cow only sends a keyframe a second).
+    Player& late = c.join("Late");
+    late.game.player.pos = {3, 3, 0};
+    c.run(400);
+    CHECK(mirrorOf(late.game, kCow) != 0 && mirrorOf(late.game, kOutlaw) != 0);
+    c.run(1500);
+    CHECK(owner.game.count(SpawnRole::PlayerPuppet) == 2);
+    CHECK(b.game.count(SpawnRole::PlayerPuppet) == 2 && late.game.count(SpawnRole::PlayerPuppet) == 2);
+    CHECK(b.session->status().players == 3);
+
+    // Late shoots the outlaw: the owner's real one takes it, and B's copy shows it.
+    late.game.playerShoots(mirrorOf(late.game, kOutlaw), 30);
+    c.run(600);
+    CHECK(owner.game.ents[outlaw].health == 70);
+    CHECK(b.game.ents[mirrorOf(b.game, kOutlaw)].health == 70);
+    // The owner's NPCs hurt Late's character: only Late loses health.
+    EntityHandle latePuppet = owner.game.find(SpawnRole::PlayerPuppet, joaat("player_Late"));
+    CHECK(latePuppet != 0);
+    owner.game.ents[latePuppet].health -= 20;
+    c.run(600);
+    CHECK(late.game.playerHealth == 180 && b.game.playerHealth == 200 && owner.game.playerHealth == 200);
+    // B sees Late move.
+    late.game.player.pos = {20, 20, 0};
+    c.run(1000);
+    EntityHandle lateOnB = b.game.find(SpawnRole::PlayerPuppet, joaat("player_Late"));
+    CHECK(lateOnB && distance(b.game.ents[lateOnB].pos, Vec3{20, 20, 0}) < 1.0f);
+    // Late leaves: gone for everyone.
+    dropPlayer(c, late);
+    c.run(600);
+    CHECK(b.game.count(SpawnRole::PlayerPuppet) == 1 && owner.game.count(SpawnRole::PlayerPuppet) == 1);
+}
+
+static void testServerWorldHandover() {
+    const uint32_t kOutlaw = joaat("g_m_m_uniduster_01"), kCow = joaat("a_c_cow");
+    Cluster c;
+    c.serverConfig.storyMode = StoryMode::HostWorld;
+    Player& a = c.join("A", true);
+    c.run(200);
+    a.game.addPed(kOutlaw, {5, 0, 0});
+    Player& b = c.join("B");
+    c.run(200);
+    Player& d = c.join("C");
+    EntityHandle bStory = b.game.addPed(kCow, {6, 0, 0});
+    b.game.ents[bStory].mission = true;  // B's own story ped: hidden while B visits A's world
+    c.run(2000);
+    CHECK(mirrorOf(b.game, kOutlaw) && mirrorOf(d.game, kOutlaw));
+    CHECK(b.game.ents[bStory].hidden);
+
+    // The world owner leaves: B (next in) takes over the world, everybody follows.
+    dropPlayer(c, a);
+    c.run(2500);
+    CHECK(b.session->status().worldOwner && d.session->status().ownerName == "B");
+    CHECK(!mirrorOf(b.game, kOutlaw) && !b.game.ents[bStory].hidden);  // B's own world is back
+    CHECK(!mirrorOf(d.game, kOutlaw) && mirrorOf(d.game, kCow));        // C now sees B's world
+    CHECK(journalHas(c, "default", "B now owns the world"));
+}
+
+static void testServerStoresEverything() {
+    Cluster c;
+    Player& a = c.join("A", true);
+    for (int i = 0; i < 5000; ++i) a.saves.latest.push_back(static_cast<uint8_t>(i * 7));
+    a.saves.stamp = 7;
+    c.run(2500);
+    CHECK(c.storage.saves["default"].size() == 1);  // a new campaign starts from the owner's save
+    // The owner saves again in the game: the server gets it by itself.
+    a.saves.latest[0] = 99;
+    a.saves.stamp = 8;
+    c.run(6000);
+    CHECK(c.storage.saves["default"].size() == 2 && c.storage.saves["default"].back()[0] == 99);
+    a.game.player.flags = PF_InMission;
+    c.run(500);
+    a.game.player.flags = 0;
+    c.run(500);
+    a.game.player.pos = {123, 45, 6};
+    c.run(300);
+
+    // The owner goes offline; someone joins later and still gets the campaign save.
+    dropPlayer(c, a);
+    c.run(500);
+    Player& b = c.join("B");
+    c.run(1000);
+    CHECK(b.session->status().campaignHasSave);
+    CHECK(b.session->requestCampaignSave());
+    c.run(3000);
+    CHECK(b.saves.written.size() == 1 && b.saves.written[0] == a.saves.latest);
+
+    // Even a restarted server still has it: everything lives in the storage.
+    dropPlayer(c, b);
+    c.run(500);
+    c.server = std::make_unique<Server>(*c.serverSock, c.serverConfig, c.storage);
+    Player& d = c.join("D");
+    c.run(1000);
+    CHECK(d.session->requestCampaignSave());
+    c.run(3000);
+    CHECK(d.saves.written.size() == 1 && d.saves.written[0][0] == 99);
+    CHECK(journalHas(c, "default", "A joined") && journalHas(c, "default", "A started a mission") &&
+          journalHas(c, "default", "A left"));
+    CHECK(c.storage.players["default"].count("A") && distance(c.storage.players["default"]["A"], Vec3{123, 45, 6}) < 0.1f);
+}
+
+static void testServerThreePlayerStory() {
+    Cluster c;
+    Player& a = c.join("A", true);
+    c.run(200);
+    Player& b = c.join("B");
+    Player& d = c.join("C");
+    c.run(1500);
+    for (Player* p : {&a, &b, &d}) p->game.player.flags = PF_InMission | PF_Cutscene;
+    c.run(1000);
+    // Everybody waits for the slowest watcher.
+    a.game.player.flags = PF_InMission;
+    c.run(600);
+    CHECK(a.game.held && !b.game.held);
+    b.game.player.flags = PF_InMission;
+    c.run(600);
+    CHECK(a.game.held && b.game.held);
+    d.game.player.flags = PF_InMission;
+    c.run(2500);
+    CHECK(!a.game.held && !b.game.held && !d.game.held);
+    // One dies: the mission restarts for the other two.
+    d.game.playerHealth = 0;
+    c.run(800);
+    CHECK(a.game.playerHealth == 0 && b.game.playerHealth == 0);
+    for (Player* p : {&a, &b, &d}) p->game.playerHealth = 200;
+    c.run(1500);
+    CHECK(a.game.playerHealth == 200 && b.game.playerHealth == 200 && d.game.playerHealth == 200);  // no echo
+}
+
+
+static void testFileStorage() {
+    std::string root = "coop-test-storage";
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    {
+        FileStorage fs(root, 3);
+        std::vector<uint8_t> data;
+        CHECK(!fs.loadSave("My Campaign!", data));
+        for (uint8_t i = 1; i <= 5; ++i) CHECK(fs.storeSave("My Campaign!", std::vector<uint8_t>(100, i), "A"));
+        CHECK(fs.loadSave("My Campaign!", data) && data.size() == 100 && data[0] == 5);  // the newest
+        fs.journal("My Campaign!", "hello");
+        fs.storePlayer("My Campaign!", "Arthur", {1, 2, 3});
+        fs.storePlayer("My Campaign!", "John", {4, 5, 6});
+        fs.storePlayer("My Campaign!", "Arthur", {7, 8, 9});
+    }
+    std::filesystem::path dir = std::filesystem::path(root) / "mycampaign";
+    size_t saves = 0;
+    for (const auto& e : std::filesystem::directory_iterator(dir / "saves")) saves += e.path().extension() == ".sav";
+    CHECK(saves == 3);  // history is capped
+    std::ifstream players(dir / "players.ini");
+    std::string all((std::istreambuf_iterator<char>(players)), std::istreambuf_iterator<char>());
+    CHECK(all.find("Arthur=") != std::string::npos && all.find("7.0 8.0 9.0") != std::string::npos &&
+          all.find("John=") != std::string::npos);
+    std::ifstream journal(dir / "journal.log");
+    std::string log((std::istreambuf_iterator<char>(journal)), std::istreambuf_iterator<char>());
+    CHECK(log.find("hello") != std::string::npos && log.find("save stored") != std::string::npos);
+    CHECK(sanitizeCampaign("../../etc") == "etc" && sanitizeCampaign("Blackwater_1") == "blackwater_1");
+    std::filesystem::remove_all(root, ec);
+}
+
 static void testUdpLoopback() {
     UdpSocket a, b;
     std::string error;
@@ -1584,7 +1785,6 @@ int main() {
         {"ini", testIni},
         {"link: reliable channel under 35% loss + jitter", testLinkReliableUnderLoss},
         {"link: reconnect, bye, role clash", testLinkReconnectAndRoleClash},
-        {"relay", testRelay},
         {"session: shared world, vehicles, damage, removal", testSessionSharedWorld},
         {"session: rides, vehicles, control transfer", testSessionRidesAndControl},
         {"session: tracking accuracy", testTrackingAccuracy},
@@ -1594,6 +1794,12 @@ int main() {
         {"story: linked mission entities", testSharedStoryMissionEntities},
         {"story: save copy, mission start, cutscene barrier, shared fail, waypoints", testSharedStoryFlow},
         {"story: spectator camera (host world)", testSpectatorCamera},
+        {"server: passwords, campaigns, capacity, names", testServerAdmission},
+        {"server: three players, late join from the server's world copy", testServerThreePlayers},
+        {"server: world handed over when the owner leaves", testServerWorldHandover},
+        {"server: saves, journal and players stored (also across restarts)", testServerStoresEverything},
+        {"server: cutscene barrier and shared failure with three players", testServerThreePlayerStory},
+        {"server: campaign files on disk", testFileStorage},
         {"udp loopback", testUdpLoopback},
     };
     for (const Test& t : tests) {

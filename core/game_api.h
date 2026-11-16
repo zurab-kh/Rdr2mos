@@ -60,6 +60,8 @@ public:
     virtual ~ISaveStore() = default;
     // The most recent save of the local player.
     virtual bool readLatest(std::vector<uint8_t>& data, std::string& name) = 0;
+    // Changes whenever a newer save appears (e.g. its modification time), 0 if there is none.
+    virtual uint64_t latestStamp() = 0;
     // Stores a copy in a free slot, never overwriting anything. `placedAs` names the slot.
     virtual bool writeCopy(const std::vector<uint8_t>& data, std::string& placedAs, std::string& error) = 0;
 };

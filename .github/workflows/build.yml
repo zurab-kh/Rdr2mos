@@ -6,7 +6,7 @@ on:
 
 jobs:
   linux:
-    name: Tests + relay (Linux), plugin (MinGW cross-build)
+    name: Tests + server (Linux), plugin (MinGW cross-build)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,7 +22,7 @@ jobs:
           cmake -S . -B build-win -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-x86_64.cmake
           cmake --build build-win
           mkdir -p dist
-          cp build-win/plugin/RDR2Coop.asi plugin/RDR2Coop.ini build-win/rdr2coop-relay.exe build/rdr2coop-relay dist/
+          cp build-win/plugin/RDR2Coop.asi plugin/RDR2Coop.ini build-win/rdr2coop-server.exe build/rdr2coop-server dist/
       - uses: actions/upload-artifact@v4
         with:
           name: RDR2Coop-mingw
@@ -47,4 +47,4 @@ jobs:
           path: |
             build/plugin/RDR2Coop.asi
             build/plugin/RDR2Coop.ini
-            build/rdr2coop-relay.exe
+            build/rdr2coop-server.exe

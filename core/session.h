@@ -1,15 +1,18 @@
-// The co-op session: turns the link + the game interface into one shared story world.
+// A player's side of a co-op session: turns the link to the server + the game interface into
+// one shared story world with any number of players.
 //
-//  * Each player owns their own character; the other side shows it as a "puppet".
-//  * The host owns the world. Peds, horses and vehicles near either player are streamed to the
-//    guest, who shows them as "mirrors" and keeps its own population switched off.
-//  * Streaming is prioritised: close entities update at the full rate, distant ones less often,
-//    idle ones only send a keyframe once a second, and only changed fields are sent.
-//  * Damage is forwarded to whoever owns the victim.
-//  * Control can move across: if the guest drives a host wagon or rides a host horse, the host
-//    moves the real one from the guest's input stream.
+//  * Every player owns their own character; the others show it as a "puppet".
+//  * One player's game owns the world (chosen by the server). It streams peds, horses and vehicles
+//    near any player; everybody else shows them as "mirrors" and keeps their own population off.
+//    Streaming is prioritised by distance to the nearest other player, only changed fields are
+//    sent, and idle entities only send a keyframe once a second.
+//  * Damage is routed by the server to whoever owns the victim.
+//  * Control can move across: if someone drives the owner's wagon or rides the owner's horse, the
+//    owner moves the real one from that player's stream.
+//  * Shared story: each player's own copies of mission NPCs are linked to the owner's.
 #pragma once
 #include <cstdint>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -22,21 +25,30 @@
 
 namespace coop {
 
-
-
 struct SessionStatus {
+    bool welcomed = false;
+    std::string denied;          // why the server refused us
+    uint8_t playerId = 0;
+    bool worldOwner = false;
+    std::string ownerName;
+    int players = 0;             // including us
+    StoryMode storyMode = StoryMode::Shared;
+    bool campaignHasSave = false;
+    // nearest other player
     bool peerVisible = false;
+    std::string peerName;
     Vec3 peerPos;
     float peerDistance = 0;
     bool peerDead = false;
     bool peerInMission = false;
-    bool peerInCutscene = false;
-    bool holding = false;        // waiting for the friend to finish a cutscene (world frozen)
-    bool spectating = false;     // watching the host's cutscene through their camera
+    bool peerInCutscene = false; // anyone else in a scene
+    int bufferMs = 0;            // smoothing delay for the nearest player's character
+    // world and story
+    int syncedEntities = 0;      // owner: entities streamed; others: mirrors shown
+    bool holding = false;
+    bool spectating = false;
     bool missionMismatch = false;
     int saveProgress = -1;
-    int syncedEntities = 0;      // host: entities streamed; guest: mirrors shown
-    int bufferMs = 0;            // current smoothing delay for the friend's character
 };
 
 class CoopSession {
@@ -47,19 +59,18 @@ public:
     void tick(uint32_t nowMs);
     // Removes everything this session created in the game world.
     void cleanup();
-    // Moves the local player next to the friend. Returns false if their position is unknown.
+    // Moves the local player next to the world owner (or the nearest player if we own the world).
     bool teleportToPeer();
 
     const SessionStatus& status() const { return status_; }
-    // Things worth telling the player ("Host started a mission"); returns false when none are left.
     bool popNotice(std::string& out);
-    // Shared story: the guest asks the host for their save (stored in a free slot).
-    bool requestHostSave() { return story_.requestHostSave(); }
+    // Downloads the campaign save from the server into a free local slot.
+    bool requestCampaignSave() { return story_.requestCampaignSave(); }
+    // Puts the latest local save on the server as the campaign save.
+    bool uploadSave() { return story_.uploadLatestSave(); }
     void setSaveStore(ISaveStore* store) { story_.setSaveStore(store); }
 
 private:
-    // Keeps track of how a driven entity was last told to move, so tasks are not re-issued
-    // every frame (that would restart animations and cost native calls).
     struct Mover {
         enum Mode { None, Idle, Moving } mode = None;
         uint32_t lastTaskMs = 0;
@@ -69,6 +80,8 @@ private:
     };
 
     struct Puppet {
+        uint8_t id = 0;
+        std::string name, avatar;
         EntityHandle ped = 0;
         EntityHandle ownMount = 0, ownVehicle = 0;
         uint32_t ownMountModel = 0, ownVehicleModel = 0;
@@ -86,23 +99,23 @@ private:
         uint32_t outfit = 0, outfitApplied = 0;
     };
 
-    // Host side: an entity of the host's world that is being streamed.
+    // World owner: an entity of the local world that is being streamed.
     struct Streamed {
         EntityHandle handle = 0;
         EntityKind kind = EntityKind::Ped;
         uint16_t id = 0;
-        EntityState sent;            // last values sent
-        uint32_t changedMs[7] = {};  // last change per field group (bit index of EntityFields)
+        EntityState sent;
+        uint32_t changedMs[7] = {};
         uint32_t nextDueMs = 0, lastKeyMs = 0, createdMs = 0;
-        float guestDistance = 0;
+        float viewerDistance = 0;
         bool fresh = true;
         bool seen = false;
     };
 
-    // Guest side: copy of a host entity.
+    // Everyone else: copy of an entity of the owner's world.
     struct Mirror {
         uint16_t id = 0;
-        EntityState st;              // accumulated latest values
+        EntityState st;
         bool haveStatic = false, havePos = false, haveVel = false;
         EntityHandle handle = 0;
         uint32_t lastHeardMs = 0;
@@ -116,10 +129,9 @@ private:
         uint32_t outfitApplied = 0;
         uint32_t firstHeardMs = 0;
         bool ragdolled = false;
-        bool bound = false;          // shared story: drives the guest's own copy of this mission entity
+        bool bound = false;          // shared story: drives our own copy of this mission entity
     };
 
-    // Guest side: mirrors that left the stream, kept invisible for quick reuse.
     struct Parked {
         EntityHandle handle = 0;
         EntityKind kind = EntityKind::Ped;
@@ -128,15 +140,22 @@ private:
     };
 
     void handleMessages(uint32_t nowMs);
+    void onRoster(const Roster& roster);
     void onSnapshot(const EntitySnapshot& snap, uint32_t nowMs);
     void sendLocalState(uint32_t nowMs);
+    void sendAppearance(uint32_t nowMs);
     void sendWorld(uint32_t nowMs);
     void streamEntity(Streamed& s, uint32_t nowMs);
-    void updatePuppet(uint32_t nowMs, float dt);
+    void updatePuppets(uint32_t nowMs, float dt);
+    void updatePuppet(Puppet& p, uint32_t nowMs, float dt);
     void updateMirrors(uint32_t nowMs, float dt);
     void updateMirrorPed(Mirror& m, uint32_t nowMs, float dt);
+    void bindMissionEntities(uint32_t nowMs);
+    void followBound(EntityHandle h, const MotionSample& target, float dt);
     void clearForeign(uint32_t nowMs);
+    void resetWorld();
     void restoreWorld();
+    void notice(const std::string& text);
 
     void movePed(EntityHandle h, Mover& m, const MotionSample& target, float dt, uint32_t nowMs);
     void steerVehicle(EntityHandle h, Mover& m, const MotionSample& target, float dt);
@@ -145,27 +164,31 @@ private:
     EntityHandle resolveRef(uint16_t ref);
     uint16_t refOf(EntityHandle h);
     bool isSessionEntity(EntityHandle h) const;
-    void sendAppearance(uint32_t nowMs);
-    void bindMissionEntities(uint32_t nowMs);
-    void followBound(EntityHandle h, const MotionSample& target, float dt);
-    void notice(const std::string& text);
-    void destroyPuppet();
+    bool inPool(EntityHandle h) const;
+    Puppet* puppetByPed(EntityHandle h);
+    void destroyPuppet(Puppet& p);
     void destroyMirror(Mirror& m, bool recycle);
     EntityHandle obtain(EntityKind kind, uint32_t model, const Vec3& pos, float heading);
-    bool inPool(EntityHandle h) const;
     void flushPool(uint32_t nowMs, bool all);
     uint16_t allocateId();
-    bool isHost() const { return link_.local().role == Role::Host; }
+    bool isOwner() const { return myId_ != 0 && myId_ == owner_; }
 
     IGame& game_;
     Link& link_;
     SessionConfig config_;
     SessionStatus status_;
-    uint32_t epoch_ = 0;
+    uint32_t linkEpoch_ = 0;
     bool active_ = false;
     uint32_t lastTickMs_ = 0;
+    uint32_t frame_ = 0;
 
-    Puppet puppet_;
+    // who is who (from the server)
+    uint8_t myId_ = 0, owner_ = 0;
+    uint16_t worldEpoch_ = 0;
+    bool haveRoster_ = false;
+    StoryMode mode_ = StoryMode::Shared;
+    std::map<uint8_t, Puppet> puppets_;
+
     LocalPlayer local_;
     bool haveLocal_ = false;
     uint32_t lastStateMs_ = 0;
@@ -173,30 +196,28 @@ private:
     bool lastSentMoving_ = false;
     uint32_t lastOutfitCheckMs_ = 0, sentOutfit_ = 0;
     bool appearanceSent_ = false;
+    uint32_t lastWorldMs_ = 0, lastInfoMs_ = 0, lastForeignMs_ = 0;
     std::vector<std::string> notices_;
     StorySync story_;
-    std::vector<MissionEntity> missionLocal_;
-    uint32_t lastMissionScanMs_ = 0;
-    uint32_t frame_ = 0;
-    uint32_t lastWorldMs_ = 0;
-    uint32_t lastInfoMs_ = 0;
-    uint32_t lastForeignMs_ = 0;
 
-    // host
+    // world owner
     std::unordered_map<EntityHandle, Streamed> streamed_;
     std::unordered_map<uint16_t, EntityHandle> handleById_;
-    std::vector<std::pair<uint16_t, uint32_t>> removals_;  // id, resend until
+    std::vector<std::pair<uint16_t, uint32_t>> removals_;
     uint16_t nextId_ = 1;
-    // guest
+    // everyone else
     std::unordered_map<uint16_t, Mirror> mirrors_;
     std::unordered_map<EntityHandle, uint16_t> mirrorByHandle_;
     std::unordered_set<EntityHandle> hidden_;
     std::vector<Parked> pool_;
-    bool hostWorldSync_ = false;
+    bool ownerWorldSync_ = false;
+    std::vector<MissionEntity> missionLocal_;
+    uint32_t lastMissionScanMs_ = 0;
 
-    // scratch buffers reused every tick (no per-frame allocations)
+    // scratch buffers reused every tick
     std::vector<NearbyEntity> nearby_;
     std::vector<std::pair<float, size_t>> order_;
+    std::vector<Vec3> viewers_;
     std::vector<EntityState> outgoing_;
     std::vector<uint16_t> removedIds_;
     std::vector<std::vector<uint8_t>> packets_;

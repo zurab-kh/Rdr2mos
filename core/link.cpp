@@ -10,11 +10,10 @@ constexpr uint32_t kResendMs = 150;
 constexpr uint32_t kKeepAliveMs = 250;
 constexpr uint32_t kPingIntervalMs = 1000;
 constexpr uint32_t kTimeoutMs = 10000;
-constexpr size_t kReliableWindow = 32;
+constexpr size_t kReliableWindow = 64;
 constexpr size_t kMaxQueuedReliable = 4096;
 constexpr size_t kMaxInbox = 4096;
 constexpr uint8_t kRecordReliable = 1;
-constexpr uint8_t kRelayRoomFull = 255;
 
 uint32_t randomNonce() {
     static std::mt19937 rng{std::random_device{}()};
@@ -30,7 +29,6 @@ void Link::start(IDatagramSocket* socket, const LinkConfig& config, uint32_t now
     socket_ = socket;
     config_ = config;
     error_.clear();
-    relayPeers_ = 0;
     beginConnecting(nowMs);
 }
 
@@ -50,10 +48,9 @@ void Link::beginConnecting(uint32_t nowMs) {
     resetSession();
     // A fresh nonce makes the peer drop whatever it remembers about our previous session.
     config_.local.nonce = randomNonce();
-    remote_ = config_.listen && !config_.viaRelay ? Endpoint{} : config_.remote;
+    remote_ = config_.listen ? Endpoint{} : config_.remote;
     lastReceiveMs_ = nowMs;
     helloSent_ = false;
-    registerSent_ = false;
 }
 
 void Link::resetSession() {
@@ -106,15 +103,6 @@ void Link::sendHello(const Endpoint& to, uint32_t nowMs) {
     helloSent_ = true;
 }
 
-void Link::sendRegister(uint32_t nowMs) {
-    ByteWriter w;
-    writePacketHeader(w, PacketType::RelayRegister);
-    w.str(config_.room);
-    transmit(config_.remote, w.data.data(), w.data.size());
-    lastRegisterMs_ = nowMs;
-    registerSent_ = true;
-}
-
 void Link::update(uint32_t nowMs) {
     if (!socket_ || state_ == State::Idle || state_ == State::Failed) return;
     updateRates(nowMs);
@@ -126,11 +114,6 @@ void Link::update(uint32_t nowMs) {
         bytesIn_ += static_cast<uint32_t>(size);
         handleDatagram(from, buffer, static_cast<size_t>(size), nowMs);
         if (state_ == State::Failed) return;
-    }
-
-    if (config_.viaRelay) {
-        uint32_t interval = state_ == State::Connected ? 5000u : 1000u;
-        if (!registerSent_ || nowMs - lastRegisterMs_ >= interval) sendRegister(nowMs);
     }
 
     if (state_ == State::Connecting) {
@@ -147,12 +130,11 @@ void Link::handleDatagram(const Endpoint& from, const uint8_t* data, size_t size
     if (!readPacketHeader(r, type, versionOk)) return;
 
     // Until a direct host has locked on to its friend it accepts a Hello from anywhere.
-    bool acceptAnySource = config_.listen && !config_.viaRelay && state_ == State::Connecting;
+    bool acceptAnySource = config_.listen && state_ == State::Connecting;
     if (!acceptAnySource && from != remote_) return;
 
     if (!versionOk) {
-        if (type == PacketType::Hello || type == PacketType::RelayStatus)
-            fail("mod version mismatch: both players (and the relay) need the same version");
+        if (type == PacketType::Hello) fail("mod version mismatch: players and server need the same version");
         return;
     }
 
@@ -165,14 +147,6 @@ void Link::handleDatagram(const Endpoint& from, const uint8_t* data, size_t size
             break;
         case PacketType::Bye:
             if (state_ == State::Connected && r.u16() == sessionKey() && r.ok()) beginConnecting(nowMs);
-            break;
-        case PacketType::RelayStatus:
-            if (config_.viaRelay) {
-                uint8_t peers = r.u8();
-                if (!r.ok()) break;
-                if (peers == kRelayRoomFull) fail("relay room is full: pick another room name");
-                else relayPeers_ = peers;
-            }
             break;
         default:
             break;
@@ -187,14 +161,7 @@ void Link::handleHello(const Endpoint& from, ByteReader& r, uint32_t nowMs) {
         // Answer first so the other side sees the same problem.
         if (nowMs - lastHelloMs_ >= kHelloIntervalMs / 2) sendHello(from, nowMs);
         // A direct host keeps listening (a stranger must not be able to shut it down); it only shows the reason.
-        if (config_.listen && !config_.viaRelay) error_ = why;
-        else fail(why);
-        return;
-    }
-    if (hello.storyMode != config_.local.storyMode) {
-        const char* why = "different story modes: set the same [story] mode in both RDR2Coop.ini files";
-        if (nowMs - lastHelloMs_ >= kHelloIntervalMs / 2) sendHello(from, nowMs);
-        if (config_.listen && !config_.viaRelay) error_ = why;
+        if (config_.listen) error_ = why;
         else fail(why);
         return;
     }

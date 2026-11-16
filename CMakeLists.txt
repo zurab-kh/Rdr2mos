@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(RDR2Coop VERSION 0.4.0 LANGUAGES CXX)
+project(RDR2Coop VERSION 0.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -22,7 +22,8 @@ add_library(coop_core STATIC
   core/protocol.cpp
   core/socket.cpp
   core/link.cpp
-  core/relay.cpp
+  core/server.cpp
+  core/server_storage.cpp
   core/session.cpp
   core/story.cpp
   core/config.cpp)
@@ -31,9 +32,9 @@ if(WIN32)
   target_link_libraries(coop_core PUBLIC ws2_32)
 endif()
 
-# ---- relay server (any OS)
-add_executable(rdr2coop-relay server/main.cpp)
-target_link_libraries(rdr2coop-relay PRIVATE coop_core)
+# ---- dedicated server (any OS)
+add_executable(rdr2coop-server server/main.cpp)
+target_link_libraries(rdr2coop-server PRIVATE coop_core)
 
 # ---- tests
 add_executable(coop_tests tests/test_main.cpp)
@@ -48,7 +49,7 @@ endif()
 
 if(MINGW)
   # Self-contained binaries: no libstdc++/libgcc/winpthread DLLs next to the game.
-  foreach(target rdr2coop-relay coop_tests)
+  foreach(target rdr2coop-server coop_tests)
     target_link_options(${target} PRIVATE -static)
   endforeach()
 endif()

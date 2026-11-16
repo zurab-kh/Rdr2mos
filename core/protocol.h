@@ -1,4 +1,4 @@
-// Wire protocol shared by the game plugin, the relay server and the tests.
+// Wire protocol shared by the game plugin, the server and the tests.
 //
 // Bandwidth matters more than CPU here, so world state is sent as compact, field-masked
 // entity updates: positions as 2 cm steps relative to a per-packet anchor, headings as
@@ -12,7 +12,7 @@
 namespace coop {
 
 constexpr uint16_t kMagic = 0x4352;  // "RC"
-constexpr uint8_t kProtocolVersion = 4;
+constexpr uint8_t kProtocolVersion = 5;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr size_t kMaxDatagram = 1200;  // stays below any sane path MTU
 constexpr size_t kMaxMessage = 1100;   // payload budget for one unreliable message
@@ -21,13 +21,12 @@ enum class PacketType : uint8_t {
     Hello = 1,
     Data = 2,
     Bye = 3,
-    RelayRegister = 10,
-    RelayStatus = 11,
 };
 
+// Link-level role: the server listens (Host), players connect to it (Guest).
 enum class Role : uint8_t {
-    Host = 0,   // owns the story world: missions, NPCs, vehicles, clock, weather
-    Guest = 1,  // joins the host's world
+    Host = 0,
+    Guest = 1,
 };
 
 enum class Msg : uint8_t {
@@ -41,9 +40,17 @@ enum class Msg : uint8_t {
     Story = 8,          // mission identity, deaths (reliable)
     Camera = 9,         // rendered camera during the host's scenes (host-world mode)
     Waypoint = 10,      // map waypoint (reliable)
-    SaveRequest = 11,   // guest asks for the host's save (reliable)
-    SaveChunk = 12,     // a piece of the save file (reliable)
+    SaveRequest = 11,   // a player asks the server for the campaign save (reliable)
+    SaveChunk = 12,     // a piece of a save file, uploaded or downloaded (reliable)
+    Welcome = 13,       // server -> player: your id and the campaign settings
+    Roster = 14,        // server -> players: who is in, who owns the world
+    StoryCommand = 15,  // server -> player: hold, release, fail, regroup, notice
+    Denied = 16,        // server -> player: not admitted, with the reason
 };
+
+// Messages that one player sends to the server and the server passes on to the others reach
+// them with one extra leading byte: the id of the player they came from.
+std::vector<uint8_t> withSource(uint8_t player, const std::vector<uint8_t>& payload);
 
 // How the two games share the story.
 enum class StoryMode : uint8_t {
@@ -51,18 +58,24 @@ enum class StoryMode : uint8_t {
     Shared = 1,     // both play the same save: each runs the mission, the games are kept in step
 };
 
-// References to things in the host's world. Entity ids are assigned by the host.
+// References to things in the shared world. Entity ids are assigned by the world owner;
+// players are referred to as kRefPlayerBase + player id.
 constexpr uint16_t kRefNone = 0;
-constexpr uint16_t kRefHostPlayer = 0xFFFE;
-constexpr uint16_t kRefGuestPlayer = 0xFFFD;
-constexpr uint16_t kMaxEntityId = 0xFFF0;
+constexpr uint16_t kMaxEntityId = 0xFEFF;
+constexpr uint16_t kRefPlayerBase = 0xFF00;
+constexpr uint8_t kMaxPlayers = 32;
+inline uint16_t playerRef(uint8_t id) { return static_cast<uint16_t>(kRefPlayerBase | id); }
+inline bool isPlayerRef(uint16_t ref) { return ref > kRefPlayerBase && ref <= kRefPlayerBase + kMaxPlayers; }
+inline uint8_t playerOfRef(uint16_t ref) { return static_cast<uint8_t>(ref & 0xFF); }
 
 struct HelloInfo {
     Role role = Role::Host;
     uint32_t nonce = 0;        // changes on every (re)start so a restarted peer is noticed
     std::string name;
-    std::string avatar;        // ped model name the peer wants to be shown as
-    StoryMode storyMode = StoryMode::Shared;
+    std::string avatar;        // ped model name the player wants to be shown as
+    std::string campaign;      // which campaign on the server to join
+    std::string password;
+    uint8_t wantsWorld = 0;    // 1 = this player wants to own the world (play the story as host)
 };
 
 enum PlayerFlags : uint16_t {
@@ -194,6 +207,47 @@ struct SaveChunk {
 constexpr size_t kSaveChunkBytes = 960;
 constexpr uint32_t kMaxSaveBytes = 64u << 20;
 
+// Server -> player after admission.
+struct Welcome {
+    uint8_t playerId = 0;
+    StoryMode storyMode = StoryMode::Shared;
+    uint8_t hasCampaignSave = 0;
+    std::string campaign;
+};
+
+struct RosterEntry {
+    uint8_t id = 0;
+    std::string name;
+    std::string avatar;
+};
+
+struct Roster {
+    uint8_t worldOwner = 0;     // player whose game simulates the world
+    uint16_t worldEpoch = 0;    // changes whenever the world owner changes: start the world afresh
+    std::vector<RosterEntry> players;
+};
+
+enum class StoryCmd : uint8_t {
+    Hold = 1,       // freeze: wait for the others to finish their scene / join the mission
+    Release = 2,
+    Fail = 3,       // a player died in the mission: fail it here too (after any running scene)
+    Regroup = 4,    // move to `pos` if farther than `distance`
+    Notice = 5,     // show `text`
+    Mismatch = 6,   // `flag`: this player's mission differs from the world owner's
+};
+
+struct StoryCommandMsg {
+    StoryCmd cmd = StoryCmd::Notice;
+    uint8_t flag = 0;
+    Vec3 pos;
+    float distance = 0;
+    std::string text;
+};
+
+struct Denied {
+    std::string reason;
+};
+
 struct WorldInfo {
     uint8_t hour = 0, minute = 0, second = 0;
     uint8_t worldSync = 0;     // host is streaming its world; the guest should show only that
@@ -221,6 +275,14 @@ bool read(ByteReader& r, SaveRequest& v);
 void write(ByteWriter& w, const SaveChunk& v);
 bool read(ByteReader& r, SaveChunk& v);
 uint32_t crc32(const uint8_t* data, size_t size, uint32_t crc = 0);
+void write(ByteWriter& w, const Welcome& v);
+bool read(ByteReader& r, Welcome& v);
+void write(ByteWriter& w, const Roster& v);
+bool read(ByteReader& r, Roster& v);
+void write(ByteWriter& w, const StoryCommandMsg& v);
+bool read(ByteReader& r, StoryCommandMsg& v);
+void write(ByteWriter& w, const Denied& v);
+bool read(ByteReader& r, Denied& v);
 void write(ByteWriter& w, const WorldInfo& v);
 bool read(ByteReader& r, WorldInfo& v);
 

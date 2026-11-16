@@ -61,6 +61,17 @@ bool Rdr2SaveStore::readLatest(std::vector<uint8_t>& data, std::string& name) {
     return !data.empty();
 }
 
+uint64_t Rdr2SaveStore::latestStamp() {
+    fs::path file, profile;
+    if (!findLatest(file, profile)) return 0;
+    std::error_code ec;
+    auto time = fs::last_write_time(file, ec);
+    if (ec) return 0;
+    uint64_t stamp = static_cast<uint64_t>(time.time_since_epoch().count());
+    for (wchar_t c : file.filename().wstring()) stamp = stamp * 31 + static_cast<uint64_t>(c);
+    return stamp ? stamp : 1;
+}
+
 bool Rdr2SaveStore::writeCopy(const std::vector<uint8_t>& data, std::string& placedAs, std::string& error) {
     std::error_code ec;
     fs::path file, profile;

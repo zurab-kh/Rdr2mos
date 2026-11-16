@@ -1,18 +1,22 @@
-// RDR2 Co-op: play Red Dead Redemption 2's story mode together with a friend.
-// ScriptHookRDR2 plugin entry point: configuration, hotkeys, HUD and the per-frame loop.
+// RDR2 Co-op: play Red Dead Redemption 2's story mode together.
+// ScriptHookRDR2 plugin entry point: configuration, the optional built-in server, hotkeys, HUD
+// and the per-frame loop.
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include "config.h"
 #include "link.h"
 #include "natives.h"
 #include "rdr2_game.h"
 #include "saves.h"
+#include "server.h"
 #include "session.h"
 
 using namespace coop;
@@ -47,17 +51,6 @@ void logLine(const char* format, ...) {
     std::fclose(file);
 }
 
-// "F7", "K", "5" ... -> virtual key code (0 = unknown / disabled).
-int parseKey(std::string name) {
-    for (char& c : name) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    if (name.size() >= 2 && name[0] == 'F') {
-        int number = std::atoi(name.c_str() + 1);
-        if (number >= 1 && number <= 24) return VK_F1 + number - 1;
-    }
-    if (name.size() == 1 && ((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= '0' && name[0] <= '9'))) return name[0];
-    return 0;
-}
-
 // Millisecond clock with sub-millisecond precision. GetTickCount() only advances every
 // 10-16 ms, which would show up as visible stutter in the interpolation.
 uint32_t clockMs() {
@@ -69,6 +62,17 @@ uint32_t clockMs() {
     LARGE_INTEGER c;
     QueryPerformanceCounter(&c);
     return static_cast<uint32_t>(static_cast<uint64_t>(c.QuadPart / ticksPerMs));
+}
+
+// "F7", "K", "5" ... -> virtual key code (0 = unknown / disabled).
+int parseKey(std::string name) {
+    for (char& c : name) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    if (name.size() >= 2 && name[0] == 'F') {
+        int number = std::atoi(name.c_str() + 1);
+        if (number >= 1 && number <= 24) return VK_F1 + number - 1;
+    }
+    if (name.size() == 1 && ((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= '0' && name[0] <= '9'))) return name[0];
+    return 0;
 }
 
 bool gameHasFocus() {
@@ -94,17 +98,19 @@ private:
 };
 
 struct Settings {
-    Role role = Role::Host;
-    bool viaRelay = false;
-    std::string address;
+    std::string serverAddress;
+    bool hostServer = false;
     int port = kDefaultPort;
-    std::string room;
+    std::string campaign = "default";
+    std::string password;
+    bool wantsWorld = false;
     std::string name = "Player";
-    std::string avatar;
+    std::string avatar = "player_zero";
     bool autoConnect = false;
     bool showHud = true;
     SessionConfig session;
-    std::string toggleKey = "F7", teleportKey = "F8", hudKey = "F9", saveKey = "F10";
+    ServerConfig server;  // used by the built-in server
+    std::string toggleKey = "F7", teleportKey = "F8", hudKey = "F9", downloadKey = "F10", uploadKey = "F11";
     std::string problem;  // configuration error to show on screen
 
     void load(const std::string& path) {
@@ -113,55 +119,85 @@ struct Settings {
             problem = "RDR2Coop.ini not found next to RDR2Coop.asi";
             return;
         }
-        std::string roleName = ini.get("network", "role", "host");
-        if (roleName == "host") role = Role::Host;
-        else if (roleName == "guest") role = Role::Guest;
-        else problem = "RDR2Coop.ini: role must be host or guest";
-
-        std::string connection = ini.get("network", "connection", "direct");
-        if (connection == "relay") viaRelay = true;
-        else if (connection != "direct") problem = "RDR2Coop.ini: connection must be direct or relay";
-
-        address = ini.get("network", "address");
+        serverAddress = ini.get("network", "server");
+        hostServer = ini.getBool("network", "host_server", false);
         port = ini.getInt("network", "port", kDefaultPort);
         if (port <= 0 || port > 65535) problem = "RDR2Coop.ini: bad port";
-        room = ini.get("network", "room");
+        campaign = ini.get("network", "campaign", "default");
+        password = ini.get("network", "password");
         autoConnect = ini.getBool("network", "auto_connect", false);
-        if (viaRelay && room.empty()) problem = "RDR2Coop.ini: relay mode needs a room name";
-        if ((viaRelay || role == Role::Guest) && address.empty())
-            problem = viaRelay ? "RDR2Coop.ini: relay mode needs the relay address"
-                               : "RDR2Coop.ini: guest needs the host's address";
+        wantsWorld = ini.getBool("network", "world_owner", hostServer);
+        if (!hostServer && serverAddress.empty())
+            problem = "RDR2Coop.ini: set server = <address> or host_server = 1";
 
         name = ini.get("player", "name", "Player").substr(0, 24);
-        avatar = ini.get("player", "avatar", role == Role::Host ? "player_zero" : "player_three");
+        avatar = ini.get("player", "avatar", wantsWorld ? "player_zero" : "player_three");
 
         session.worldSync = ini.getBool("sync", "world_sync", true);
         session.friendlyFire = ini.getBool("sync", "friendly_fire", false);
         session.syncClock = ini.getBool("sync", "sync_clock", true);
         session.syncWeather = ini.getBool("sync", "sync_weather", true);
         session.softCorrection = ini.getBool("sync", "soft_correction", true);
-        session.autoRegroup = ini.getBool("sync", "auto_regroup", true);
-        std::string mode = ini.get("story", "mode", "shared");
-        if (mode == "shared") session.storyMode = StoryMode::Shared;
-        else if (mode == "host") session.storyMode = StoryMode::HostWorld;
-        else problem = "RDR2Coop.ini: [story] mode must be shared or host";
-        session.cutsceneBarrier = ini.getBool("story", "cutscene_barrier", true);
-        session.barrierTimeoutMs = static_cast<uint32_t>(std::clamp(ini.getInt("story", "barrier_timeout", 120), 10, 1800)) * 1000u;
-        session.sharedFail = ini.getBool("story", "shared_fail", true);
-        session.spectate = ini.getBool("story", "spectate", true);
-        session.syncWaypoints = ini.getBool("story", "sync_waypoints", true);
-        session.regroupDistance = std::clamp(ini.getFloat("sync", "regroup_distance", 150.0f), 20.0f, 5000.0f);
         session.npcRadius = std::clamp(ini.getFloat("sync", "radius", 150.0f), 30.0f, 400.0f);
         session.maxPeds = std::clamp(ini.getInt("sync", "max_peds", 64), 0, 200);
         session.maxVehicles = std::clamp(ini.getInt("sync", "max_vehicles", 16), 0, 64);
+        session.autoRegroup = ini.getBool("story", "auto_regroup", true);
+        session.spectate = ini.getBool("story", "spectate", true);
+        session.syncWaypoints = ini.getBool("story", "sync_waypoints", true);
+        session.autoUploadSaves = ini.getBool("story", "auto_upload_saves", true);
+
+        std::string mode = ini.get("server", "mode", "shared");
+        if (mode == "shared") server.storyMode = StoryMode::Shared;
+        else if (mode == "host") server.storyMode = StoryMode::HostWorld;
+        else problem = "RDR2Coop.ini: [server] mode must be shared or host";
+        server.password = password;
+        server.maxPlayers = std::clamp(ini.getInt("server", "max_players", 8), 1, static_cast<int>(kMaxPlayers));
+        server.cutsceneBarrier = ini.getBool("server", "cutscene_barrier", true);
+        server.barrierTimeoutMs = static_cast<uint32_t>(std::clamp(ini.getInt("server", "barrier_timeout", 120), 10, 1800)) * 1000u;
+        server.sharedFail = ini.getBool("server", "shared_fail", true);
+        server.regroupDistance = std::clamp(ini.getFloat("server", "regroup_distance", 150.0f), 20.0f, 5000.0f);
 
         toggleKey = ini.get("keys", "toggle", "F7");
         teleportKey = ini.get("keys", "teleport_to_friend", "F8");
         hudKey = ini.get("keys", "hud", "F9");
-        saveKey = ini.get("keys", "get_host_save", "F10");
+        downloadKey = ini.get("keys", "download_campaign_save", "F10");
+        uploadKey = ini.get("keys", "upload_save", "F11");
         showHud = ini.getBool("hud", "show", true);
     }
 };
+
+// The built-in server runs on its own thread: it needs nothing from the game, so it keeps
+// serving the others even while this game sits in a loading screen (when scripts are paused).
+class BuiltInServer {
+public:
+    bool start(const Settings& s, std::string& error) {
+        if (thread_.joinable()) return true;  // already running (survives script restarts)
+        if (!socket_.open(static_cast<uint16_t>(s.port), &error)) return false;
+        storage_ = std::make_unique<FileStorage>(moduleDirectory() + "\\RDR2Coop-server");
+        server_ = std::make_unique<Server>(socket_, s.server, *storage_);
+        stop_ = false;
+        thread_ = std::thread([this] {
+            while (!stop_) {
+                socket_.waitReadable(5);
+                server_->pump(clockMs());
+            }
+        });
+        logLine("built-in server running on UDP port %d", s.port);
+        return true;
+    }
+    void stop() {
+        stop_ = true;
+        if (thread_.joinable()) thread_.detach();  // never block the loader lock in DllMain
+    }
+
+private:
+    UdpSocket socket_;
+    std::unique_ptr<FileStorage> storage_;
+    std::unique_ptr<Server> server_;
+    std::thread thread_;
+    std::atomic<bool> stop_{false};
+};
+BuiltInServer g_server;
 
 class App {
 public:
@@ -170,11 +206,12 @@ public:
         toggle_ = Hotkey(parseKey(settings_.toggleKey));
         teleport_ = Hotkey(parseKey(settings_.teleportKey));
         hud_ = Hotkey(parseKey(settings_.hudKey));
-        save_ = Hotkey(parseKey(settings_.saveKey));
+        download_ = Hotkey(parseKey(settings_.downloadKey));
+        upload_ = Hotkey(parseKey(settings_.uploadKey));
         showHud_ = settings_.showHud;
-        logLine("RDR2 Co-op started: role=%s connection=%s%s%s", settings_.role == Role::Host ? "host" : "guest",
-                settings_.viaRelay ? "relay" : "direct", settings_.problem.empty() ? "" : " CONFIG ERROR: ",
-                settings_.problem.c_str());
+        logLine("RDR2 Co-op started: server=%s campaign=%s%s%s",
+                settings_.hostServer ? "built-in" : settings_.serverAddress.c_str(), settings_.campaign.c_str(),
+                settings_.problem.empty() ? "" : " CONFIG ERROR: ", settings_.problem.c_str());
 
         bool wantAutoConnect = settings_.autoConnect || g_reconnect;
         for (;;) {
@@ -196,30 +233,31 @@ public:
                     connect(now);
                 }
             }
-            if (teleport_.pressed() && session_) {
-                if (!session_->teleportToPeer()) notify(now, "Friend's position is not known yet");
-            }
+            if (teleport_.pressed() && session_ && !session_->teleportToPeer())
+                notify(now, "Nobody else's position is known yet");
             if (hud_.pressed()) showHud_ = !showHud_;
-            if (save_.pressed()) {
-                if (settings_.role != Role::Guest) notify(now, "Only the guest copies the host's save");
-                else if (!session_ || !link_->connected()) notify(now, "Connect to the host first");
-                else if (!session_->requestHostSave()) notify(now, "A save transfer is already running");
+            if (download_.pressed()) {
+                if (!session_ || !link_->connected()) notify(now, "Connect to the server first");
+                else if (!session_->requestCampaignSave()) notify(now, "A download is already running");
+            }
+            if (upload_.pressed()) {
+                if (!session_ || !link_->connected()) notify(now, "Connect to the server first");
+                else session_->uploadSave();
             }
 
             if (online_) {
                 session_->tick(now);
                 trackLinkState(now);
                 std::string text;
-                while (session_->popNotice(text)) notify(now, text);
+                while (session_->popNotice(text)) {
+                    notify(now, text);
+                    logLine("%s", text.c_str());
+                }
             }
             measureWork(workStart, native::g_nativeCalls - nativesBefore);
             if (showHud_) drawHud(now);
             scriptWait(0);
         }
-    }
-
-    void shutdown() {
-        if (online_) disconnect();
     }
 
 private:
@@ -228,21 +266,24 @@ private:
             notify(now, settings_.problem);
             return;
         }
-        LinkConfig config;
-        config.local.role = settings_.role;
-        config.local.name = settings_.name;
-        config.local.avatar = settings_.avatar;
-        config.local.storyMode = settings_.session.storyMode;
-        config.viaRelay = settings_.viaRelay;
-        config.room = settings_.room;
-        config.listen = !settings_.viaRelay && settings_.role == Role::Host;
-        if (!config.listen &&
-            !UdpSocket::resolve(settings_.address, static_cast<uint16_t>(settings_.port), config.remote)) {
-            notify(now, "Cannot resolve address: " + settings_.address);
+        std::string error;
+        if (settings_.hostServer && !g_server.start(settings_, error)) {
+            notify(now, "Cannot start the server: " + error);
             return;
         }
-        std::string error;
-        if (!socket_.open(config.listen ? static_cast<uint16_t>(settings_.port) : 0, &error)) {
+        LinkConfig config;
+        config.local.role = Role::Guest;
+        config.local.name = settings_.name;
+        config.local.avatar = settings_.avatar;
+        config.local.campaign = settings_.campaign;
+        config.local.password = settings_.password;
+        config.local.wantsWorld = settings_.wantsWorld ? 1 : 0;
+        std::string address = settings_.hostServer ? "127.0.0.1" : settings_.serverAddress;
+        if (!UdpSocket::resolve(address, static_cast<uint16_t>(settings_.port), config.remote)) {
+            notify(now, "Cannot resolve server address: " + address);
+            return;
+        }
+        if (!socket_.open(0, &error)) {
             notify(now, error);
             return;
         }
@@ -253,7 +294,7 @@ private:
         online_ = true;
         g_reconnect = true;
         lastState_ = Link::State::Idle;
-        logLine("connecting (%s)", config.listen ? "listening" : config.remote.toString().c_str());
+        logLine("connecting to %s (campaign %s)", config.remote.toString().c_str(), settings_.campaign.c_str());
     }
 
     void disconnect() {
@@ -270,11 +311,11 @@ private:
         Link::State state = link_->state();
         if (state == lastState_) return;
         if (state == Link::State::Connected) {
-            notify(now, link_->peer().name + " joined");
-            logLine("connected to %s", link_->peer().name.c_str());
+            notify(now, "Connected to the server");
+            logLine("connected to the server");
         } else if (lastState_ == Link::State::Connected) {
-            notify(now, "Friend disconnected");
-            logLine("peer lost");
+            notify(now, "Lost the server - reconnecting...");
+            logLine("server lost");
         } else if (state == Link::State::Failed) {
             logLine("link failed: %s", link_->error().c_str());
         }
@@ -315,43 +356,40 @@ private:
             drawText(line, x, y, 0.30f, 200, 200, 200);
         } else if (link_->state() == Link::State::Failed) {
             drawText("Co-op: " + link_->error(), x, y, 0.30f, 255, 110, 90);
-        } else if (link_->state() != Link::State::Connected) {
-            if (settings_.viaRelay) {
-                std::snprintf(line, sizeof(line), "Co-op: %s, room \"%s\"",
-                              link_->relayPeers() == 0 ? "contacting relay" : "waiting for friend", settings_.room.c_str());
-            } else if (settings_.role == Role::Host) {
-                std::snprintf(line, sizeof(line), "Co-op: waiting for friend on UDP port %d", settings_.port);
-            } else {
-                std::snprintf(line, sizeof(line), "Co-op: connecting to %s", settings_.address.c_str());
-            }
+        } else if (!session_->status().denied.empty()) {
+            drawText("Co-op: the server refused: " + session_->status().denied, x, y, 0.30f, 255, 110, 90);
+        } else if (link_->state() != Link::State::Connected || !session_->status().welcomed) {
+            std::snprintf(line, sizeof(line), "Co-op: connecting to %s...",
+                          settings_.hostServer ? "the built-in server" : settings_.serverAddress.c_str());
             drawText(line, x, y, 0.30f, 240, 220, 120);
-            if (!link_->error().empty()) drawText(link_->error(), x, y += 0.026f, 0.28f, 255, 110, 90);
         } else {
             const SessionStatus& st = session_->status();
-            std::snprintf(line, sizeof(line), "Co-op: %s  |  ping %d ms  |  up %.1f / down %.1f KB/s",
-                          link_->peer().name.c_str(), link_->pingMs() < 0 ? 0 : link_->pingMs(),
+            std::snprintf(line, sizeof(line), "Co-op \"%s\": %d player%s  |  world: %s  |  ping %d ms  |  up %.1f / down %.1f KB/s",
+                          settings_.campaign.c_str(), st.players, st.players == 1 ? "" : "s",
+                          st.worldOwner ? "you" : st.ownerName.c_str(), link_->pingMs() < 0 ? 0 : link_->pingMs(),
                           link_->sendRate() / 1024.0f, link_->receiveRate() / 1024.0f);
             drawText(line, x, y, 0.30f, 140, 230, 140);
-            if (st.peerVisible || st.peerDistance > 0) {
-                std::snprintf(line, sizeof(line), "%.0f m away%s%s  |  smoothing %d ms  [%s] teleport", st.peerDistance,
-                              st.peerDead ? "  |  DEAD" : "", st.peerInMission ? "  |  in mission" : "", st.bufferMs,
-                              settings_.teleportKey.c_str());
+            if (st.players > 1 && (st.peerVisible || st.peerDistance > 0)) {
+                std::snprintf(line, sizeof(line), "nearest: %s %.0f m%s%s  |  smoothing %d ms  [%s] teleport",
+                              st.peerName.c_str(), st.peerDistance, st.peerDead ? "  |  DEAD" : "",
+                              st.peerInMission ? "  |  in mission" : "", st.bufferMs, settings_.teleportKey.c_str());
                 drawText(line, x, y += 0.026f, 0.28f, 220, 220, 220);
             }
             if (settings_.session.worldSync) {
                 std::snprintf(line, sizeof(line),
-                              settings_.role == Role::Guest ? "Host world: %d shown  |  mod %.2f ms, %.0f calls/frame"
-                                                            : "World: %d streamed  |  mod %.2f ms, %.0f calls/frame",
+                              st.worldOwner ? "World: %d streamed  |  mod %.2f ms, %.0f calls/frame"
+                                            : "World: %d shown  |  mod %.2f ms, %.0f calls/frame",
                               st.syncedEntities, workUs_ / 1000.0, natives_);
                 drawText(line, x, y += 0.026f, 0.28f, 220, 220, 220);
             }
             const char* storyLine = nullptr;
-            if (st.holding) storyLine = "Waiting for your friend - the world is paused";
-            else if (st.spectating) storyLine = "Watching the host's cutscene";
-            else if (st.peerInCutscene) storyLine = "Your friend is in a cutscene";
+            if (st.holding) storyLine = "Waiting for the others - the world is paused";
+            else if (st.spectating) storyLine = "Watching the world owner's cutscene";
+            else if (st.peerInCutscene) storyLine = "Someone is in a cutscene";
             if (storyLine) drawText(storyLine, x, y += 0.026f, 0.28f, 240, 220, 120);
-            if (st.missionMismatch) drawText("Different missions! Load the same save to play the story together", x,
-                                             y += 0.026f, 0.28f, 255, 110, 90);
+            if (st.missionMismatch)
+                drawText("Different missions! Load the campaign save to play the story together", x, y += 0.026f, 0.28f,
+                         255, 110, 90);
             if (st.saveProgress >= 0) {
                 std::snprintf(line, sizeof(line), "Save transfer: %d%%", st.saveProgress);
                 drawText(line, x, y += 0.026f, 0.28f, 240, 220, 120);
@@ -363,14 +401,14 @@ private:
 
     Settings settings_;
     Rdr2Game game_;
+    Rdr2SaveStore saves_;
     UdpSocket socket_;
     std::unique_ptr<Link> link_;
     std::unique_ptr<CoopSession> session_;
     bool online_ = false;
     bool showHud_ = true;
     Link::State lastState_ = Link::State::Idle;
-    Hotkey toggle_, teleport_, hud_, save_;
-    Rdr2SaveStore saves_;
+    Hotkey toggle_, teleport_, hud_, download_, upload_;
     std::string notice_;
     uint32_t noticeUntil_ = 0;
     double workUs_ = 0, natives_ = 0;
@@ -380,7 +418,6 @@ std::unique_ptr<App> g_app;
 
 // Script Hook calls this on its script thread, again after every save load.
 void scriptMain() {
-    // Entity handles from before a reload are gone; only the network side needs a goodbye.
     g_app = std::make_unique<App>();
     g_app->run();
 }
@@ -392,6 +429,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         g_module = module;
         scriptRegister(module, scriptMain);
     } else if (reason == DLL_PROCESS_DETACH) {
+        g_server.stop();
         scriptUnregister(module);
     }
     return TRUE;

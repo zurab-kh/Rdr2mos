@@ -6,19 +6,15 @@
 namespace coop {
 
 struct SessionConfig {
-    bool worldSync = true;       // stream the host's world to the guest
+    bool worldSync = true;       // the world owner streams its world to everyone else
     bool friendlyFire = false;   // let players hurt each other
     bool syncClock = true;
     bool syncWeather = true;
     bool softCorrection = true;  // nudge remote characters onto their path instead of only re-tasking
-    StoryMode storyMode = StoryMode::Shared;
-    bool cutsceneBarrier = true;    // shared: whoever finishes a scene first waits for the other
-    uint32_t barrierTimeoutMs = 120000;
-    bool sharedFail = true;         // shared: if one player dies in a mission, it restarts for both
-    bool spectate = true;           // host world: the guest watches the host's scenes through the host's camera
+    bool spectate = true;        // host world: watch the owner's scenes through the owner's camera
     bool syncWaypoints = true;
-    bool autoRegroup = true;     // guest: jump to the host when a mission starts or a cutscene ends far away
-    float regroupDistance = 150.0f;
+    bool autoRegroup = true;     // follow the server's "move to the mission start" requests
+    bool autoUploadSaves = true; // world owner: put every new save on the server
     float npcRadius = 150.0f;
     int maxPeds = 64;
     int maxVehicles = 16;

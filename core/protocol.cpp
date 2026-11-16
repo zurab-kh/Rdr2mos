@@ -49,17 +49,20 @@ void write(ByteWriter& w, const HelloInfo& v) {
     w.u32(v.nonce);
     w.str(v.name);
     w.str(v.avatar);
-    w.u8(static_cast<uint8_t>(v.storyMode));
+    w.str(v.campaign);
+    w.str(v.password);
+    w.u8(v.wantsWorld);
 }
 bool read(ByteReader& r, HelloInfo& v) {
     uint8_t role = r.u8();
     v.nonce = r.u32();
     v.name = r.str();
     v.avatar = r.str();
-    uint8_t mode = r.u8();
-    if (!r.ok() || role > 1 || mode > 1) return false;
+    v.campaign = r.str();
+    v.password = r.str();
+    v.wantsWorld = r.u8();
+    if (!r.ok() || role > 1) return false;
     v.role = static_cast<Role>(role);
-    v.storyMode = static_cast<StoryMode>(mode);
     return true;
 }
 
@@ -371,6 +374,78 @@ uint32_t crc32(const uint8_t* data, size_t size, uint32_t crc) {
 void write(ByteWriter& w, const Appearance& v) { w.u32(v.outfit); }
 bool read(ByteReader& r, Appearance& v) {
     v.outfit = r.u32();
+    return r.ok();
+}
+
+std::vector<uint8_t> withSource(uint8_t player, const std::vector<uint8_t>& payload) {
+    std::vector<uint8_t> out;
+    out.reserve(payload.size() + 1);
+    out.push_back(player);
+    out.insert(out.end(), payload.begin(), payload.end());
+    return out;
+}
+
+void write(ByteWriter& w, const Welcome& v) {
+    w.u8(v.playerId);
+    w.u8(static_cast<uint8_t>(v.storyMode));
+    w.u8(v.hasCampaignSave);
+    w.str(v.campaign);
+}
+bool read(ByteReader& r, Welcome& v) {
+    v.playerId = r.u8();
+    uint8_t mode = r.u8();
+    v.hasCampaignSave = r.u8();
+    v.campaign = r.str();
+    if (!r.ok() || mode > 1 || v.playerId == 0 || v.playerId > kMaxPlayers) return false;
+    v.storyMode = static_cast<StoryMode>(mode);
+    return true;
+}
+
+void write(ByteWriter& w, const Roster& v) {
+    w.u8(v.worldOwner);
+    w.u16(v.worldEpoch);
+    w.u8(static_cast<uint8_t>(std::min<size_t>(v.players.size(), kMaxPlayers)));
+    for (size_t i = 0; i < v.players.size() && i < kMaxPlayers; ++i) {
+        w.u8(v.players[i].id);
+        w.str(v.players[i].name);
+        w.str(v.players[i].avatar);
+    }
+}
+bool read(ByteReader& r, Roster& v) {
+    v.worldOwner = r.u8();
+    v.worldEpoch = r.u16();
+    size_t n = r.u8();
+    if (!r.ok() || n > kMaxPlayers) return false;
+    v.players.resize(n);
+    for (auto& p : v.players) {
+        p.id = r.u8();
+        p.name = r.str();
+        p.avatar = r.str();
+        if (p.id == 0 || p.id > kMaxPlayers) return false;
+    }
+    return r.ok();
+}
+
+void write(ByteWriter& w, const StoryCommandMsg& v) {
+    w.u8(static_cast<uint8_t>(v.cmd));
+    w.u8(v.flag);
+    w.vec3(v.pos);
+    w.f32(v.distance);
+    w.str(v.text);
+}
+bool read(ByteReader& r, StoryCommandMsg& v) {
+    uint8_t c = r.u8();
+    v.cmd = static_cast<StoryCmd>(c);
+    v.flag = r.u8();
+    v.pos = r.vec3();
+    v.distance = r.f32();
+    v.text = r.str();
+    return r.ok() && c >= 1 && c <= 6 && std::isfinite(v.pos.x) && std::isfinite(v.pos.y) && std::isfinite(v.pos.z);
+}
+
+void write(ByteWriter& w, const Denied& v) { w.str(v.reason); }
+bool read(ByteReader& r, Denied& v) {
+    v.reason = r.str();
     return r.ok();
 }
 

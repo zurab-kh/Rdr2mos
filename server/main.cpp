@@ -1,26 +1,59 @@
-// RDR2 Co-op relay server.
+// RDR2 Co-op dedicated server.
 //
-// Run it on any machine both players can reach (a cheap VPS is enough):
-//     rdr2coop-relay [port]
-// Then both players set  connection = relay  and the same  room  in RDR2Coop.ini.
-// The relay only forwards packets between the two members of a room; it keeps no game state.
+//     rdr2coop-server [--port 27960] [--data ./rdr2coop-data] [--mode shared|host]
+//                     [--password SECRET] [--max-players 8] [--barrier-timeout 120]
+//                     [--no-barrier] [--no-shared-fail] [--memory]
+//
+// Players set  server = <this machine>:<port>  and a campaign name in RDR2Coop.ini.
+// Campaign saves, the journal and the players are kept under the data folder.
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <memory>
 #include <string>
+#include <vector>
 
-#include "protocol.h"
-#include "relay.h"
+#include "server.h"
+
+static void usage(const char* exe) {
+    std::fprintf(stderr,
+                 "usage: %s [--port N] [--data DIR] [--mode shared|host] [--password P] [--max-players N]\n"
+                 "          [--barrier-timeout SECONDS] [--no-barrier] [--no-shared-fail] [--memory]\n",
+                 exe);
+}
 
 int main(int argc, char** argv) {
     int port = coop::kDefaultPort;
-    if (argc > 1) {
-        port = std::atoi(argv[1]);
-        if (port <= 0 || port > 65535) {
-            std::fprintf(stderr, "usage: %s [port]   (default %d)\n", argv[0], coop::kDefaultPort);
-            return 2;
-        }
+    std::string data = "rdr2coop-data";
+    bool memory = false;
+    coop::ServerConfig config;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        auto next = [&]() -> const char* {
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                std::exit(2);
+            }
+            return argv[++i];
+        };
+        if (a == "--port") port = std::atoi(next());
+        else if (a == "--data") data = next();
+        else if (a == "--mode") {
+            std::string m = next();
+            if (m == "shared") config.storyMode = coop::StoryMode::Shared;
+            else if (m == "host") config.storyMode = coop::StoryMode::HostWorld;
+            else return usage(argv[0]), 2;
+        } else if (a == "--password") config.password = next();
+        else if (a == "--max-players") config.maxPlayers = std::atoi(next());
+        else if (a == "--barrier-timeout") config.barrierTimeoutMs = static_cast<uint32_t>(std::atoi(next())) * 1000u;
+        else if (a == "--no-barrier") config.cutsceneBarrier = false;
+        else if (a == "--no-shared-fail") config.sharedFail = false;
+        else if (a == "--memory") memory = true;
+        else if (std::isdigit(static_cast<unsigned char>(a[0]))) port = std::atoi(a.c_str());  // "rdr2coop-server 27960" also works
+        else return usage(argv[0]), 2;
     }
+    if (port <= 0 || port > 65535 || config.maxPlayers < 1) return usage(argv[0]), 2;
 
     coop::UdpSocket socket;
     std::string error;
@@ -28,21 +61,28 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "error: %s\n", error.c_str());
         return 1;
     }
-    std::printf("RDR2 Co-op relay listening on UDP port %d (protocol v%d)\n", port, coop::kProtocolVersion);
+    std::unique_ptr<coop::IServerStorage> storage;
+    if (memory) storage = std::make_unique<coop::MemoryStorage>();
+    else storage = std::make_unique<coop::FileStorage>(data);
+
+    coop::Server server(socket, config, *storage);
+    std::printf("RDR2 Co-op server on UDP port %d (protocol v%d), story mode %s, %s\n", port, coop::kProtocolVersion,
+                config.storyMode == coop::StoryMode::Shared ? "shared" : "host world",
+                memory ? "nothing stored" : ("data in " + data).c_str());
     std::fflush(stdout);
 
-    coop::Relay relay(socket);
     auto start = std::chrono::steady_clock::now();
-    size_t lastRooms = 0, lastClients = 0;
+    std::vector<std::string> last;
     for (;;) {
-        socket.waitReadable(250);
+        socket.waitReadable(5);
         auto elapsed = std::chrono::steady_clock::now() - start;
-        relay.pump(static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()));
-        if (relay.roomCount() != lastRooms || relay.clientCount() != lastClients) {
-            lastRooms = relay.roomCount();
-            lastClients = relay.clientCount();
-            std::printf("rooms: %zu, players: %zu\n", lastRooms, lastClients);
+        server.pump(static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()));
+        std::vector<std::string> now = server.describe();
+        if (now != last) {
+            if (now.empty()) std::printf("no players\n");
+            for (const auto& line : now) std::printf("%s\n", line.c_str());
             std::fflush(stdout);
+            last = now;
         }
     }
 }

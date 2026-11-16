@@ -41,7 +41,7 @@ public:
     bool sendTo(const Endpoint& to, const uint8_t* data, size_t size) override;
     int recvFrom(Endpoint& from, uint8_t* buffer, size_t capacity) override;
 
-    // Blocks up to timeoutMs until a datagram is readable. Used by the relay server.
+    // Blocks up to timeoutMs until a datagram is readable. Used by the server.
     bool waitReadable(int timeoutMs);
 
     // Resolves "host" or "host:port" (IPv4). defaultPort is used when no port is given.

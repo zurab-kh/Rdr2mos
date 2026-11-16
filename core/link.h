@@ -1,5 +1,5 @@
-// Two-player connection over UDP: handshake, reconnect, a reliable ordered channel for events
-// and an unreliable channel for state, plus optional rendezvous through the relay server.
+// Connection between a player and the server over UDP: handshake, reconnect, a reliable ordered
+// channel for events and an unreliable channel for state.
 #pragma once
 #include <cstdint>
 #include <deque>
@@ -11,10 +11,8 @@
 namespace coop {
 
 struct LinkConfig {
-    bool listen = false;     // direct mode, waiting for the friend to connect to our port
-    bool viaRelay = false;   // `remote` is a relay server; peers meet in `room`
-    Endpoint remote;         // friend (direct join) or relay address; unused when listening
-    std::string room;
+    bool listen = false;     // server side: wait for a player to connect
+    Endpoint remote;         // server address (player side); unused when listening
     HelloInfo local;         // nonce is filled in by the link
 };
 
@@ -45,8 +43,6 @@ public:
     int pingMs() const { return pingMs_; }
     // Bumped every time a (new) session with the peer is established.
     uint32_t epoch() const { return epoch_; }
-    // Relay mode: players currently in the room (0 = relay not answering yet).
-    int relayPeers() const { return relayPeers_; }
     // Traffic over the last second, in bytes per second (UDP payload, without IP/UDP headers).
     uint32_t sendRate() const { return sendRate_; }
     // Reliable messages queued and not yet acknowledged (bulk transfers throttle on this).
@@ -69,7 +65,6 @@ private:
     void handleHello(const Endpoint& from, ByteReader& r, uint32_t nowMs);
     void handleData(ByteReader& r, uint32_t nowMs);
     void sendHello(const Endpoint& to, uint32_t nowMs);
-    void sendRegister(uint32_t nowMs);
     void beginConnecting(uint32_t nowMs);
     void resetSession();
     void fail(const std::string& why);
@@ -85,17 +80,14 @@ private:
     Endpoint remote_;
     uint32_t epoch_ = 0;
     int pingMs_ = -1;
-    int relayPeers_ = 0;
     uint32_t bytesOut_ = 0, bytesIn_ = 0, sendRate_ = 0, receiveRate_ = 0, rateStartMs_ = 0;
     ByteWriter packet_;  // reused for every outgoing data packet
 
     uint32_t lastReceiveMs_ = 0;
     uint32_t lastSendMs_ = 0;
     uint32_t lastHelloMs_ = 0;
-    uint32_t lastRegisterMs_ = 0;
     uint32_t lastPingMs_ = 0;
     bool helloSent_ = false;
-    bool registerSent_ = false;
     bool ackDirty_ = false;
 
     std::vector<Record> outUnreliable_;
