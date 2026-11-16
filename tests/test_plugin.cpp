@@ -26,6 +26,13 @@ struct Spec {
     bool dead;  // the game ignores the call
 };
 const Spec kNativeDb[] = {
+    {0x10C70A515BC03707, "PED::GET_NUM_META_PED_OUTFITS", 1, false},
+    {0x66B957AAC2EAAEAB, "PED::_UPDATE_SHOP_ITEM_WEARABLE_STATE", 6, false},
+    {0x77BA37622E22023B, "PED::_GET_SHOP_ITEM_COMPONENT_AT_INDEX", 5, false},
+    {0x77FF8D35EEC6BBC4, "PED::_EQUIP_META_PED_OUTFIT_PRESET", 3, false},
+    {0x90403E8107B60E81, "PED::_GET_NUM_COMPONENTS_IN_PED", 1, false},
+    {0xD3A7B003ED343FD9, "PED::_APPLY_SHOP_ITEM_TO_PED", 5, false},
+    {0xED40380076A31506, "PLAYER::SET_PLAYER_MODEL", 3, false},
     {0x0252D2B5582957A6, "CAMERA::GET_GAMEPLAY_CAM_ROT", 1, false},
     {0x028F76B6E78246EB, "PED::SET_PED_ONTO_MOUNT", 4, false},
     {0x04AF77971E508F6A, "CAMERA::GET_FINAL_RENDERED_CAM_FOV", 0, false},
@@ -179,6 +186,8 @@ struct Ent {
     int harness[6] = {};
     int seats[10] = {};  // seat -1..8
     int tasks = 0, coordReads = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> items;  // shop items worn: component, wearable state
+    int preset = -1;
 };
 
 struct World;
@@ -443,6 +452,40 @@ World::World() {
     H["PED::GET_PED_CROUCH_MOVEMENT"] = [](World& w) { w.retI(w.e0() && w.e0()->crouch); };
     H["PED::GET_CURRENT_TARGET_FOR_PED"] = [](World& w) { if (Ent* e = w.e0()) w.retI(e->target); };
     H["PED::_GET_PED_META_OUTFIT_HASH"] = [](World& w) { if (Ent* e = w.e0()) w.retI(static_cast<int32_t>(e->outfit)); };
+    H["PLAYER::SET_PLAYER_MODEL"] = [](World& w) {
+        // A new ped of that model for the player; the old one is gone.
+        Vec3 pos = w.get(w.playerPed) ? w.ents[w.playerPed].pos : Vec3{};
+        w.erase(w.playerPed);
+        w.playerPed = w.addPed(w.u(1), pos);
+    };
+    H["PED::GET_NUM_META_PED_OUTFITS"] = [](World& w) { w.retI(w.e0() ? 3 : 0); };
+    H["PED::_EQUIP_META_PED_OUTFIT_PRESET"] = [](World& w) {
+        if (Ent* e = w.e0()) {
+            e->preset = w.i(1);
+            e->items.clear();
+            e->outfit = 0xABC0u + static_cast<uint32_t>(w.i(1));
+        }
+    };
+    H["PED::_GET_NUM_COMPONENTS_IN_PED"] = [](World& w) { if (Ent* e = w.e0()) w.retI(static_cast<int>(e->items.size())); };
+    H["PED::_GET_SHOP_ITEM_COMPONENT_AT_INDEX"] = [](World& w) {
+        Ent* e = w.e0();
+        size_t k = static_cast<size_t>(w.i(1));
+        if (!e || k >= e->items.size()) return;
+        *w.p<uint64_t>(4) = e->items[k].second;
+        w.retI(static_cast<int32_t>(e->items[k].first));
+    };
+    H["PED::_APPLY_SHOP_ITEM_TO_PED"] = [](World& w) {
+        Ent* e = w.e0();
+        if (!e) return;
+        for (auto& item : e->items)
+            if (item.first == w.u(1)) return;
+        e->items.push_back({w.u(1), 0});
+    };
+    H["PED::_UPDATE_SHOP_ITEM_WEARABLE_STATE"] = [](World& w) {
+        if (Ent* e = w.e0())
+            for (auto& item : e->items)
+                if (item.first == w.u(1)) item.second = w.u(2);
+    };
     H["PED::GET_PED_RELATIONSHIP_GROUP_HASH"] = [](World& w) { w.retI(static_cast<int32_t>(joaat("PLAYER"))); };
     H["WEAPON::_GET_PED_CURRENT_HELD_WEAPON"] = [](World& w) { if (Ent* e = w.e0()) w.retI(static_cast<int32_t>(e->weapon)); };
     H["STREAMING::IS_MODEL_VALID"] = [](World& w) { w.retI(w.u(0) != 0); };
@@ -823,6 +866,24 @@ COOP_TEST(testPluginEveryNativeMatchesTheDatabase, "plugin: every native call ma
     g.showFriendWaypoint(false, {});
     std::vector<NearbyEntity> nearby;
     g.listNearby({}, {}, 100, nearby);
+    // Characters: dressing another ped like the player, the wardrobe, becoming someone else.
+    w.ents[w.playerPed].items = {{0x111, 0}, {0x222, 0x99}};
+    Appearance look;
+    CHECK(g.readAppearance(g.localPlayerPed(), look));
+    CHECK(look.items.size() == 2 && look.items[1].wearable == 0x99);
+    look.preset = 1;
+    g.applyAppearance(passenger, look);
+    CHECK(w.ents[passenger].preset == 1 && w.ents[passenger].items.size() == 2 && w.ents[passenger].items[1].second == 0x99);
+    CHECK(g.outfitPresets(g.localPlayerPed()) == 3);
+    g.setOutfitPreset(g.localPlayerPed(), 2);
+    CHECK(w.ents[w.playerPed].preset == 2);
+    CHECK(g.modelExists(joaat("cs_charlessmith")));
+    uint32_t before = g.localModel();
+    CHECK(g.setLocalModel(joaat("cs_charlessmith")));
+    CHECK(g.localModel() == joaat("cs_charlessmith") && g.localPlayerPed() == w.playerPed);
+    s.step();
+    CHECK(g.setLocalModel(before));
+    s.step();
     const Vec3 viewers[3] = {{}, {50, 0, 0}, {0, 50, 0}};
     g.listNearbyAny(viewers, 3, 100, nearby);
     EntityHandle ridden = g.spawn(EntityKind::Ped, kHorse, {4, 4, 0}, 0, SpawnRole::Mirror);
@@ -951,6 +1012,12 @@ COOP_TEST(testPluginSettings, "plugin: settings - bad values, keys, names") {
     CHECK(ok.problem.empty() && ok.warnings.empty());
     CHECK(ok.port == 27960 && ok.name == "Arthur" && ok.avatar == "player_three" && ok.toggleKey.vk == 0x76);
     CHECK(ok.uploadKey.vk == 0x7A && ok.uploadKey.name == "F11");
+    CHECK(ok.characterKey.vk == 0x75 && ok.outfitKey.vk == 0x74);  // F6, F5
+    CHECK(ok.session.becomeCharacter);                               // on unless the ini says no
+    settings::Settings off = load("[network]\nserver = x\n[player]\nbecome_character = 0\navatar = CS_CharlesSmith\n");
+    CHECK(!off.session.becomeCharacter && off.avatar == "CS_CharlesSmith");
+    settings::Settings clash = load("[network]\nserver = x\n[keys]\noutfit = F7\n");
+    CHECK(clash.outfitKey.vk == 0 && !clash.warnings.empty());      // the toggle key keeps F7
 
     CHECK(!load("[network]\nserver = x\nport = 27960x\n").problem.empty());
     CHECK(!load("[network]\nserver = x\nport = 70000\n").problem.empty());

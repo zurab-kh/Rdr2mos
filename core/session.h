@@ -23,6 +23,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include "character.h"
 #include "game_api.h"
 #include "interp.h"
 #include "link.h"
@@ -55,6 +56,13 @@ struct SessionStatus {
     bool spectating = false;
     bool missionMismatch = false;
     int saveProgress = -1;
+    // characters
+    std::string character;       // ours, as the server has it (a model name)
+    bool playingHero = false;    // we are the story hero for a mission or scene, not our character
+    struct Taken {
+        std::string avatar, by;
+    };
+    std::vector<Taken> characters;  // every player's character, ours included
 };
 
 class CoopSession {
@@ -75,6 +83,10 @@ public:
     // Puts the latest local save on the server as the campaign save.
     bool uploadSave() { return story_.uploadLatestSave(); }
     void setSaveStore(ISaveStore* store) { story_.setSaveStore(store); }
+    // Asks the server for another character (a model name from characterCatalog()).
+    bool chooseCharacter(const std::string& avatar) { return character_.choose(avatar); }
+    // The wardrobe: next (+1) or previous (-1) outfit of the character we are right now.
+    void cycleOutfit(int step) { character_.cycleOutfit(step); }
 
 private:
     struct Mover {
@@ -105,7 +117,8 @@ private:
         MotionBuffer motion{40, 300};
         PlayerState state;
         bool haveState = false;
-        uint32_t outfit = 0, outfitApplied = 0;
+        Appearance look;                 // how the player dresses their character
+        bool haveLook = false, lookApplied = false;
     };
 
     // World owner: an entity of the local world that is being streamed.
@@ -152,7 +165,7 @@ private:
     void onRoster(const Roster& roster);
     void onSnapshot(const EntitySnapshot& snap, uint32_t nowMs);
     void sendLocalState(uint32_t nowMs);
-    void sendAppearance(uint32_t nowMs);
+    bool storyHeroNeeded() const;
     void sendWorld(uint32_t nowMs);
     void streamEntity(Streamed& s, uint32_t nowMs);
     void updatePuppets(uint32_t nowMs, float dt);
@@ -225,11 +238,10 @@ private:
     uint16_t lastSentFlags_ = 0;
     bool lastSentMoving_ = false;
     uint32_t lastMovingMs_ = 0;
-    uint32_t lastOutfitCheckMs_ = 0, sentOutfit_ = 0;
-    bool appearanceSent_ = false;
     uint32_t lastWorldMs_ = 0, lastInfoMs_ = 0, lastForeignMs_ = 0;
     std::vector<std::string> notices_;
     StorySync story_;
+    CharacterSync character_;
     // Damage not yet sent, per victim (an entity id of the current world, or a player ref).
     struct PendingDamage {
         uint32_t amount = 0;

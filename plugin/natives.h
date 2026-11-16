@@ -50,6 +50,8 @@ inline bool test(uint64_t hash, Args... args) { return invoke<int>(hash, args...
 // --- PLAYER
 inline int PLAYER_ID() { return invoke<int>(0x217E9DC48139933D); }
 inline Ped PLAYER_PED_ID() { return invoke<Ped>(0x096275889B8E0EE0); }
+// Gives the player a new ped of that model (the old one is gone afterwards).
+inline void SET_PLAYER_MODEL(int player, Hash model) { call(0xED40380076A31506, player, model, 0); }
 inline bool IS_PLAYER_FREE_AIMING(int player) { return test(0x936F967D4BE1CE9D, player); }
 // Aiming with lock-on (the default with a controller) is not free aiming.
 inline bool IS_PLAYER_TARGETTING_ANYTHING(int player) { return test(0x4605C66E0F935F83, player); }
@@ -109,6 +111,23 @@ inline int GET_VEHICLE_DRAFT_HORSE_IS_ATTACHED_TO(Ped horse) { return invoke<int
 inline void SET_RANDOM_OUTFIT_VARIATION(Ped ped) { call(0x283978A15512B2FE, ped, 1); }
 inline Hash GET_PED_META_OUTFIT_HASH(Ped ped) { return invoke<Hash>(0x30569F348D126A5A, ped); }
 inline void EQUIP_META_PED_OUTFIT(Ped ped, Hash outfit) { call(0x1902C4CFCC5BE57C, ped, outfit); }
+// Outfit presets of the ped's model: how many, and wearing one (`p2` false: keep accessories as they are).
+inline int GET_NUM_META_PED_OUTFITS(Ped ped) { return invoke<int>(0x10C70A515BC03707, ped); }
+inline void EQUIP_META_PED_OUTFIT_PRESET(Ped ped, int preset) { call(0x77FF8D35EEC6BBC4, ped, preset, 0); }
+// The shop items a ped wears (what the stores sell), one by one, and how each is worn.
+inline int GET_NUM_COMPONENTS_IN_PED(Ped ped) { return invoke<int>(0x90403E8107B60E81, ped); }
+inline Hash GET_SHOP_ITEM_COMPONENT_AT_INDEX(Ped ped, int index, Hash* wearableState) {
+    // Script variables are 8-byte slots: the outputs get slots of their own, read afterwards.
+    uint64_t status = 0, wearable = 0;
+    Hash item = invoke<Hash>(0x77BA37622E22023B, ped, index, 1, &status, &wearable);
+    *wearableState = static_cast<Hash>(wearable);
+    return item;
+}
+inline void APPLY_SHOP_ITEM_TO_PED(Ped ped, Hash item) { call(0xD3A7B003ED343FD9, ped, item, 1, 0, 0); }
+inline void UPDATE_SHOP_ITEM_WEARABLE_STATE(Ped ped, Hash item, Hash wearableState) {
+    call(0x66B957AAC2EAAEAB, ped, item, wearableState, 0, 0, 1);
+}
+// Builds the ped's look from the components it was given (after any of the calls above).
 inline void UPDATE_PED_VARIATION(Ped ped) { call(0xCC8CA3E88256E58F, ped, 0, 1, 1, 1, 0); }
 inline bool IS_PED_A_PLAYER(Ped ped) { return test(0x12534C348C6CB68B, ped); }
 inline bool IS_PED_HUMAN(Ped ped) { return test(0xB980061DA992779D, ped); }

@@ -13,6 +13,7 @@
 #include <string>
 #include <thread>
 
+#include "character_menu.h"
 #include "connection.h"
 #include "hud.h"
 #include "link.h"
@@ -176,6 +177,12 @@ public:
         hud_ = Hotkey(settings_.hudKey.vk);
         download_ = Hotkey(settings_.downloadKey.vk);
         upload_ = Hotkey(settings_.uploadKey.vk);
+        character_ = Hotkey(settings_.characterKey.vk);
+        outfit_ = Hotkey(settings_.outfitKey.vk);
+        menuUp_ = Hotkey(VK_UP);
+        menuDown_ = Hotkey(VK_DOWN);
+        menuPick_ = Hotkey(VK_RETURN);
+        menuBack_ = Hotkey(VK_BACK);
         showHud_ = settings_.showHud;
         logLine("RDR2 Co-op started: server=%s campaign=%s%s%s",
                 settings_.hostServer ? "built-in" : settings_.serverAddress.c_str(), settings_.campaign.c_str(),
@@ -206,6 +213,7 @@ public:
             }
             measureWork(workStart, native::g_nativeCalls - nativesBefore);
             if (showHud_) drawHud(now);
+            drawMenu();
             scriptWait(0);
         }
     }
@@ -239,6 +247,7 @@ private:
             if (!session_ || !link().connected()) notify(now, "Connect to the server first");
             else session_->uploadSave();
         }
+        characterKeys(now);
 
         if (online_) {
             session_->tick(now);
@@ -252,6 +261,47 @@ private:
     }
 
     Link& link() { return g_connection.link(); }
+
+    // The character menu and the wardrobe.
+    void characterKeys(uint32_t now) {
+        bool welcomed = session_ && link().connected() && session_->status().welcomed;
+        if (character_.pressed()) {
+            if (menu_.isOpen()) {
+                menu_.close();
+            } else if (!welcomed) {
+                notify(now, "Connect to the server first");
+            } else {
+                menu_.open(session_->status(), [this](const std::string& model) {
+                    return game_.modelExists(joaat(model.c_str()));
+                });
+            }
+        }
+        if (menu_.isOpen()) {
+            if (!welcomed) menu_.close();
+            if (menuUp_.pressed()) menu_.move(-1);
+            if (menuDown_.pressed()) menu_.move(+1);
+            if (menuBack_.pressed()) menu_.close();
+            if (menuPick_.pressed()) {
+                std::string why;
+                std::string avatar = menu_.pick(why);
+                if (avatar.empty()) {
+                    notify(now, why);
+                } else if (session_->chooseCharacter(avatar)) {
+                    notify(now, "Asking the server for " + characterName(avatar) + "...");
+                    menu_.close();
+                }
+            }
+        }
+        if (outfit_.pressed()) {
+            if (!welcomed) notify(now, "Connect to the server first");
+            else session_->cycleOutfit(+1);
+        }
+        // The character the server gave us is the one to ask for when we connect again.
+        if (welcomed && !session_->status().character.empty() && session_->status().character != settings_.avatar) {
+            settings_.avatar = session_->status().character;
+            logLine("character: %s", settings_.avatar.c_str());
+        }
+    }
 
     void connect(uint32_t now) {
         // Offline here, so no link uses the socket: a connection that does not happen closes it
@@ -390,6 +440,12 @@ private:
                               st.syncedEntities, workUs_ / 1000.0, natives_);
                 hud::drawText(line, x, y += 0.026f, 0.28f, 220, 220, 220);
             }
+            if (!st.character.empty()) {
+                std::snprintf(line, sizeof(line), "You: %s%s  [%s] character  [%s] outfit", characterName(st.character).c_str(),
+                              st.playingHero ? " (the story hero for now)" : "", settings_.characterKey.name.c_str(),
+                              settings_.outfitKey.name.c_str());
+                hud::drawText(line, x, y += 0.026f, 0.28f, 220, 220, 220);
+            }
             const char* storyLine = nullptr;
             if (st.holding) storyLine = "Waiting for the others - the world is paused";
             else if (st.spectating) storyLine = "Watching the world owner's cutscene";
@@ -407,6 +463,18 @@ private:
             hud::drawText(notice_, x, y + 0.03f, 0.32f, 255, 255, 255);
     }
 
+    void drawMenu() {
+        if (!menu_.isOpen()) return;
+        float y = 0.30f;
+        hud::drawText("Choose your character   (up / down, Enter, " + settings_.characterKey.name + " closes)", 0.35f, y,
+                      0.32f, 240, 220, 120);
+        std::vector<std::string> rows = menu_.lines(14);
+        for (const std::string& row : rows) {
+            bool current = row.rfind("> ", 0) == 0;
+            hud::drawText(row, 0.35f, y += 0.03f, 0.30f, current ? 255 : 210, current ? 255 : 210, current ? 140 : 210);
+        }
+    }
+
     settings::Settings settings_;
     Rdr2Game game_;
     Rdr2SaveStore saves_;
@@ -415,7 +483,9 @@ private:
     bool showHud_ = true;
     bool wantAutoConnect_ = false;
     Link::State lastState_ = Link::State::Idle;
-    Hotkey toggle_, teleport_, hud_, download_, upload_;
+    Hotkey toggle_, teleport_, hud_, download_, upload_, character_, outfit_;
+    Hotkey menuUp_, menuDown_, menuPick_, menuBack_;
+    CharacterMenu menu_;
     std::string notice_;
     uint32_t noticeUntil_ = 0;
     double workUs_ = 0, natives_ = 0;

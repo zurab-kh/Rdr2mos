@@ -82,6 +82,7 @@ struct Settings {
     coop::SessionConfig session;
     coop::ServerConfig server;  // used by the built-in server
     Key toggleKey{"F7", 0}, teleportKey{"F8", 0}, hudKey{"F9", 0}, downloadKey{"F10", 0}, uploadKey{"F11", 0};
+    Key characterKey{"F6", 0}, outfitKey{"F5", 0};
     std::string problem;                // configuration error: shown on screen, connecting is refused
     std::vector<std::string> warnings;  // fixed up with a default: shown once
 
@@ -127,6 +128,8 @@ struct Settings {
             avatar = defaultAvatar;
         }
 
+        session.becomeCharacter = ini.getBool("player", "become_character", true);
+
         session.worldSync = ini.getBool("sync", "world_sync", true);
         session.friendlyFire = ini.getBool("sync", "friendly_fire", false);
         session.syncClock = ini.getBool("sync", "sync_clock", true);
@@ -152,10 +155,12 @@ struct Settings {
         server.sharedFail = ini.getBool("server", "shared_fail", true);
         server.regroupDistance = number(ini, "server", "regroup_distance", 150.0f, 20.0f, 5000.0f);
 
-        Key* keys[] = {&toggleKey, &teleportKey, &hudKey, &downloadKey, &uploadKey};
-        const char* entries[] = {"toggle", "teleport_to_friend", "hud", "download_campaign_save", "upload_save"};
-        const char* defaults[] = {"F7", "F8", "F9", "F10", "F11"};
-        for (int k = 0; k < 5; ++k) {
+        Key* keys[] = {&toggleKey, &teleportKey, &hudKey, &downloadKey, &uploadKey, &characterKey, &outfitKey};
+        const char* entries[] = {"toggle", "teleport_to_friend", "hud", "download_campaign_save", "upload_save",
+                                 "character", "outfit"};
+        const char* defaults[] = {"F7", "F8", "F9", "F10", "F11", "F6", "F5"};
+        constexpr int kKeys = static_cast<int>(sizeof(keys) / sizeof(keys[0]));
+        for (int k = 0; k < kKeys; ++k) {
             Key& key = *keys[k];
             key.name = trimmed(ini.get("keys", entries[k], defaults[k]));
             key.vk = parseKey(key.name);

@@ -278,7 +278,13 @@ COOP_TEST(testNetDecoderFuzz, "net: decoders survive random and mutated input") 
     h.cookie = 5;
     fuzzDecoder(rng, std::vector<HelloInfo>{h}, kRounds);
     fuzzDecoder(rng, std::vector<Damage>{{5, 10}}, kRounds);
-    fuzzDecoder(rng, std::vector<Appearance>{{77}}, kRounds);
+    Appearance look;
+    look.outfit = 77;
+    look.model = 1234;
+    look.preset = 2;
+    look.items = {{11, 0}, {12, 5}, {13, 0}};
+    fuzzDecoder(rng, std::vector<Appearance>{look, Appearance{}}, kRounds);
+    fuzzDecoder(rng, std::vector<CharacterRequest>{{"cs_charlessmith"}}, kRounds);
     fuzzDecoder(rng, std::vector<StoryInfo>{{StoryEvent::Died, 3}}, kRounds);
     CameraState cam;
     cam.pos = {1, 2, 3};

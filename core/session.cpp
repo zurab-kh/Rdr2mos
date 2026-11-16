@@ -18,7 +18,6 @@ constexpr uint32_t kMirrorTimeoutMs = 3000;
 constexpr uint32_t kForeignScanMs = 500;
 constexpr uint32_t kRespawnGraceMs = 1500;
 constexpr uint32_t kOwnRideKeepMs = 30000;
-constexpr uint32_t kOutfitCheckMs = 2000;
 constexpr int kSpawnsPerFrame = 3;
 constexpr float kStreamHysteresis = 20.0f;       // entities leave the stream this much further out than they enter
 constexpr size_t kPoolSize = 24;
@@ -62,7 +61,11 @@ uint32_t updateInterval(float viewerDistance, const EntityState& st) {
 }  // namespace
 
 CoopSession::CoopSession(IGame& game, Link& link, const SessionConfig& config)
-    : game_(game), link_(link), config_(config), story_(game, link, config_, [this](const std::string& t) { notice(t); }) {
+    : game_(game),
+      link_(link),
+      config_(config),
+      story_(game, link, config_, [this](const std::string& t) { notice(t); }),
+      character_(game, link, config_, [this](const std::string& t) { notice(t); }) {
     nearby_.reserve(512);
     outgoing_.reserve(128);
 }
@@ -98,7 +101,8 @@ void CoopSession::tick(uint32_t nowMs) {
         ++frame_;
         localPed_ = game_.localPlayerPed();
         sendLocalState(nowMs);
-        sendAppearance(nowMs);
+        character_.tick(nowMs, local_.state, storyHeroNeeded());
+        status_.playingHero = character_.playingHero();
         if (isOwner()) sendWorld(nowMs);
         updatePuppets(nowMs, dt);
         peers_.clear();
@@ -160,6 +164,8 @@ void CoopSession::restoreWorld() {
 }
 
 void CoopSession::cleanup() {
+    character_.restoreHero();  // the story goes on as the story hero
+    character_.reset();
     for (auto& [id, p] : puppets_) destroyPuppet(p);
     puppets_.clear();
     resetWorld();
@@ -173,8 +179,6 @@ void CoopSession::cleanup() {
     lastSentMoving_ = false;
     lastMovingMs_ = 0;
     ownVehicle_ = localPed_ = 0;
-    lastOutfitCheckMs_ = sentOutfit_ = 0;
-    appearanceSent_ = false;
     story_.reset();
     std::string denied = status_.denied;
     status_ = SessionStatus{};
@@ -396,7 +400,7 @@ void CoopSession::destroyPuppet(Puppet& p, bool forGood) {
     p.deadSinceMs = 0;
     p.crouched = p.ragdolled = p.aimingTask = false;
     p.mover = p.bodyMover = Mover{};
-    p.outfitApplied = 0;
+    p.lookApplied = false;
 }
 
 void CoopSession::destroyMirror(Mirror& m, bool recycle) {
@@ -468,14 +472,49 @@ void CoopSession::onRoster(const Roster& roster) {
     status_.players = static_cast<int>(roster.players.size());
     status_.worldOwner = isOwner();
     status_.ownerName.clear();
+    status_.characters.clear();
     for (const RosterEntry& e : roster.players) {
         if (e.id == owner_) status_.ownerName = e.name;
-        if (e.id == myId_) continue;
+        status_.characters.push_back({e.avatar, e.name});
+        if (e.id == myId_) {
+            character_.setMine(e.avatar);
+            status_.character = e.avatar;
+            continue;
+        }
         Puppet& p = puppets_[e.id];
         p.id = e.id;
         p.name = e.name;
-        p.avatar = e.avatar;
+        if (p.avatar != e.avatar) {
+            // Another character now: a new ped of that model takes the place of the old one (its
+            // horse and wagon stay), dressed once the look for it arrives.
+            if (!p.avatar.empty() && p.ped) {
+                if (game_.exists(p.ped)) game_.remove(p.ped);
+                p.ped = 0;
+                p.ridingOn = p.seatedIn = 0;
+                p.weapon = 0;
+                p.deadSinceMs = 0;
+                p.crouched = p.ragdolled = p.aimingTask = false;
+                p.mover = p.bodyMover = Mover{};
+            }
+            if (!p.avatar.empty()) p.haveLook = false;
+            p.avatar = e.avatar;
+            p.lookApplied = false;
+        }
     }
+}
+
+// Missions, scenes and the shops are made for the story hero: whoever chose another character is
+// the hero again while one is on. In the shared story the world owner's mission is everybody's, and
+// we should be the hero before we walk into its marker; in the owner's world only the owner plays.
+bool CoopSession::storyHeroNeeded() const {
+    const uint16_t f = local_.state.flags;
+    if (f & (PF_InMission | PF_Cutscene | PF_Holding)) return true;
+    if (story_.holding()) return true;
+    if (mode_ == StoryMode::Shared && owner_ && owner_ != myId_) {
+        auto it = puppets_.find(owner_);
+        if (it != puppets_.end() && it->second.haveState && (it->second.state.flags & PF_InMission)) return true;
+    }
+    return false;
 }
 
 void CoopSession::handleMessages(uint32_t nowMs) {
@@ -544,7 +583,11 @@ void CoopSession::handleMessages(uint32_t nowMs) {
             case Msg::Appearance: {
                 Appearance a;
                 auto it = puppets_.find(from);
-                if (decode(body, bodySize, a) && it != puppets_.end()) it->second.outfit = a.outfit;
+                if (decode(body, bodySize, a) && it != puppets_.end() && (!it->second.haveLook || a != it->second.look)) {
+                    it->second.look = std::move(a);
+                    it->second.haveLook = true;
+                    it->second.lookApplied = false;
+                }
                 break;
             }
             case Msg::EntitySnapshot: {
@@ -699,15 +742,6 @@ void CoopSession::sendLocalState(uint32_t nowMs) {
     link_.send(Msg::PlayerState, s, false);
 }
 
-void CoopSession::sendAppearance(uint32_t nowMs) {
-    if (appearanceSent_ && nowMs - lastOutfitCheckMs_ < kOutfitCheckMs) return;
-    lastOutfitCheckMs_ = nowMs;
-    uint32_t outfit = game_.localOutfit();
-    if (appearanceSent_ && outfit == sentOutfit_) return;
-    link_.send(Msg::Appearance, Appearance{outfit}, true);
-    sentOutfit_ = outfit;
-    appearanceSent_ = true;
-}
 
 void CoopSession::sendWorld(uint32_t nowMs) {
     if (lastInfoMs_ == 0 || nowMs - lastInfoMs_ >= kInfoIntervalMs) {
@@ -1085,7 +1119,7 @@ void CoopSession::updatePuppet(Puppet& p, uint32_t nowMs, float dt) {
         p.ridingOn = p.seatedIn = 0;
         p.weapon = 0;
         p.mover = Mover{};
-        p.outfitApplied = 0;
+        p.lookApplied = false;
     }
     if (p.ownMount && !game_.exists(p.ownMount)) p.ownMount = 0;
     if (p.ownVehicle && !game_.exists(p.ownVehicle)) p.ownVehicle = 0;
@@ -1095,11 +1129,13 @@ void CoopSession::updatePuppet(Puppet& p, uint32_t nowMs, float dt) {
         game_.setHealth(p.ped, std::max<int>(s.health, 1), s.maxHealth);
         game_.setLabel(p.ped, p.name.c_str());
         p.expectedHealth = game_.health(p.ped);
-        p.outfitApplied = 0;
+        p.lookApplied = false;
     }
-    if (p.outfit && p.outfit != p.outfitApplied) {
-        game_.setOutfit(p.ped, p.outfit);
-        p.outfitApplied = p.outfit;
+    if (p.haveLook && !p.lookApplied) {
+        // Clothes fit their own model only: a look for another one (the player was someone else
+        // when it was sent) waits for the next.
+        if (!p.look.model || p.look.model == joaat(p.avatar.c_str())) game_.applyAppearance(p.ped, p.look);
+        p.lookApplied = true;
     }
     MotionSample target = p.motion.sample(nowMs);
 

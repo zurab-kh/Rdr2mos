@@ -24,6 +24,13 @@ public:
     void damageLocalPlayer(int amount) override;
     void teleportLocalPlayer(const coop::Vec3& pos) override;
     uint32_t localOutfit() override;
+    uint32_t localModel() override;
+    bool setLocalModel(uint32_t model) override;
+    bool modelExists(uint32_t model) override;
+    bool readAppearance(coop::EntityHandle ped, coop::Appearance& out) override;
+    void applyAppearance(coop::EntityHandle ped, const coop::Appearance& look) override;
+    int outfitPresets(coop::EntityHandle ped) override;
+    void setOutfitPreset(coop::EntityHandle ped, int preset) override;
     void setLocalProtected(bool on) override;
     void killLocalPlayer() override;
     void holdWorld(bool on) override;

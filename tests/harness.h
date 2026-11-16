@@ -152,6 +152,8 @@ public:
         bool parked = false;
         bool harmless = false;
         uint32_t outfit = 0, script = 0;
+        Appearance look;      // what applyAppearance() put on
+        int looks = 0;        // applyAppearance() calls
         int faces = 0, updates = 0;  // updates: any driving call (task, nudge, face, steer)
         mutable int queries = 0;     // position / health reads
         Vec3 goal;
@@ -176,6 +178,14 @@ public:
     int adoptions = 0;
     int spawns = 0, removals = 0, prefetches = 0;
     uint32_t playerOutfit = 0;
+    // the local character: its model, what it wears (shop items), its outfit presets
+    uint32_t localModelHash = 0;
+    std::vector<ShopItem> playerItems;
+    int presetsOfModel = 4;
+    int playerPreset = -1;
+    int modelSwitches = 0;
+    int switchFailures = 0;                  // setLocalModel() fails this many times first
+    std::vector<uint32_t> missingModels;     // models the game does not have
     bool playerProtected = false;
     bool held = false;
     uint32_t missionScript = 0;
@@ -265,6 +275,59 @@ public:
     void damageLocalPlayer(int amount) override { playerHealth = std::max(0, playerHealth - amount); }
     void teleportLocalPlayer(const Vec3& pos) override { player.pos = pos; }
     uint32_t localOutfit() override { return playerOutfit; }
+    uint32_t localModel() override { return localModelHash; }
+    bool setLocalModel(uint32_t model) override {
+        if (!modelExists(model)) return false;
+        if (switchFailures > 0) {
+            --switchFailures;
+            return false;
+        }
+        // The game gives the player a new ped of that model, dressed in its defaults.
+        ents.erase(playerPed);
+        playerPed = add(EntityKind::Ped, model, player.pos);
+        localModelHash = model;
+        playerItems.clear();
+        playerOutfit = 0;
+        playerPreset = -1;
+        ++modelSwitches;
+        return true;
+    }
+    bool modelExists(uint32_t model) override {
+        return std::find(missingModels.begin(), missingModels.end(), model) == missingModels.end();
+    }
+    bool readAppearance(EntityHandle ped, Appearance& out) override {
+        out = Appearance{};
+        if (ped == playerPed) {
+            out.model = localModelHash;
+            out.outfit = playerOutfit;
+            out.items = playerItems;
+            return true;
+        }
+        auto it = ents.find(ped);
+        if (it == ents.end()) return false;
+        out = it->second.look;
+        out.model = it->second.model;
+        return true;
+    }
+    void applyAppearance(EntityHandle ped, const Appearance& look) override {
+        if (ped == playerPed) {
+            playerItems = look.items;
+            playerOutfit = look.outfit;
+            if (look.preset != Appearance::kNoPreset) playerPreset = look.preset;
+            return;
+        }
+        Ent& e = ents.at(ped);
+        e.look = look;
+        e.outfit = look.outfit;
+        ++e.looks;
+    }
+    int outfitPresets(EntityHandle ped) override { return ped == playerPed ? presetsOfModel : 0; }
+    void setOutfitPreset(EntityHandle ped, int preset) override {
+        if (ped != playerPed) return;
+        playerPreset = preset;
+        playerOutfit = 0xC0FFEE00u + static_cast<uint32_t>(preset);  // each preset is another outfit
+        playerItems.clear();
+    }
     void setLocalProtected(bool on) override { playerProtected = on; }
     void killLocalPlayer() override { playerHealth = 0; }
     void holdWorld(bool on) override { held = on; }
@@ -529,6 +592,7 @@ struct Player {
         linkConfig.local.role = Role::Guest;
         linkConfig.local.name = name;
         linkConfig.local.avatar = avatar;
+        if (!game.localModelHash) game.localModelHash = joaat(avatar.c_str());
         linkConfig.local.campaign = campaign;
         linkConfig.local.password = password;
         linkConfig.local.wantsWorld = wantsWorld ? 1 : 0;

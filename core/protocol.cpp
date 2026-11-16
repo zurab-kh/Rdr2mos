@@ -409,10 +409,35 @@ uint32_t crc32(const uint8_t* data, size_t size, uint32_t crc) {
     return ~crc;
 }
 
-void write(ByteWriter& w, const Appearance& v) { w.u32(v.outfit); }
+void write(ByteWriter& w, const Appearance& v) {
+    w.u32(v.outfit);
+    w.u32(v.model);
+    w.u8(v.preset);
+    size_t n = std::min(v.items.size(), kMaxShopItems);
+    w.u8(static_cast<uint8_t>(n));
+    for (size_t i = 0; i < n; ++i) {
+        w.u32(v.items[i].component);
+        w.u32(v.items[i].wearable);
+    }
+}
 bool read(ByteReader& r, Appearance& v) {
     v.outfit = r.u32();
+    v.model = r.u32();
+    v.preset = r.u8();
+    size_t n = r.u8();
+    if (!r.ok() || n > kMaxShopItems || r.remaining() < n * 8) return false;
+    v.items.resize(n);
+    for (ShopItem& item : v.items) {
+        item.component = r.u32();
+        item.wearable = r.u32();
+    }
     return r.ok();
+}
+
+void write(ByteWriter& w, const CharacterRequest& v) { w.str(v.avatar); }
+bool read(ByteReader& r, CharacterRequest& v) {
+    v.avatar = r.str();
+    return r.ok() && !v.avatar.empty() && v.avatar.size() <= 48;
 }
 
 std::vector<uint8_t> withSource(uint8_t player, const std::vector<uint8_t>& payload) {

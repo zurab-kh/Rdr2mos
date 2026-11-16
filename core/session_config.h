@@ -15,6 +15,9 @@ struct SessionConfig {
     bool syncWaypoints = true;
     bool autoRegroup = true;     // follow the server's "move to the mission start" requests
     bool autoUploadSaves = true; // world owner: put every new save on the server
+    // Become the chosen character in our own game too (outside missions and scenes, which the story
+    // hero plays). Off: only the others see us as that character. The plugin turns it on by default.
+    bool becomeCharacter = false;
     float npcRadius = 150.0f;
     int maxPeds = 64;
     int maxVehicles = 16;

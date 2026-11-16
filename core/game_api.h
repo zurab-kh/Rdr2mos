@@ -85,6 +85,39 @@ public:
     virtual void damageLocalPlayer(int amount) = 0;
     virtual void teleportLocalPlayer(const Vec3& pos) = 0;
     virtual uint32_t localOutfit() = 0;                 // meta outfit hash of the player's character, 0 = unknown
+    // The model of the local player's character (0: not known).
+    virtual uint32_t localModel() { return 0; }
+    // Makes the local player a character of this model (the game gives the player a new ped).
+    // False: not possible right now (the model is still loading, ...): ask again later.
+    virtual bool setLocalModel(uint32_t model) {
+        (void)model;
+        return false;
+    }
+    // Whether the game has this model at all.
+    virtual bool modelExists(uint32_t model) {
+        (void)model;
+        return true;
+    }
+    // The exact look of a ped: model, outfit and every shop item it wears. False: not known.
+    virtual bool readAppearance(EntityHandle ped, Appearance& out) {
+        (void)ped;
+        (void)out;
+        return false;
+    }
+    // Dresses a ped of the same model like that: the preset first (if any), then every item.
+    virtual void applyAppearance(EntityHandle ped, const Appearance& look) {
+        (void)ped;
+        (void)look;
+    }
+    // The outfit presets of a ped's model (the mod's wardrobe): how many there are, and wearing one.
+    virtual int outfitPresets(EntityHandle ped) {
+        (void)ped;
+        return 0;
+    }
+    virtual void setOutfitPreset(EntityHandle ped, int preset) {
+        (void)ped;
+        (void)preset;
+    }
     // Guest during the host's cutscenes: nobody can help them, so they cannot be hurt.
     virtual void setLocalProtected(bool on) = 0;
     virtual void killLocalPlayer() = 0;                 // shared mission failure

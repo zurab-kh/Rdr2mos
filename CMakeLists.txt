@@ -26,6 +26,8 @@ add_library(coop_core STATIC
   core/server_storage.cpp
   core/session.cpp
   core/story.cpp
+  core/characters.cpp
+  core/character.cpp
   core/config.cpp)
 target_include_directories(coop_core PUBLIC core)
 if(WIN32)

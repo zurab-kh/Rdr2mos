@@ -327,6 +327,71 @@ bool Rdr2Game::belongsToLocalPlayer(EntityHandle h) { return own_.count(h) != 0;
 
 uint32_t Rdr2Game::localOutfit() { return playerPed_ ? n::GET_PED_META_OUTFIT_HASH(playerPed_) : 0; }
 
+// ---------------------------------------------------------------- characters
+
+uint32_t Rdr2Game::localModel() { return playerPed_ ? n::GET_ENTITY_MODEL(playerPed_) : 0; }
+
+bool Rdr2Game::modelExists(uint32_t model) { return model && n::IS_MODEL_VALID(model); }
+
+bool Rdr2Game::setLocalModel(uint32_t model) {
+    if (!playerPed_ || !modelExists(model)) return false;
+    n::REQUEST_MODEL(model);
+    if (!n::HAS_MODEL_LOADED(model)) return false;  // streaming in: the session asks again
+    int old = playerPed_;
+    n::SET_PLAYER_MODEL(player_, model);
+    n::SET_MODEL_AS_NO_LONGER_NEEDED(model);
+    // A new ped for the player: nothing known about the old one applies to it.
+    forget(old);
+    invalidate(old);
+    poolsChanged();
+    playerPed_ = n::PLAYER_PED_ID();
+    if (playerPed_) {
+        forget(playerPed_);
+        Cached& me = cached(playerPed_);
+        me.exists = true;
+        me.have |= kHaveExists;
+        own_.insert(playerPed_);
+    }
+    ownHorsesFresh_ = false;
+    playerMaxHealth_ = 0;
+    return playerPed_ != 0;
+}
+
+bool Rdr2Game::readAppearance(EntityHandle ped, coop::Appearance& out) {
+    out = coop::Appearance{};
+    if (!ped || !exists(ped)) return false;
+    out.model = n::GET_ENTITY_MODEL(ped);
+    out.outfit = n::GET_PED_META_OUTFIT_HASH(ped);
+    int count = std::clamp(n::GET_NUM_COMPONENTS_IN_PED(ped), 0, static_cast<int>(coop::kMaxShopItems));
+    for (int i = 0; i < count; ++i) {
+        uint32_t wearable = 0;
+        uint32_t item = n::GET_SHOP_ITEM_COMPONENT_AT_INDEX(ped, i, &wearable);
+        if (item) out.items.push_back({item, wearable});
+    }
+    return true;
+}
+
+void Rdr2Game::applyAppearance(EntityHandle ped, const coop::Appearance& look) {
+    if (!ped || !exists(ped)) return;
+    // The base first (an outfit preset, or the outfit it was dressed in), then every shop item on
+    // top, worn the same way: hats, coats, rolled-up sleeves.
+    if (look.preset != coop::Appearance::kNoPreset) n::EQUIP_META_PED_OUTFIT_PRESET(ped, look.preset);
+    else if (look.items.empty() && look.outfit) n::EQUIP_META_PED_OUTFIT(ped, look.outfit);
+    for (const coop::ShopItem& item : look.items) {
+        n::APPLY_SHOP_ITEM_TO_PED(ped, item.component);
+        if (item.wearable) n::UPDATE_SHOP_ITEM_WEARABLE_STATE(ped, item.component, item.wearable);
+    }
+    n::UPDATE_PED_VARIATION(ped);
+}
+
+int Rdr2Game::outfitPresets(EntityHandle ped) { return ped && exists(ped) ? n::GET_NUM_META_PED_OUTFITS(ped) : 0; }
+
+void Rdr2Game::setOutfitPreset(EntityHandle ped, int preset) {
+    if (!ped || !exists(ped) || preset < 0) return;
+    n::EQUIP_META_PED_OUTFIT_PRESET(ped, preset);
+    n::UPDATE_PED_VARIATION(ped);
+}
+
 void Rdr2Game::setLocalProtected(bool on) {
     protected_ = on;
     g_protectionLeftOn = on;

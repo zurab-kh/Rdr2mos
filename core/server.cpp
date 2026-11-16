@@ -1,5 +1,7 @@
 #include "server.h"
 
+#include "characters.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -442,6 +444,7 @@ Server::Verdict Server::allow(Client& c, Msg type, size_t size, uint32_t nowMs) 
             return Verdict::Handle;
         case Msg::Story:
         case Msg::SaveRequest:
+        case Msg::CharacterRequest:
             return c.story.take(1, kStoryPerSecond, kStoryBurst, nowMs) ? Verdict::Handle : Verdict::Wait;
         case Msg::Waypoint:
         case Msg::Appearance: {
@@ -618,7 +621,13 @@ void Server::admit(Client& c, uint32_t nowMs) {
     c.id = id;
     c.campaign = campaignName;
     c.name = name;
-    c.avatar = cleanAvatar(hello.avatar);
+    // Every character once per campaign: whoever asks for one that is taken gets the first free one.
+    std::string wantedAvatar = normalizeAvatar(cleanAvatar(hello.avatar));
+    if (wantedAvatar.empty()) wantedAvatar = characterCatalog().front().model;
+    std::vector<std::string> takenAvatars;
+    for (uint8_t other : camp.ids)
+        if (Client* m = member(camp, other); m && m != &c && m != twin) takenAvatars.push_back(m->avatar);
+    c.avatar = freeCharacter(wantedAvatar, takenAvatars);
     c.wantsWorld = hello.wantsWorld != 0;
     c.joinedMs = nowMs;
     c.haveState = false;
@@ -661,6 +670,9 @@ void Server::admit(Client& c, uint32_t nowMs) {
     }
     if (camp.owner != id) sendWorldTo(camp, c);
     if (!camp.waypoint.empty()) c.link.sendFrom(camp.waypointFrom, Msg::Waypoint, camp.waypoint, true);
+    if (c.avatar != wantedAvatar)
+        notice(c, characterName(wantedAvatar) + " is taken - you are " + characterName(c.avatar) +
+                      " (choose another one with the character key)");
     if (twin) return;
     for (uint8_t other : camp.ids)
         if (Client* o = member(camp, other); o && o != &c) notice(*o, name + " joined the campaign");
@@ -856,6 +868,25 @@ void Server::handle(Client& c, Msg type, const std::vector<uint8_t>& payload, ui
             uint8_t to = isPlayerRef(d.target) ? playerOfRef(d.target) : camp.owner;
             Client* target = member(camp, to);
             if (target && target != &c) target->link.sendFrom(c.id, type, payload, true);
+            return;
+        }
+        case Msg::CharacterRequest: {
+            CharacterRequest req;
+            if (!decode(payload, req)) return;
+            std::string want = normalizeAvatar(cleanAvatar(req.avatar));
+            if (want.empty() || want == c.avatar) return;
+            for (uint8_t other : camp.ids) {
+                Client* m = member(camp, other);
+                if (m && m != &c && normalizeAvatar(m->avatar) == want) {
+                    notice(c, characterName(want) + " is already taken by " + m->name);
+                    return;
+                }
+            }
+            c.avatar = want;
+            c.appearanceBytes.clear();  // those clothes were for the old character
+            ++revision_;
+            storage_.journal(camp.name, c.name + " is now " + characterName(want));
+            sendRoster(camp);  // the others give the player its new character
             return;
         }
         case Msg::Appearance:

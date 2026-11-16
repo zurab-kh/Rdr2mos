@@ -12,7 +12,7 @@
 namespace coop {
 
 constexpr uint16_t kMagic = 0x4352;  // "RC"
-constexpr uint8_t kProtocolVersion = 7;
+constexpr uint8_t kProtocolVersion = 8;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr size_t kMaxDatagram = 1200;  // stays below any sane path MTU
 constexpr size_t kMaxMessage = 1100;   // payload budget for one unreliable message
@@ -51,6 +51,7 @@ enum class Msg : uint8_t {
     StoryCommand = 15,  // server -> player: hold, release, fail, regroup, notice
     Denied = 16,        // server -> player: not admitted, with the reason
     SaveResult = 17,    // server -> uploader: the upload was stored (with its CRC) or refused, and why
+    CharacterRequest = 18,  // player -> server: "I want to be this character" (reliable)
 };
 
 // Messages that one player sends to the server and the server passes on to the others reach
@@ -174,9 +175,34 @@ struct Damage {
     uint16_t worldEpoch = 0;           // the sender's Roster::worldEpoch: world ids mean nothing in another world
 };
 
-// The look of a player's character; sent reliably when it changes.
+// One piece of clothing (a shop item) a character wears, and how it is worn (sleeves rolled up,
+// collar open...).
+struct ShopItem {
+    uint32_t component = 0;
+    uint32_t wearable = 0;  // wearable state, 0 = the default
+    bool operator==(const ShopItem& o) const { return component == o.component && wearable == o.wearable; }
+};
+constexpr size_t kMaxShopItems = 96;
+
+// The look of a player's character; sent reliably when it changes. Clothes belong to one model:
+// they are only put on a character of that model.
 struct Appearance {
-    uint32_t outfit = 0;
+    uint32_t outfit = 0;            // meta outfit hash (what the character was dressed in last)
+    uint32_t model = 0;             // the model the clothes are for (0: not known)
+    uint8_t preset = kNoPreset;     // outfit preset put on first (the mod's wardrobe), kNoPreset: none
+    std::vector<ShopItem> items;    // every shop item worn, in the order the game lists them
+    static constexpr uint8_t kNoPreset = 0xFF;
+    bool operator==(const Appearance& o) const {
+        return outfit == o.outfit && model == o.model && preset == o.preset && items == o.items;
+    }
+    bool operator!=(const Appearance& o) const { return !(*this == o); }
+};
+
+// Player -> server: be this character from now on (a model name, e.g. "cs_charlessmith"). The
+// server lets each character be taken by one player of a campaign at a time; the answer is the
+// next Roster (with the new avatar), or a notice why not.
+struct CharacterRequest {
+    std::string avatar;
 };
 
 enum class StoryEvent : uint8_t {
@@ -284,6 +310,8 @@ void write(ByteWriter& w, const Damage& v);
 bool read(ByteReader& r, Damage& v);
 void write(ByteWriter& w, const Appearance& v);
 bool read(ByteReader& r, Appearance& v);
+void write(ByteWriter& w, const CharacterRequest& v);
+bool read(ByteReader& r, CharacterRequest& v);
 void write(ByteWriter& w, const StoryInfo& v);
 bool read(ByteReader& r, StoryInfo& v);
 void write(ByteWriter& w, const CameraState& v);
