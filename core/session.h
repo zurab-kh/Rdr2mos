@@ -6,11 +6,14 @@
 //    near any player; everybody else shows them as "mirrors" and keeps their own population off.
 //    Streaming is prioritised by distance to the nearest other player, only changed fields are
 //    sent, and idle entities only send a keyframe once a second.
-//  * Damage is routed by the server to whoever owns the victim.
+//  * Damage is routed by the server to whoever owns the victim. It is added up per victim and sent
+//    at most every 100 ms (fire and poison hurt a little every frame), tagged with the world epoch:
+//    entity ids mean nothing in another owner's world.
 //  * Control can move across: if someone drives the owner's wagon or rides the owner's horse, the
 //    owner moves the real one from that player's stream, and so does everybody else with their
 //    copy. A seat in another player's own wagon is referred to by that player, so it stays one
-//    wagon in every game; a ride whose original goes away (owner left) stays with its rider.
+//    wagon in every game, whoever holds the reins; a ride whose original goes away (owner left)
+//    stays with everybody sitting on it.
 //  * Shared story: each player's own copies of mission NPCs are linked to the owner's.
 #pragma once
 #include <algorithm>
@@ -166,6 +169,7 @@ private:
     void movePed(EntityHandle h, Mover& m, const MotionBuffer& motion, const MotionSample& target, float dt, uint32_t nowMs);
     void steerVehicle(EntityHandle h, Mover& m, const MotionSample& target, float dt);
     void forwardDamage(EntityHandle h, int& expectedHealth, uint16_t target);
+    void flushDamage(uint32_t nowMs);
     Vec3 refPosition(uint16_t ref, bool& found);
     EntityHandle resolveRef(uint16_t ref);
     EntityHandle resolveVehicle(uint16_t ref);
@@ -176,6 +180,8 @@ private:
     bool localRides(EntityHandle h) const {
         return h && (h == local_.mount || (h == local_.vehicle && local_.state.seat == -1));
     }
+    // The local player is on it in any seat, passengers included.
+    bool localSitsIn(EntityHandle h) const { return h && (h == local_.mount || h == local_.vehicle); }
     // Another player's puppet rides it or sits in it.
     bool puppetUses(EntityHandle h) const {
         for (const auto& entry : puppets_)
@@ -184,11 +190,14 @@ private:
     }
     bool puppetDrives(EntityHandle h) const { return std::find(driven_.begin(), driven_.end(), h) != driven_.end(); }
     Puppet* puppetByPed(EntityHandle h);
-    void destroyPuppet(Puppet& p);
+    // forGood: the player left (or we did). Otherwise only the character is recreated in a moment.
+    void destroyPuppet(Puppet& p, bool forGood = true);
     void destroyMirror(Mirror& m, bool recycle);
+    bool handOverToDriver(Mirror& m);
+    void retargetVehicleRefs(uint16_t from, uint16_t to);
     EntityHandle obtain(EntityKind kind, uint32_t model, const Vec3& pos, float heading);
     void flushPool(uint32_t nowMs, bool all);
-    EntityHandle takeOverOwnVehicle(uint32_t model, const Vec3& pos);
+    EntityHandle takeOverOwnVehicle(uint32_t model, const Vec3& pos, uint16_t id);
     uint16_t allocateId();
     bool isOwner() const { return myId_ != 0 && myId_ == owner_; }
 
@@ -221,6 +230,12 @@ private:
     uint32_t lastWorldMs_ = 0, lastInfoMs_ = 0, lastForeignMs_ = 0;
     std::vector<std::string> notices_;
     StorySync story_;
+    // Damage not yet sent, per victim (an entity id of the current world, or a player ref).
+    struct PendingDamage {
+        uint32_t amount = 0;
+        uint32_t lastSentMs = 0;
+    };
+    std::unordered_map<uint16_t, PendingDamage> damage_;
 
     // world owner
     std::unordered_map<EntityHandle, Streamed> streamed_;

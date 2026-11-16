@@ -28,6 +28,10 @@ constexpr uint32_t kMissionScanMs = 250;
 constexpr float kBindDistance = 35.0f;
 constexpr float kLeadMs = 500.0f;                // walking peds head for where they will be this much later
 constexpr uint32_t kIdleRecheckMs = 500;         // a ped standing where it should is looked at this often
+// Damage to one victim is added up and sent at most this often. Fire, poison, a drag or a trample
+// take a little health every frame: one reliable message per frame and victim would be 60+ a
+// second each, which the server's per-player budget cannot (and should not) carry.
+constexpr uint32_t kDamageIntervalMs = 100;
 
 constexpr int kGroupPos = 0, kGroupHeading = 1, kGroupTilt = 2, kGroupVel = 3, kGroupHealth = 4, kGroupState = 5,
               kGroupStatic = 6;
@@ -114,6 +118,7 @@ void CoopSession::tick(uint32_t nowMs) {
                 restoreWorld();
             }
         }
+        flushDamage(nowMs);
     }
     link_.flush(nowMs);
 }
@@ -128,6 +133,8 @@ void CoopSession::resetWorld() {
     lastWorldMs_ = lastInfoMs_ = lastForeignMs_ = 0;
     missionLocal_.clear();
     lastMissionScanMs_ = 0;
+    // Hits on entities of the old world not sent yet: their ids would name something else now.
+    for (auto it = damage_.begin(); it != damage_.end();) it = isPlayerRef(it->first) ? std::next(it) : damage_.erase(it);
     for (auto& [id, p] : puppets_) {
         // Seats and saddles referred to the old world.
         if (p.ridingOn && p.ridingOn != p.ownMount) {
@@ -156,6 +163,7 @@ void CoopSession::cleanup() {
     for (auto& [id, p] : puppets_) destroyPuppet(p);
     puppets_.clear();
     resetWorld();
+    damage_.clear();
     myId_ = owner_ = 0;
     worldEpoch_ = 0;
     haveRoster_ = false;
@@ -298,16 +306,55 @@ EntityHandle CoopSession::obtain(EntityKind kind, uint32_t model, const Vec3& po
 // The world owner got out of a vehicle of its own: from now on it streams it as part of the world.
 // Our puppet copy of it (maybe with us or others in it) simply becomes the mirror, instead of a
 // second wagon appearing on top of it.
-EntityHandle CoopSession::takeOverOwnVehicle(uint32_t model, const Vec3& pos) {
-    for (auto& [id, p] : puppets_) {
+EntityHandle CoopSession::takeOverOwnVehicle(uint32_t model, const Vec3& pos, uint16_t id) {
+    for (auto& [pid, p] : puppets_) {
         EntityHandle h = p.ownVehicle;
-        if (!h || p.ownVehicleModel != model || p.seatedIn == h || !game_.exists(h)) continue;
+        if (!h || p.ownVehicleModel != model || !game_.exists(h)) continue;
+        // Another player's puppet still sitting in its own vehicle means it is not this one. The
+        // world owner's can: its game streams the vehicle only once the owner got down, so a state
+        // saying otherwise is out of date (the one that said "got down" was lost, and a standing
+        // player's next state is up to 200 ms away, while the snapshot is repeated every world tick).
+        if (p.seatedIn == h && pid != owner_) continue;
         if (distanceSq(game_.position(h), pos) > 16.0f) continue;
         p.ownVehicle = 0;
         p.ownVehicleUnusedMs = 0;
+        if (pid == owner_ && (p.state.flags & PF_InVehicle) && p.state.vehicleRef == kRefNone)
+            p.state.flags = static_cast<uint16_t>(p.state.flags & ~PF_InVehicle);
+        // Whoever sits in it by the player's reference sits in the mirror now, which is what their
+        // next states will say too; until then they stay seated instead of dropping out.
+        retargetVehicleRefs(playerRef(pid), id);
         return h;
     }
     return 0;
+}
+
+// Puppets whose last state puts them in vehicle `from` are put in `to` instead: what that vehicle
+// is called changed here, and their next state will say the same.
+void CoopSession::retargetVehicleRefs(uint16_t from, uint16_t to) {
+    for (auto& [id, q] : puppets_)
+        if (q.haveState && (q.state.flags & PF_InVehicle) && q.state.vehicleRef == from) q.state.vehicleRef = to;
+}
+
+// A mirror vehicle we sit in as a passenger loses its original. The player driving it keeps it:
+// their game adopts it, and from then on it is their own vehicle, so ours becomes our copy of it
+// (their puppet's own vehicle) with us still in it, instead of a second one appearing next to it.
+bool CoopSession::handOverToDriver(Mirror& m) {
+    for (auto& [id, q] : puppets_) {
+        if (!q.ped || q.seatedIn != m.handle || q.seat != -1) continue;
+        if (q.ownVehicle && q.ownVehicle != m.handle && game_.exists(q.ownVehicle)) game_.remove(q.ownVehicle);
+        q.ownVehicle = m.handle;
+        q.ownVehicleModel = m.st.model;
+        q.ownVehicleUnusedMs = 0;
+        // The driver's next state names it as their own; assume that now, or the puppet would get
+        // out until it arrives.
+        if (q.haveState && q.state.vehicleRef == m.id) {
+            q.state.vehicleRef = kRefNone;
+            q.state.vehicleModel = m.st.model;
+        }
+        retargetVehicleRefs(m.id, playerRef(id));
+        return true;
+    }
+    return false;
 }
 
 void CoopSession::flushPool(uint32_t nowMs, bool all) {
@@ -321,10 +368,29 @@ void CoopSession::flushPool(uint32_t nowMs, bool all) {
     }
 }
 
-void CoopSession::destroyPuppet(Puppet& p) {
-    for (EntityHandle h : {p.ped, p.ownMount, p.ownVehicle})
+void CoopSession::destroyPuppet(Puppet& p, bool forGood) {
+    if (p.ped && game_.exists(p.ped)) game_.remove(p.ped);
+    for (EntityHandle* ride : {&p.ownMount, &p.ownVehicle}) {
+        EntityHandle h = *ride;
+        if (h && game_.exists(h) && localSitsIn(h)) {
+            // The local player is on the friend's horse or wagon: it is never deleted under them.
+            // The character only comes back in a moment: it keeps its ride.
+            if (!forGood) continue;
+            // The friend is gone for good: it stays as part of our own game, like a mirror does
+            // when its original goes away, and the others now see it as ours.
+            if (game_.adopt(h)) {
+                if (h == local_.vehicle) {
+                    ownVehicle_ = h;
+                    retargetVehicleRefs(playerRef(p.id), playerRef(myId_));
+                }
+                *ride = 0;
+                continue;
+            }
+        }
         if (h && game_.exists(h)) game_.remove(h);
-    p.ped = p.ownMount = p.ownVehicle = 0;
+        *ride = 0;
+    }
+    p.ped = 0;
     p.ridingOn = p.seatedIn = 0;
     p.weapon = 0;
     p.deadSinceMs = 0;
@@ -346,9 +412,17 @@ void CoopSession::destroyMirror(Mirror& m, bool recycle) {
     if (m.handle) {
         mirrorByHandle_.erase(m.handle);
         if (game_.exists(m.handle)) {
-            if (localRides(m.handle) && game_.adopt(m.handle)) {
+            if (m.st.kind == EntityKind::Vehicle && !localRides(m.handle) && localSitsIn(m.handle) &&
+                handOverToDriver(m)) {
+                // A passenger: the wagon goes on with the player who drives it (see handOverToDriver).
+            } else if (localSitsIn(m.handle) && game_.adopt(m.handle)) {
                 // The original is gone, but the player is on this one: it stays, as part of our
-                // own game, instead of vanishing under them.
+                // own game, instead of vanishing under them. A passenger with nobody at the reins
+                // keeps it too. Whoever else sits in it now sits in our own vehicle.
+                if (m.handle == local_.vehicle) {
+                    ownVehicle_ = m.handle;
+                    retargetVehicleRefs(m.id, playerRef(myId_));
+                }
             } else if (recycle && pool_.size() < kPoolSize && !game_.isDead(m.handle)) {
                 // Live entities are parked for reuse: the next mirror of the same model appears instantly.
                 game_.park(m.handle);
@@ -483,7 +557,9 @@ void CoopSession::handleMessages(uint32_t nowMs) {
                 if (!decode(body, bodySize, d) || d.amount == 0 || !game_.ready()) break;
                 if (d.target == playerRef(myId_)) {
                     game_.damageLocalPlayer(d.amount);
-                } else if (isOwner() && !isPlayerRef(d.target)) {
+                } else if (isOwner() && !isPlayerRef(d.target) && d.worldEpoch == worldEpoch_) {
+                    // Only hits on entities of our world: each owner numbers its world from 1, so
+                    // a hit sent before the sender heard of a handover names some other entity here.
                     EntityHandle victim = resolveRef(d.target);
                     auto attacker = puppets_.find(from);
                     if (victim) game_.damageNpc(victim, d.amount, attacker != puppets_.end() ? attacker->second.ped : 0);
@@ -947,11 +1023,27 @@ void CoopSession::forwardDamage(EntityHandle h, int& expectedHealth, uint16_t ta
             forward = byLocalPlayer && config_.friendlyFire;
         }
         if (forward) {
-            int amount = std::min(expectedHealth - current, 65535);
-            link_.send(Msg::Damage, Damage{target, static_cast<uint16_t>(amount)}, true);
+            PendingDamage& pending = damage_[target];
+            pending.amount = std::min<uint32_t>(pending.amount + static_cast<uint32_t>(expectedHealth - current), 1u << 24);
         }
     }
     expectedHealth = current;
+}
+
+// The first hit on a victim goes out at once; what follows within kDamageIntervalMs is added up
+// and sent as one message, so a burning NPC costs ~10 messages a second instead of one per frame.
+void CoopSession::flushDamage(uint32_t nowMs) {
+    for (auto it = damage_.begin(); it != damage_.end();) {
+        PendingDamage& d = it->second;
+        if (d.amount && (!d.lastSentMs || nowMs - d.lastSentMs >= kDamageIntervalMs)) {
+            uint32_t amount = std::min<uint32_t>(d.amount, 65535);
+            link_.send(Msg::Damage, Damage{it->first, static_cast<uint16_t>(amount), worldEpoch_}, true);
+            d.amount -= amount;
+            d.lastSentMs = nowMs ? nowMs : 1;
+        }
+        if (!d.amount && nowMs - d.lastSentMs >= kDamageIntervalMs) it = damage_.erase(it);
+        else ++it;
+    }
 }
 
 // ---------------------------------------------------------------- other players' characters
@@ -1020,7 +1112,7 @@ void CoopSession::updatePuppet(Puppet& p, uint32_t nowMs, float dt) {
     if (game_.isDead(p.ped)) {
         // Dead here but alive for its owner (they respawned, or survived the hit): recreate it.
         if (!p.deadSinceMs) p.deadSinceMs = nowMs ? nowMs : 1;
-        else if (nowMs - p.deadSinceMs > kRespawnGraceMs) destroyPuppet(p);
+        else if (nowMs - p.deadSinceMs > kRespawnGraceMs) destroyPuppet(p, false);
         return;
     }
     p.deadSinceMs = 0;
@@ -1047,8 +1139,17 @@ void CoopSession::updatePuppet(Puppet& p, uint32_t nowMs, float dt) {
                 p.ownVehicleModel = s.vehicleModel;
             }
             wantVehicle = p.ownVehicle;
-        } else if (wantVehicle && s.seat == -1 && !isPlayerRef(s.vehicleRef)) {
-            controlsShared = !(local_.vehicle == wantVehicle && local_.state.seat == -1) && !puppetDrives(wantVehicle);
+        } else if (wantVehicle && s.seat == -1) {
+            // At the reins of a shared vehicle, or of another player's own one (their copy here, or
+            // the real one if it is ours). That player's puppet steers its own vehicle only while it
+            // drives it itself; when it sits beside us, this puppet does, or nobody would.
+            bool ownerAtReins = false;
+            if (isPlayerRef(s.vehicleRef)) {
+                auto owner = puppets_.find(playerOfRef(s.vehicleRef));
+                ownerAtReins = owner != puppets_.end() && owner->second.seatedIn == wantVehicle && owner->second.seat == -1;
+            }
+            controlsShared = !ownerAtReins && !(local_.vehicle == wantVehicle && local_.state.seat == -1) &&
+                             !puppetDrives(wantVehicle);
         }
     } else if (s.flags & PF_OnMount) {
         wantMount = resolveRef(s.mountRef);
@@ -1093,7 +1194,8 @@ void CoopSession::updatePuppet(Puppet& p, uint32_t nowMs, float dt) {
     // A shared entity is already where it should be (more or less): take it over smoothly instead
     // of snapping it onto the puppet's stream, which runs a little earlier or later than the world's.
     if (controlsShared && p.bodyMover.mode == Mover::None) p.bodyMover.mode = Mover::Moving;
-    // Own rides that are no longer used disappear after a while (or at once if far away).
+    // Own rides that are no longer used disappear after a while (or at once if far away from their
+    // player). Used means by anybody: the player, us, or another player's puppet riding along.
     auto expire = [&](EntityHandle& h, uint32_t& unusedSince, bool inUse) {
         if (!h) return;
         if (inUse) {
@@ -1107,8 +1209,8 @@ void CoopSession::updatePuppet(Puppet& p, uint32_t nowMs, float dt) {
             unusedSince = 0;
         }
     };
-    expire(p.ownMount, p.ownMountUnusedMs, p.ridingOn == p.ownMount);
-    expire(p.ownVehicle, p.ownVehicleUnusedMs, p.seatedIn == p.ownVehicle || local_.vehicle == p.ownVehicle);
+    expire(p.ownMount, p.ownMountUnusedMs, localSitsIn(p.ownMount) || puppetUses(p.ownMount));
+    expire(p.ownVehicle, p.ownVehicleUnusedMs, localSitsIn(p.ownVehicle) || puppetUses(p.ownVehicle));
 
     if (s.weapon != p.weapon) {
         game_.setWeapon(p.ped, s.weapon);
@@ -1171,7 +1273,7 @@ void CoopSession::bindMissionEntities(uint32_t nowMs) {
     const float reach2 = kBindDistance * kBindDistance;
     for (auto& [id, m] : mirrors_) {
         if (m.bound || !m.st.script || !m.haveStatic || !m.havePos) continue;
-        if (localRides(m.handle)) continue;  // not while the player is on the stand-in
+        if (localSitsIn(m.handle)) continue;  // not while the player is on the stand-in
         for (size_t i = 0; i < missionLocal_.size(); ++i) {
             const MissionEntity& e = missionLocal_[i];
             if (e.kind != m.st.kind || e.model != m.st.model || e.script != m.st.script) continue;
@@ -1320,7 +1422,7 @@ void CoopSession::updateMirrors(uint32_t nowMs, float dt) {
         --budget;
         MotionSample t = m->motion.empty() ? MotionSample{} : m->motion.sample(nowMs);
         Vec3 pos = m->motion.empty() ? m->st.pos : t.pos;
-        m->handle = m->st.kind == EntityKind::Vehicle ? takeOverOwnVehicle(m->st.model, pos) : 0;
+        m->handle = m->st.kind == EntityKind::Vehicle ? takeOverOwnVehicle(m->st.model, pos, m->id) : 0;
         if (!m->handle) m->handle = obtain(m->st.kind, m->st.model, pos, m->st.heading);
         if (!m->handle) continue;
         mirrorByHandle_[m->handle] = m->id;
