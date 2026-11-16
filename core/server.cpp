@@ -463,6 +463,7 @@ void Server::admit(Client& c, uint32_t nowMs) {
     w.playerId = id;
     w.storyMode = config_.storyMode;
     w.hasCampaignSave = camp.hasSave;
+    w.campaignSaveCrc = camp.hasSave ? camp.saveCrc : 0;
     w.campaign = campaignName;
     c.link.send(Msg::Welcome, w, true);
     storage_.journal(campaignName, name + " joined");
@@ -537,6 +538,8 @@ void Server::sendRoster(Campaign& camp) {
     Roster r;
     r.worldOwner = camp.owner;
     r.worldEpoch = camp.epoch;
+    r.hasCampaignSave = camp.hasSave ? 1 : 0;
+    r.campaignSaveCrc = camp.hasSave ? camp.saveCrc : 0;
     for (uint8_t id : camp.ids)
         if (Client* m = member(camp, id)) r.players.push_back({m->id, m->name, m->avatar});
     std::vector<uint8_t> bytes = encode(r);
@@ -749,11 +752,17 @@ void Server::finishUpload(Client& c, Campaign& camp, uint32_t nowMs) {
         camp.save = std::make_shared<const std::vector<uint8_t>>(std::move(c.upload));
     }
     dropUpload(c);
+    SaveResult result;
+    result.crc = c.uploadCrc;
+    result.stored = ok ? 1 : 0;
+    if (!ok) result.reason = "The server could not store your save";
+    c.link.send(Msg::SaveResult, result, true);
     if (!ok) {
         notice(c, "The server could not store your save");
         return;
     }
     camp.hasSave = true;
+    sendRoster(camp);  // everyone learns the campaign's new save (its CRC)
     for (uint8_t id : camp.ids)
         if (Client* m = member(camp, id)) notice(*m, "Campaign saved on the server (by " + c.name + ")");
 }

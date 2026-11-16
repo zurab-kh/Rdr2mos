@@ -12,7 +12,7 @@
 namespace coop {
 
 constexpr uint16_t kMagic = 0x4352;  // "RC"
-constexpr uint8_t kProtocolVersion = 6;
+constexpr uint8_t kProtocolVersion = 7;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr size_t kMaxDatagram = 1200;  // stays below any sane path MTU
 constexpr size_t kMaxMessage = 1100;   // payload budget for one unreliable message
@@ -50,6 +50,7 @@ enum class Msg : uint8_t {
     Roster = 14,        // server -> players: who is in, who owns the world
     StoryCommand = 15,  // server -> player: hold, release, fail, regroup, notice
     Denied = 16,        // server -> player: not admitted, with the reason
+    SaveResult = 17,    // server -> uploader: the upload was stored (with its CRC) or refused, and why
 };
 
 // Messages that one player sends to the server and the server passes on to the others reach
@@ -170,6 +171,7 @@ struct EntitySnapshot {
 struct Damage {
     uint16_t target = kRefNone;        // host-world entity id (guest -> host), or a player ref
     uint16_t amount = 0;
+    uint16_t worldEpoch = 0;           // the sender's Roster::worldEpoch: world ids mean nothing in another world
 };
 
 // The look of a player's character; sent reliably when it changes.
@@ -218,6 +220,7 @@ struct Welcome {
     StoryMode storyMode = StoryMode::Shared;
     uint8_t hasCampaignSave = 0;
     std::string campaign;
+    uint32_t campaignSaveCrc = 0;      // CRC-32 of the campaign save the server holds (0: none)
 };
 
 struct RosterEntry {
@@ -230,6 +233,16 @@ struct Roster {
     uint8_t worldOwner = 0;     // player whose game simulates the world
     uint16_t worldEpoch = 0;    // changes whenever the world owner changes: start the world afresh
     std::vector<RosterEntry> players;
+    uint8_t hasCampaignSave = 0;       // the campaign has a save on the server (changes when the first one arrives)
+    uint32_t campaignSaveCrc = 0;      // its CRC-32 (0: none)
+};
+
+// Server -> the player who uploaded a save: the outcome. Only `stored` with a matching CRC means
+// the server keeps exactly that file as the campaign save.
+struct SaveResult {
+    uint32_t crc = 0;
+    uint8_t stored = 0;
+    std::string reason;                // why it was refused (shown to the player)
 };
 
 enum class StoryCmd : uint8_t {
@@ -284,6 +297,8 @@ void write(ByteWriter& w, const Welcome& v);
 bool read(ByteReader& r, Welcome& v);
 void write(ByteWriter& w, const Roster& v);
 bool read(ByteReader& r, Roster& v);
+void write(ByteWriter& w, const SaveResult& v);
+bool read(ByteReader& r, SaveResult& v);
 void write(ByteWriter& w, const StoryCommandMsg& v);
 bool read(ByteReader& r, StoryCommandMsg& v);
 void write(ByteWriter& w, const Denied& v);

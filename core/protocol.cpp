@@ -294,10 +294,12 @@ void encodeSnapshots(uint32_t timeMs, const Vec3& anchor, const std::vector<Enti
 void write(ByteWriter& w, const Damage& v) {
     w.u16(v.target);
     w.u16(v.amount);
+    w.u16(v.worldEpoch);
 }
 bool read(ByteReader& r, Damage& v) {
     v.target = r.u16();
     v.amount = r.u16();
+    v.worldEpoch = r.u16();
     return r.ok();
 }
 
@@ -426,12 +428,14 @@ void write(ByteWriter& w, const Welcome& v) {
     w.u8(static_cast<uint8_t>(v.storyMode));
     w.u8(v.hasCampaignSave);
     w.str(v.campaign);
+    w.u32(v.campaignSaveCrc);
 }
 bool read(ByteReader& r, Welcome& v) {
     v.playerId = r.u8();
     uint8_t mode = r.u8();
     v.hasCampaignSave = r.u8();
     v.campaign = r.str();
+    v.campaignSaveCrc = r.u32();
     if (!r.ok() || mode > 1 || v.playerId == 0 || v.playerId > kMaxPlayers) return false;
     v.storyMode = static_cast<StoryMode>(mode);
     return true;
@@ -446,6 +450,8 @@ void write(ByteWriter& w, const Roster& v) {
         w.str(v.players[i].name);
         w.str(v.players[i].avatar);
     }
+    w.u8(v.hasCampaignSave);
+    w.u32(v.campaignSaveCrc);
 }
 bool read(ByteReader& r, Roster& v) {
     v.worldOwner = r.u8();
@@ -461,7 +467,21 @@ bool read(ByteReader& r, Roster& v) {
         if (p.id == 0 || p.id > kMaxPlayers || (seen >> p.id & 1)) return false;
         seen |= uint64_t(1) << p.id;
     }
-    return r.ok();
+    v.hasCampaignSave = r.u8();
+    v.campaignSaveCrc = r.u32();
+    return r.ok() && v.hasCampaignSave <= 1;
+}
+
+void write(ByteWriter& w, const SaveResult& v) {
+    w.u32(v.crc);
+    w.u8(v.stored);
+    w.str(v.reason);
+}
+bool read(ByteReader& r, SaveResult& v) {
+    v.crc = r.u32();
+    v.stored = r.u8();
+    v.reason = r.str();
+    return r.ok() && v.stored <= 1;
 }
 
 void write(ByteWriter& w, const StoryCommandMsg& v) {

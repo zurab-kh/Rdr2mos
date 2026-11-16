@@ -35,6 +35,12 @@ public:
     void setSaveStore(ISaveStore* store) { store_ = store; }
     void setMode(StoryMode mode) { mode_ = mode; }
     void setCampaignHasSave(bool has) { campaignHasSave_ = has; }
+    // What the server holds for the campaign (from Welcome and every Roster): whether it has a save,
+    // and that save's CRC-32 (0: none).
+    void setCampaignSave(bool has, uint32_t crc) {
+        campaignHasSave_ = has;
+        campaignSaveCrc_ = crc;
+    }
 
     // Call every frame. `peers` are the other players we know the state of.
     void tick(uint32_t nowMs, const PlayerState& local, const std::vector<Peer>& peers, uint8_t worldOwner, uint8_t me);
@@ -110,6 +116,7 @@ private:
     uint64_t lastStamp_ = 0;
     bool stampKnown_ = false, seedChecked_ = false;
     bool campaignHasSave_ = true;
+    uint32_t campaignSaveCrc_ = 0;
     // the newest file the server and we agree on (sent up, or received): never sent again by itself
     uint32_t uploadedCrc_ = 0, downloadedCrc_ = 0;
     bool haveUploadedCrc_ = false, haveDownloadedCrc_ = false;
