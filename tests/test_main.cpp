@@ -1,3 +1,4 @@
+#include <cstring>
 // Tests for the portable core: protocol, link, server, interpolation and the co-op session.
 // The harness (simulated game, network and clusters) is in harness.h; more tests live in the
 // other tests/*.cpp files and register themselves with COOP_TEST.
@@ -949,6 +950,7 @@ static void testSharedStoryFlow() {
     p.guestGame.player.flags = PF_InMission;
     p.run(500);
     CHECK(p.guestGame.held);
+    p.net.loss = 0;  // the Bye is a single datagram: lost, only the link timeout would tell the server
     p.hostLink.stop();
     p.run(300);
     CHECK(!p.guestGame.held && !p.guestGame.playerProtected && !p.guestGame.friendWaypoint);
@@ -1211,7 +1213,8 @@ static void testUdpLoopback() {
     CHECK(!UdpSocket::resolve("127.0.0.1:99999", 1, def));
 }
 
-int main() {
+// Usage: coop_tests [substring...] runs only the tests whose name contains one of the substrings.
+int main(int argc, char** argv) {
     struct Test { const char* name; void (*fn)(); };
     const Test tests[] = {
         {"protocol", testProtocol},
@@ -1240,6 +1243,9 @@ int main() {
     for (const Test& t : tests) all.push_back({t.name, t.fn});
     for (const TestCase& t : testRegistry()) all.push_back(t);
     for (const TestCase& t : all) {
+        bool wanted = argc < 2;
+        for (int i = 1; i < argc && !wanted; ++i) wanted = std::strstr(t.name, argv[i]) != nullptr;
+        if (!wanted) continue;
         int before = g_failures;
         t.fn();
         std::printf("[%s] %s\n", g_failures == before ? " ok " : "FAIL", t.name);

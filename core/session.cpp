@@ -371,7 +371,14 @@ void CoopSession::destroyMirror(Mirror& m, bool recycle) {
 
 void CoopSession::onRoster(const Roster& roster) {
     owner_ = roster.worldOwner;
-    if (!haveRoster_ || roster.worldEpoch != worldEpoch_) resetWorld();  // a different world from now on
+    if (!haveRoster_ || roster.worldEpoch != worldEpoch_) {
+        // A different world from now on. The owner's world info can overtake the first roster (it is
+        // sent unreliably, the roster reliably): the server only passes on the current owner's, so
+        // keep it, or the world would stay hidden until the owner's next one, two seconds later.
+        bool keepInfo = !haveRoster_ && ownerWorldSync_;
+        resetWorld();
+        ownerWorldSync_ = keepInfo;
+    }
     worldEpoch_ = roster.worldEpoch;
     haveRoster_ = true;
     // Puppets of players who left go away; newcomers get one when their state arrives.
