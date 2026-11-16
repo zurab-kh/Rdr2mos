@@ -15,6 +15,9 @@ constexpr uint32_t kHoldSafetyMs = 15 * 60 * 1000;      // a hold the server for
 constexpr uint32_t kOwnKillMs = 5000;                   // a death this soon after we killed ourselves is that kill
 constexpr uint32_t kPendingFailMs = 10 * 60 * 1000;     // longer than any scene: a failure this old is stale
 constexpr uint32_t kDownloadStallMs = 30000;
+// The server answers an upload as soon as its last piece arrives. Once that piece is in the link it
+// takes a few round trips at most; a server that dropped the upload (it refused it) never answers.
+constexpr uint32_t kSaveResultMs = 30000;
 constexpr size_t kSaveWindow = 48;                      // save chunks in flight; leaves room for game traffic
 
 float distance2d(const Vec3& a, const Vec3& b) { return std::hypot(a.x - b.x, a.y - b.y); }
@@ -34,7 +37,8 @@ void StorySync::reset() {
     lastScriptCheckMs_ = sentScript_ = 0;
     mismatch_ = protected_ = holding_ = false;
     holdStartMs_ = 0;
-    regroupPending_ = false;
+    regroupPending_ = regroupDeferred_ = false;
+    worldOwner_ = regroupOwner_ = 0;
     // pendingFail_ stays: the others restart the mission whether or not our connection blipped
     // meanwhile. tick() drops it if the mission ends first.
     camMotion_.clear();
@@ -50,13 +54,18 @@ void StorySync::reset() {
     seedChecked_ = false;
     if (sendingSave_ || uploadUnconfirmed_) uploadAgain_ = true;
     if (receivingSave_) downloadAgain_ = true;
-    up_.clear();
-    up_.shrink_to_fit();
+    dropUpload();
     down_.clear();
     down_.shrink_to_fit();
-    upOffset_ = 0;
     downTotal_ = 0;
-    sendingSave_ = uploadUnconfirmed_ = receivingSave_ = false;
+    receivingSave_ = false;
+}
+
+void StorySync::dropUpload() {
+    sendingSave_ = uploadUnconfirmed_ = false;
+    up_.clear();
+    up_.shrink_to_fit();
+    upOffset_ = 0;
 }
 
 int StorySync::saveProgress() const {
@@ -107,13 +116,19 @@ bool StorySync::startUpload(bool automatic, const std::string& why) {
         return false;
     }
     uint32_t crc = crc32(data.data(), data.size());
-    // A file the server already has: our last upload, or the campaign save we got from it (its copy
-    // becomes our newest file, and the game touches it again when it is loaded).
-    if (automatic && ((haveUploadedCrc_ && crc == uploadedCrc_) || (haveDownloadedCrc_ && crc == downloadedCrc_)))
+    // A file the server already has: our last upload, the campaign save it holds, or the campaign
+    // save we got from it (its copy becomes our newest file, and the game touches it again when it
+    // is loaded). Nor one on its way up already, or one the server turned down: offered again by
+    // itself, it would only be turned down again.
+    if (automatic && ((haveUploadedCrc_ && crc == uploadedCrc_) || (haveDownloadedCrc_ && crc == downloadedCrc_) ||
+                      (campaignHasSave_ && campaignSaveCrc_ && crc == campaignSaveCrc_) ||
+                      ((sendingSave_ || uploadUnconfirmed_) && crc == upCrc_) || (haveRefusedCrc_ && crc == refusedCrc_)))
         return false;
     up_ = std::move(data);
     upCrc_ = crc;
+    upStamp_ = store_->latestStamp();
     upOffset_ = 0;
+    upAsOwner_ = iOwn_;
     sendingSave_ = uploadUnconfirmed_ = true;
     uploadAgain_ = false;
     notify_(why.empty() ? "Uploading your save (" + name + ") to the server..." : why);
@@ -154,6 +169,7 @@ void StorySync::tick(uint32_t nowMs, const PlayerState& local, const std::vector
     const bool localMission = lf & PF_InMission, localCut = lf & PF_Cutscene, localDead = lf & PF_Dead;
     const bool iOwn = worldOwner == me;
     iOwn_ = iOwn;
+    worldOwner_ = worldOwner;
     if (first_) {
         prevLocal_ = lf;  // a state that already holds is not an event
         first_ = false;
@@ -198,9 +214,23 @@ void StorySync::tick(uint32_t nowMs, const PlayerState& local, const std::vector
     setWorldHeld(holding_ && (worldHeld_ || !localCut));
 
     // --- move to the mission start, once our own scene is over
+    if (regroupPending_ && !regroupOwner_) regroupOwner_ = worldOwner;  // came in before our first frame
+    if (regroupPending_ && regroupOwner_ != worldOwner) regroupPending_ = false;  // toward an owner who is gone
+    if (regroupPending_ && localCut) regroupDeferred_ = true;
     if (regroupPending_ && !localCut) {
         regroupPending_ = false;
-        regroup();
+        bool go = true;
+        if (regroupDeferred_) {
+            // The position is where the owner stood when the mission started, and scenes move players
+            // (an intro often ends somewhere else): aim at where the owner is now. A "start it here
+            // too" is done once our scene has put us in a mission ourselves: moving us would take us
+            // out of that mission's area.
+            auto owner = std::find_if(peers.begin(), peers.end(), [&](const Peer& p) { return p.id == worldOwner; });
+            if (owner == peers.end() || (!regroupWasInMission_ && localMission)) go = false;
+            else regroupPos_ = owner->pos;
+        }
+        regroupDeferred_ = false;
+        if (go) regroup();
     }
 
     // --- protection: nobody can help us while the others are in a scene
@@ -262,20 +292,19 @@ void StorySync::tick(uint32_t nowMs, const PlayerState& local, const std::vector
     }
 
     // --- campaign saves
-    if ((sendingSave_ || uploadUnconfirmed_) && !iOwn && campaignHasSave_) {
-        // The world changed hands: the server takes the campaign save from the new owner only, so
-        // pieces still on their way are dropped there.
-        if (sendingSave_) notify_("The world now belongs to another player - your save was not uploaded");
-        sendingSave_ = uploadUnconfirmed_ = false;
-        up_.clear();
-        up_.shrink_to_fit();
+    if (sendingSave_ && !iOwn && campaignHasSave_) {
+        // The world changed hands, or the campaign got its first save from the owner while ours
+        // went up: the server takes the campaign save from the owner only, so the pieces still to
+        // come would be dropped there. One fully sent already waits for the server's answer: it
+        // may have arrived while we still owned the world.
+        notify_(upAsOwner_ ? "The world now belongs to another player - your save was not uploaded"
+                           : "The world owner has saved the campaign meanwhile - your save was not uploaded");
+        dropUpload();
     }
-    if (uploadUnconfirmed_ && !sendingSave_ && link_.pendingReliable() == 0) {
-        // Every piece is acknowledged: the server has the file.
-        uploadUnconfirmed_ = false;
-        uploadedCrc_ = upCrc_;
-        haveUploadedCrc_ = true;
-        campaignHasSave_ = true;
+    if (uploadUnconfirmed_ && !sendingSave_ && nowMs - upQueuedMs_ > kSaveResultMs) {
+        // No answer: the server dropped the upload (a server that refuses without saying so).
+        dropUpload();
+        notify_("The server did not confirm your save upload - it was probably not stored");
     }
     if (uploadAgain_ && !sendingSave_) {
         // An upload the connection cut off.
@@ -296,21 +325,32 @@ void StorySync::tick(uint32_t nowMs, const PlayerState& local, const std::vector
     }
     // Every new save of the world owner goes to the server. Everybody keeps track of their save
     // files, so a player who takes over the world later only sends saves made from then on.
-    if (store_ && (!seedChecked_ || nowMs - lastStampCheckMs_ >= kSaveCheckMs)) {
+    // The first check of a connection waits for an upload that runs (one resumed after a reconnect):
+    // it decides about the same file, and a busy check would only come back every frame.
+    if (store_ && ((!seedChecked_ && !sendingSave_) || nowMs - lastStampCheckMs_ >= kSaveCheckMs)) {
         lastStampCheckMs_ = nowMs;
         uint64_t stamp = store_->latestStamp();
-        bool seed = false;
+        bool seed = false, catchUp = false;
         if (!seedChecked_) {
             // A new campaign starts from the save of the player who owns the world when we arrive.
             seedChecked_ = true;
             seed = iOwn && !campaignHasSave_ && stamp;
+            // As the owner of a campaign that has a save: our newest file goes up if the server does
+            // not have it. That is a save made just before we quit last time (the session ended
+            // before the check saw it, or during its upload) or while we were offline. startUpload()
+            // leaves out what the server has, gave us, or turned down; a file it already answered
+            // for is not even read again.
+            catchUp = iOwn && campaignHasSave_ && campaignSaveCrc_ && stamp && stamp != answeredStamp_;
         }
         bool fresh = stampKnown_ && stamp && stamp != lastStamp_;
-        bool upload = config_.autoUploadSaves && iOwn && (fresh || seed);
+        bool upload = config_.autoUploadSaves && iOwn && (fresh || seed || catchUp);
         if (upload && sendingSave_) {
-            if (seed) seedChecked_ = false;  // busy: this save goes up on a later check
+            if (seed || catchUp) seedChecked_ = false;  // busy: this save goes up on a later check
         } else {
-            if (upload) startUpload(true, fresh ? "New save detected - uploading it to the server..." : "");
+            if (upload)
+                startUpload(true, fresh     ? "New save detected - uploading it to the server..."
+                                  : catchUp ? "Uploading your newest save - the server does not have it yet..."
+                                            : "");
             lastStamp_ = stamp;
             stampKnown_ = true;
         }
@@ -344,6 +384,9 @@ void StorySync::handle(Msg type, uint8_t from, const uint8_t* data, size_t size,
                     break;
                 case StoryCmd::Regroup:
                     regroupPending_ = true;  // carried out by tick(), after any running scene
+                    regroupDeferred_ = false;
+                    regroupOwner_ = worldOwner_;
+                    regroupWasInMission_ = local_.flags & PF_InMission;
                     regroupPos_ = cmd.pos;
                     regroupDistance_ = cmd.distance;
                     regroupText_ = cmd.text;
@@ -387,6 +430,11 @@ void StorySync::handle(Msg type, uint8_t from, const uint8_t* data, size_t size,
             if (receivingSave_ && decode(data, size, c)) receiveSaveChunk(c, nowMs);
             return;
         }
+        case Msg::SaveResult: {
+            SaveResult r;
+            if (decode(data, size, r)) uploadAnswered(r);
+            return;
+        }
         default:
             return;
     }
@@ -404,10 +452,29 @@ void StorySync::sendSaveChunks() {
         link_.send(Msg::SaveChunk, c, true);
         upOffset_ += n;
         if (upOffset_ >= up_.size()) {
-            sendingSave_ = false;  // uploadUnconfirmed_ until the server has acknowledged every piece
+            sendingSave_ = false;  // uploadUnconfirmed_ until the server's SaveResult
+            upQueuedMs_ = nowMs_;
             up_.clear();
             up_.shrink_to_fit();
         }
+    }
+}
+
+void StorySync::uploadAnswered(const SaveResult& r) {
+    // Only the answer for the upload that runs counts. Pieces of an earlier one that the link still
+    // delivered can be answered after we started another (a newer save, a resend after a reconnect).
+    if (!(sendingSave_ || uploadUnconfirmed_) || r.crc != upCrc_) return;
+    answeredStamp_ = upStamp_;
+    dropUpload();
+    if (r.stored) {
+        uploadedCrc_ = r.crc;
+        haveUploadedCrc_ = true;
+        campaignHasSave_ = true;
+        campaignSaveCrc_ = r.crc;  // the Roster that follows says the same
+    } else {
+        refusedCrc_ = r.crc;
+        haveRefusedCrc_ = true;
+        notify_(r.reason.empty() ? std::string("The server did not take your save") : "Save not uploaded: " + r.reason);
     }
 }
 
