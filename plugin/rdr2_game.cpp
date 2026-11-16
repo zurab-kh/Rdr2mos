@@ -25,6 +25,7 @@ constexpr uint32_t kAliveMs = 250;       // our own (persistent) entities are no
 constexpr uint32_t kOwnHorsesMs = 500;
 constexpr uint32_t kMaxHealthMs = 1000;
 constexpr uint32_t kInfoKeepMs = 10000;  // forget handles not asked about for this long
+constexpr size_t kMaxAdopted = 8;         // adopted mirrors kept as the player's (oldest dropped)
 // World scan: an entity far out of range cannot be in range before it could have covered the gap
 // (nothing but trains moves faster than this), so its position is not re-read every scan.
 constexpr float kMaxScanSpeed = 30.0f;   // m/s
@@ -215,6 +216,11 @@ void Rdr2Game::refreshOwnHorses(bool force) {
     if (playerVehicle_)
         for (int harness = 0; harness < kDraftHarnesses; ++harness)
             if (int horse = n::GET_PED_IN_DRAFT_HARNESS(playerVehicle_, harness)) ownHorses_.push_back(horse);
+    // Adopted mirrors stay the player's until the game cleans them up (they are no longer needed,
+    // so it will once nobody is near). Their draft teams follow through draftOf.
+    adopted_.erase(std::remove_if(adopted_.begin(), adopted_.end(), [](int h) { return !n::DOES_ENTITY_EXIST(h); }),
+                   adopted_.end());
+    ownHorses_.insert(ownHorses_.end(), adopted_.begin(), adopted_.end());
     ownHorsesPed_ = playerPed_;
     ownHorsesMount_ = playerMount_;
     ownHorsesVehicle_ = playerVehicle_;
@@ -256,9 +262,10 @@ LocalPlayer Rdr2Game::readLocalPlayer() {
     s.vel = n::GET_ENTITY_VELOCITY(body);
     s.heading = heading(body);
     s.health = static_cast<uint16_t>(std::clamp(n::GET_ENTITY_HEALTH(playerPed_), 0, 65535));
-    if (due(nowMs_, playerMaxHealthDueMs_)) {
+    if (!haveMaxHealth_ || due(nowMs_, playerMaxHealthDueMs_)) {
         playerMaxHealth_ = n::GET_ENTITY_MAX_HEALTH(playerPed_);
         playerMaxHealthDueMs_ = nowMs_ + kMaxHealthMs;
+        haveMaxHealth_ = true;
     }
     s.maxHealth = static_cast<uint16_t>(std::clamp(playerMaxHealth_, 0, 65535));
     s.weapon = n::GET_PED_CURRENT_HELD_WEAPON(playerPed_);
@@ -707,10 +714,19 @@ bool Rdr2Game::adopt(EntityHandle h) {
     int handle = h;
     n::SET_ENTITY_AS_NO_LONGER_NEEDED(&handle);  // the game may clean it up once nobody uses it
     poolsChanged();
+    // For a guest an ordinary local entity is foreign population, and nothing else keeps a wagon
+    // the player stepped off (there is no last-vehicle equivalent of GET_LAST_MOUNT).
+    if (std::find(adopted_.begin(), adopted_.end(), h) == adopted_.end()) {
+        if (adopted_.size() >= kMaxAdopted) adopted_.erase(adopted_.begin());
+        adopted_.push_back(h);
+    }
+    own_.insert(h);
+    ownHorsesDueMs_ = nowMs_;  // the next frame's refresh takes it into ownHorses_
     return true;
 }
 
 void Rdr2Game::remove(EntityHandle h) {
+    adopted_.erase(std::remove(adopted_.begin(), adopted_.end(), h), adopted_.end());
     auto blip = blips_.find(h);
     if (blip != blips_.end()) {
         n::REMOVE_BLIP(&blip->second);
@@ -744,7 +760,9 @@ bool Rdr2Game::exists(EntityHandle h) {
     if (!(c.have & kHaveExists)) {
         // Our own entities are persistent (mission entities): asking every frame is not needed.
         auto known = isSpawned(h) ? info_.find(h) : info_.end();
-        if (known != info_.end() && !due(nowMs_, known->second.aliveUntilMs)) {
+        // The facts may have been created by another query (kindInfo, the world scan) that never
+        // asked whether it exists: only a deadline this check set itself counts.
+        if (known != info_.end() && known->second.haveAlive && !due(nowMs_, known->second.aliveUntilMs)) {
             c.exists = true;
         } else {
             c.exists = n::DOES_ENTITY_EXIST(h);
@@ -752,6 +770,7 @@ bool Rdr2Game::exists(EntityHandle h) {
                 Info& in = info_[h];
                 in.usedMs = nowMs_;
                 in.aliveUntilMs = nowMs_ + kAliveMs;
+                in.haveAlive = true;
             }
         }
         c.have |= kHaveExists;

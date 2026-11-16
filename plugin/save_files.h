@@ -55,12 +55,17 @@ void eachEntry(const fs::path& dir, F&& f) {
     for (; !ec && it != end; it.increment(ec)) f(*it);
 }
 
-// The newest save of any profile, and the profile it lives in.
+// The newest save of any profile, and the profile it lives in. A save in a profile-looking folder
+// always beats one anywhere else: players keep copies in folders like "backup", which the game
+// never lists, and an Explorer copy keeps the original's time, so it can be the newest (or tie).
+// Other folders only count when no profile holds a save.
 inline bool findLatest(const fs::path& root, Found& out) {
-    bool found = false;
+    bool found = false, foundLooks = false;
     eachEntry(root, [&](const fs::directory_entry& dir) {
         std::error_code ec;
         if (!dir.is_directory(ec)) return;
+        const bool looks = looksLikeProfile(dir.path());
+        if (found && foundLooks && !looks) return;
         eachEntry(dir.path(), [&](const fs::directory_entry& entry) {
             std::error_code e;
             if (!isSaveName(entry.path()) || !entry.is_regular_file(e)) return;
@@ -68,12 +73,13 @@ inline bool findLatest(const fs::path& root, Found& out) {
             if (e) return;
             uintmax_t size = entry.file_size(e);
             if (e) return;
-            if (!found || time > out.time) {
+            if (!found || (looks && !foundLooks) || (looks == foundLooks && time > out.time)) {
                 out.file = entry.path();
                 out.profile = dir.path();
                 out.time = time;
                 out.size = size;
                 found = true;
+                foundLooks = looks;
             }
         });
     });
@@ -159,8 +165,11 @@ public:
             error = "RDR2 save folder not found (start the story once and save)";
             return false;
         }
+        // The profile the player saves in; a save found only in some other folder does not make
+        // that folder a place the game reads, so then a profile-looking folder is chosen instead.
         Found latest;
-        fs::path profile = findLatest(root_, latest) ? latest.profile : pickProfile(root_);
+        fs::path profile =
+            findLatest(root_, latest) && looksLikeProfile(latest.profile) ? latest.profile : pickProfile(root_);
         if (profile.empty()) {
             error = "RDR2 save folder not found (start the story once and save)";
             return false;

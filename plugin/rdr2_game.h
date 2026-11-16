@@ -114,7 +114,9 @@ private:
         bool haveSeen = false;
         uint32_t kindDueMs = 0, ownerDueMs = 0, outfitDueMs = 0, aliveUntilMs = 0;
         uint32_t usedMs = 0;
-        bool haveKind = false, haveOwner = false, haveOutfit = false;
+        // Each deadline above counts only with its flag: 0 is not "due" once the clock (time since
+        // boot) is past 2^31 ms, where the wrap-safe comparison takes it for a time in the future.
+        bool haveKind = false, haveOwner = false, haveOutfit = false, haveAlive = false;
     };
     Info& kindInfo(int h, bool vehicle);   // model, human, player, train
     Info& ownerInfo(int h, bool vehicle);  // + mission, script, draftOf
@@ -153,6 +155,11 @@ private:
     bool ownHorsesFresh_ = false;                   // refreshed this frame already
     int playerMaxHealth_ = 0;
     uint32_t playerMaxHealthDueMs_ = 0;
+    bool haveMaxHealth_ = false;                    // playerMaxHealthDueMs_ is only valid with this
+    // Mirrors adopted into the local world (see adopt()): they stay the player's while they exist,
+    // like the last horse, so a guest who steps off an adopted wagon does not see it deleted as
+    // foreign population. Few: one per mirror the player was riding when its original went away.
+    std::vector<int> adopted_;
     std::unordered_set<int> vehicles_;              // vehicles we created
     std::unordered_map<int, bool> quadruped_;       // peds we created: horse/animal (different gaits)
     uint32_t lastPlayerShotMs_ = 0;

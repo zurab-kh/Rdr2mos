@@ -13,6 +13,7 @@
 #include <string>
 #include <thread>
 
+#include "connection.h"
 #include "hud.h"
 #include "link.h"
 #include "natives.h"
@@ -160,6 +161,12 @@ private:
 };
 BuiltInServer g_server;
 
+// The connection to the server outlives the App, like g_server: see connection.h. Only the script
+// thread touches these (scriptMain and App); their constructors make no system calls, so they are
+// safe to build at DLL load.
+UdpSocket g_socket;
+ServerConnection g_connection;
+
 class App {
 public:
     void run() {
@@ -225,11 +232,11 @@ private:
             notify(now, "Nobody else's position is known yet");
         if (hud_.pressed()) showHud_ = !showHud_;
         if (download_.pressed()) {
-            if (!session_ || !link_->connected()) notify(now, "Connect to the server first");
+            if (!session_ || !link().connected()) notify(now, "Connect to the server first");
             else if (!session_->requestCampaignSave()) notify(now, "A download is already running");
         }
         if (upload_.pressed()) {
-            if (!session_ || !link_->connected()) notify(now, "Connect to the server first");
+            if (!session_ || !link().connected()) notify(now, "Connect to the server first");
             else session_->uploadSave();
         }
 
@@ -244,15 +251,21 @@ private:
         }
     }
 
+    Link& link() { return g_connection.link(); }
+
     void connect(uint32_t now) {
+        // Offline here, so no link uses the socket: a connection that does not happen closes it
+        // (it may still be open from before a script restart).
         if (!settings_.problem.empty()) {
             notify(now, settings_.problem);
+            g_socket.close();
             return;
         }
         std::string error;
         if (settings_.hostServer && !g_server.start(settings_, error)) {
             notify(now, "Cannot start the server: " + error);
             logLine("cannot start the built-in server: %s", error.c_str());
+            g_socket.close();
             return;
         }
         LinkConfig config;
@@ -265,15 +278,17 @@ private:
         std::string address = settings_.hostServer ? "127.0.0.1" : settings_.serverAddress;
         if (!UdpSocket::resolve(address, static_cast<uint16_t>(settings_.port), config.remote)) {
             notify(now, "Cannot resolve server address: " + address);
+            g_socket.close();
             return;
         }
-        if (!socket_.open(0, &error)) {
+        // After a script restart the socket is still open: the same port, so the server sees this
+        // player coming back rather than a stranger next to a ghost of them.
+        if (!g_socket.isOpen() && !g_socket.open(0, &error)) {
             notify(now, error);
             return;
         }
-        link_ = std::make_unique<Link>();
-        link_->start(&socket_, config, now);
-        session_ = std::make_unique<CoopSession>(game_, *link_, settings_.session);
+        g_connection.start(&g_socket, config, now);
+        session_ = std::make_unique<CoopSession>(game_, link(), settings_.session);
         session_->setSaveStore(&saves_);
         online_ = true;
         g_reconnect = true;
@@ -283,10 +298,9 @@ private:
 
     void disconnect() {
         if (session_) session_->cleanup();
-        if (link_) link_->stop();
+        g_connection.stop();
         session_.reset();
-        link_.reset();
-        socket_.close();
+        g_socket.close();
         online_ = false;
         logLine("disconnected");
     }
@@ -296,15 +310,18 @@ private:
             disconnect();
         } catch (...) {
             session_.reset();
-            link_.reset();
-            socket_.close();
+            g_socket.close();
+            try {
+                g_connection.stop();  // the Bye goes nowhere now, but the link is idle again
+            } catch (...) {
+            }
             online_ = false;
         }
         g_reconnect = false;
     }
 
     void trackLinkState(uint32_t now) {
-        Link::State state = link_->state();
+        Link::State state = link().state();
         if (state == lastState_) return;
         if (state == Link::State::Connected) {
             notify(now, "Connected to the server");
@@ -313,7 +330,7 @@ private:
             notify(now, "Lost the server - reconnecting...");
             logLine("server lost");
         } else if (state == Link::State::Failed) {
-            logLine("link failed: %s", link_->error().c_str());
+            logLine("link failed: %s", link().error().c_str());
         }
         lastState_ = state;
     }
@@ -345,11 +362,11 @@ private:
         if (!online_) {
             std::snprintf(line, sizeof(line), "Co-op: offline  [%s] connect", toggle);
             hud::drawText(line, x, y, 0.30f, 200, 200, 200);
-        } else if (link_->state() == Link::State::Failed) {
-            hud::drawText("Co-op: " + link_->error(), x, y, 0.30f, 255, 110, 90);
+        } else if (link().state() == Link::State::Failed) {
+            hud::drawText("Co-op: " + link().error(), x, y, 0.30f, 255, 110, 90);
         } else if (!session_->status().denied.empty()) {
             hud::drawText("Co-op: the server refused: " + session_->status().denied, x, y, 0.30f, 255, 110, 90);
-        } else if (link_->state() != Link::State::Connected || !session_->status().welcomed) {
+        } else if (link().state() != Link::State::Connected || !session_->status().welcomed) {
             std::snprintf(line, sizeof(line), "Co-op: connecting to %s...",
                           settings_.hostServer ? "the built-in server" : settings_.serverAddress.c_str());
             hud::drawText(line, x, y, 0.30f, 240, 220, 120);
@@ -357,8 +374,8 @@ private:
             const SessionStatus& st = session_->status();
             std::snprintf(line, sizeof(line), "Co-op \"%s\": %d player%s  |  world: %s  |  ping %d ms  |  up %.1f / down %.1f KB/s",
                           settings_.campaign.c_str(), st.players, st.players == 1 ? "" : "s",
-                          st.worldOwner ? "you" : st.ownerName.c_str(), link_->pingMs() < 0 ? 0 : link_->pingMs(),
-                          link_->sendRate() / 1024.0f, link_->receiveRate() / 1024.0f);
+                          st.worldOwner ? "you" : st.ownerName.c_str(), link().pingMs() < 0 ? 0 : link().pingMs(),
+                          link().sendRate() / 1024.0f, link().receiveRate() / 1024.0f);
             hud::drawText(line, x, y, 0.30f, 140, 230, 140);
             if (st.players > 1 && (st.peerVisible || st.peerDistance > 0)) {
                 std::snprintf(line, sizeof(line), "nearest: %s %.0f m%s%s  |  smoothing %d ms  [%s] teleport",
@@ -393,9 +410,7 @@ private:
     settings::Settings settings_;
     Rdr2Game game_;
     Rdr2SaveStore saves_;
-    UdpSocket socket_;
-    std::unique_ptr<Link> link_;
-    std::unique_ptr<CoopSession> session_;
+    std::unique_ptr<CoopSession> session_;  // runs on g_connection's link
     bool online_ = false;
     bool showHud_ = true;
     bool wantAutoConnect_ = false;
@@ -408,8 +423,14 @@ private:
 
 std::unique_ptr<App> g_app;
 
-// Script Hook calls this on its script thread, again after every save load.
+// Script Hook calls this on its script thread, again after every save load. The previous
+// instance's fiber is gone by then (never resumed, its stack not unwound): its App is dropped first,
+// since its session refers to the link, and then the session it left behind is ended with a Bye,
+// at once, instead of lingering on the server until the link times out. The reconnect, if the
+// player was online, follows from the same port once the game is ready (g_reconnect).
 void scriptMain() {
+    g_app.reset();
+    g_connection.retire(g_socket.isOpen() ? &g_socket : nullptr);
     g_app = std::make_unique<App>();
     g_app->run();
 }
