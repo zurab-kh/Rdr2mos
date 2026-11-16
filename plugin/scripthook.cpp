@@ -1,6 +1,14 @@
 #include "scripthook.h"
 
+#include <windows.h>
+
+#include <type_traits>
+
 namespace scripthook {
+
+// The portable declarations in scripthook.h must stay ABI-identical to the SDK's.
+static_assert(std::is_same<HMODULE, HINSTANCE__*>::value, "HMODULE must be HINSTANCE__* (STRICT)");
+static_assert(sizeof(DWORD) == sizeof(unsigned long) && sizeof(UINT64) == sizeof(uint64_t), "SDK types");
 
 Api g_api;
 

@@ -7,17 +7,20 @@
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
+#include <exception>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
-#include "config.h"
+#include "hud.h"
 #include "link.h"
 #include "natives.h"
 #include "rdr2_game.h"
 #include "saves.h"
 #include "server.h"
 #include "session.h"
+#include "settings.h"
 
 using namespace coop;
 
@@ -30,29 +33,32 @@ bool g_reconnect = false;
 
 std::string moduleDirectory() {
     char path[MAX_PATH] = {};
-    GetModuleFileNameA(g_module, path, MAX_PATH);
-    std::string dir = path;
+    DWORD n = GetModuleFileNameA(g_module, path, MAX_PATH);
+    std::string dir(path, n < MAX_PATH ? n : 0);
     size_t slash = dir.find_last_of("\\/");
     return slash == std::string::npos ? std::string(".") : dir.substr(0, slash);
 }
 
+// Called from the script thread and from the built-in server's thread.
 void logLine(const char* format, ...) {
-    static std::string path = moduleDirectory() + "\\RDR2Coop.log";
-    FILE* file = std::fopen(path.c_str(), "a");
-    if (!file) return;
-    SYSTEMTIME t;
-    GetLocalTime(&t);
-    std::fprintf(file, "[%02d:%02d:%02d] ", t.wHour, t.wMinute, t.wSecond);
+    static std::mutex mutex;
+    static const std::string path = moduleDirectory() + "\\RDR2Coop.log";
+    char text[1024];
     va_list args;
     va_start(args, format);
-    std::vfprintf(file, format, args);
+    std::vsnprintf(text, sizeof text, format, args);
     va_end(args);
-    std::fputc('\n', file);
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    std::lock_guard<std::mutex> lock(mutex);
+    FILE* file = std::fopen(path.c_str(), "a");
+    if (!file) return;
+    std::fprintf(file, "[%02d:%02d:%02d] %s\n", t.wHour, t.wMinute, t.wSecond, text);
     std::fclose(file);
 }
 
-// Millisecond clock with sub-millisecond precision. GetTickCount() only advances every
-// 10-16 ms, which would show up as visible stutter in the interpolation.
+// Millisecond clock from the performance counter. GetTickCount() only advances every 10-16 ms,
+// which would show up as visible stutter in the interpolation. Used by both threads.
 uint32_t clockMs() {
     static const double ticksPerMs = [] {
         LARGE_INTEGER f;
@@ -61,18 +67,7 @@ uint32_t clockMs() {
     }();
     LARGE_INTEGER c;
     QueryPerformanceCounter(&c);
-    return static_cast<uint32_t>(static_cast<uint64_t>(c.QuadPart / ticksPerMs));
-}
-
-// "F7", "K", "5" ... -> virtual key code (0 = unknown / disabled).
-int parseKey(std::string name) {
-    for (char& c : name) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    if (name.size() >= 2 && name[0] == 'F') {
-        int number = std::atoi(name.c_str() + 1);
-        if (number >= 1 && number <= 24) return VK_F1 + number - 1;
-    }
-    if (name.size() == 1 && ((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= '0' && name[0] <= '9'))) return name[0];
-    return 0;
+    return static_cast<uint32_t>(static_cast<uint64_t>(static_cast<double>(c.QuadPart) / ticksPerMs));
 }
 
 bool gameHasFocus() {
@@ -86,7 +81,7 @@ public:
     explicit Hotkey(int vk = 0) : vk_(vk) {}
     // True once per key press.
     bool pressed() {
-        bool down = vk_ && gameHasFocus() && (GetAsyncKeyState(vk_) & 0x8000);
+        bool down = vk_ && (GetAsyncKeyState(vk_) & 0x8000) && gameHasFocus();
         bool edge = down && !wasDown_;
         wasDown_ = down;
         return edge;
@@ -97,97 +92,62 @@ private:
     bool wasDown_ = false;
 };
 
-struct Settings {
-    std::string serverAddress;
-    bool hostServer = false;
-    int port = kDefaultPort;
-    std::string campaign = "default";
-    std::string password;
-    bool wantsWorld = false;
-    std::string name = "Player";
-    std::string avatar = "player_zero";
-    bool autoConnect = false;
-    bool showHud = true;
-    SessionConfig session;
-    ServerConfig server;  // used by the built-in server
-    std::string toggleKey = "F7", teleportKey = "F8", hudKey = "F9", downloadKey = "F10", uploadKey = "F11";
-    std::string problem;  // configuration error to show on screen
-
-    void load(const std::string& path) {
-        IniFile ini;
-        if (!ini.load(path)) {
-            problem = "RDR2Coop.ini not found next to RDR2Coop.asi";
-            return;
-        }
-        serverAddress = ini.get("network", "server");
-        hostServer = ini.getBool("network", "host_server", false);
-        port = ini.getInt("network", "port", kDefaultPort);
-        if (port <= 0 || port > 65535) problem = "RDR2Coop.ini: bad port";
-        campaign = ini.get("network", "campaign", "default");
-        password = ini.get("network", "password");
-        autoConnect = ini.getBool("network", "auto_connect", false);
-        wantsWorld = ini.getBool("network", "world_owner", hostServer);
-        if (!hostServer && serverAddress.empty())
-            problem = "RDR2Coop.ini: set server = <address> or host_server = 1";
-
-        name = ini.get("player", "name", "Player").substr(0, 24);
-        avatar = ini.get("player", "avatar", wantsWorld ? "player_zero" : "player_three");
-
-        session.worldSync = ini.getBool("sync", "world_sync", true);
-        session.friendlyFire = ini.getBool("sync", "friendly_fire", false);
-        session.syncClock = ini.getBool("sync", "sync_clock", true);
-        session.syncWeather = ini.getBool("sync", "sync_weather", true);
-        session.softCorrection = ini.getBool("sync", "soft_correction", true);
-        session.npcRadius = std::clamp(ini.getFloat("sync", "radius", 150.0f), 30.0f, 400.0f);
-        session.maxPeds = std::clamp(ini.getInt("sync", "max_peds", 64), 0, 200);
-        session.maxVehicles = std::clamp(ini.getInt("sync", "max_vehicles", 16), 0, 64);
-        session.autoRegroup = ini.getBool("story", "auto_regroup", true);
-        session.spectate = ini.getBool("story", "spectate", true);
-        session.syncWaypoints = ini.getBool("story", "sync_waypoints", true);
-        session.autoUploadSaves = ini.getBool("story", "auto_upload_saves", true);
-
-        std::string mode = ini.get("server", "mode", "shared");
-        if (mode == "shared") server.storyMode = StoryMode::Shared;
-        else if (mode == "host") server.storyMode = StoryMode::HostWorld;
-        else problem = "RDR2Coop.ini: [server] mode must be shared or host";
-        server.password = password;
-        server.maxPlayers = std::clamp(ini.getInt("server", "max_players", 8), 1, static_cast<int>(kMaxPlayers));
-        server.cutsceneBarrier = ini.getBool("server", "cutscene_barrier", true);
-        server.barrierTimeoutMs = static_cast<uint32_t>(std::clamp(ini.getInt("server", "barrier_timeout", 120), 10, 1800)) * 1000u;
-        server.sharedFail = ini.getBool("server", "shared_fail", true);
-        server.regroupDistance = std::clamp(ini.getFloat("server", "regroup_distance", 150.0f), 20.0f, 5000.0f);
-
-        toggleKey = ini.get("keys", "toggle", "F7");
-        teleportKey = ini.get("keys", "teleport_to_friend", "F8");
-        hudKey = ini.get("keys", "hud", "F9");
-        downloadKey = ini.get("keys", "download_campaign_save", "F10");
-        uploadKey = ini.get("keys", "upload_save", "F11");
-        showHud = ini.getBool("hud", "show", true);
-    }
-};
-
 // The built-in server runs on its own thread: it needs nothing from the game, so it keeps
 // serving the others even while this game sits in a loading screen (when scripts are paused).
+// It shares nothing with the script thread but logLine() and clockMs().
 class BuiltInServer {
 public:
-    bool start(const Settings& s, std::string& error) {
+    bool start(const settings::Settings& s, std::string& error) {
         if (thread_.joinable()) return true;  // already running (survives script restarts)
         if (!socket_.open(static_cast<uint16_t>(s.port), &error)) return false;
         storage_ = std::make_unique<FileStorage>(moduleDirectory() + "\\RDR2Coop-server");
         server_ = std::make_unique<Server>(socket_, s.server, *storage_);
         stop_ = false;
+        running_ = true;
         thread_ = std::thread([this] {
+            uint32_t failures = 0;
             while (!stop_) {
-                socket_.waitReadable(5);
-                server_->pump(clockMs());
+                try {
+                    socket_.waitReadable(5);
+                    server_->pump(clockMs());
+                    failures = 0;
+                } catch (const std::exception& e) {
+                    // A full disk or an unreadable campaign folder must not take the game down:
+                    // log it, back off, keep serving.
+                    if (failures++ < 5) logLine("built-in server error: %s", e.what());
+                    Sleep(failures < 5 ? 50 : 1000);
+                } catch (...) {
+                    if (failures++ < 5) logLine("built-in server error");
+                    Sleep(failures < 5 ? 50 : 1000);
+                }
             }
+            running_ = false;
         });
         logLine("built-in server running on UDP port %d", s.port);
         return true;
     }
-    void stop() {
+
+    // From DllMain, under the loader lock: the thread can never be joined there (its exit needs
+    // that lock).
+    void stop(bool processExit) {
         stop_ = true;
-        if (thread_.joinable()) thread_.detach();  // never block the loader lock in DllMain
+        if (!thread_.joinable()) return;
+        if (processExit) {
+            // Windows has already killed the thread, perhaps in the middle of a file write:
+            // nothing it owned may be touched any more, so it is abandoned, not destroyed.
+            thread_.detach();
+            (void)server_.release();
+            (void)storage_.release();
+            return;
+        }
+        // The DLL is being unloaded: wait for the thread to leave our code first.
+        for (int i = 0; i < 200 && running_; ++i) Sleep(5);
+        if (!running_) Sleep(20);  // let it get from the loop into the thread exit
+        thread_.detach();
+        if (running_) {  // stuck: leak it rather than free what it uses
+            (void)server_.release();
+            (void)storage_.release();
+        }
     }
 
 private:
@@ -196,6 +156,7 @@ private:
     std::unique_ptr<Server> server_;
     std::thread thread_;
     std::atomic<bool> stop_{false};
+    std::atomic<bool> running_{false};
 };
 BuiltInServer g_server;
 
@@ -203,56 +164,38 @@ class App {
 public:
     void run() {
         settings_.load(moduleDirectory() + "\\RDR2Coop.ini");
-        toggle_ = Hotkey(parseKey(settings_.toggleKey));
-        teleport_ = Hotkey(parseKey(settings_.teleportKey));
-        hud_ = Hotkey(parseKey(settings_.hudKey));
-        download_ = Hotkey(parseKey(settings_.downloadKey));
-        upload_ = Hotkey(parseKey(settings_.uploadKey));
+        toggle_ = Hotkey(settings_.toggleKey.vk);
+        teleport_ = Hotkey(settings_.teleportKey.vk);
+        hud_ = Hotkey(settings_.hudKey.vk);
+        download_ = Hotkey(settings_.downloadKey.vk);
+        upload_ = Hotkey(settings_.uploadKey.vk);
         showHud_ = settings_.showHud;
         logLine("RDR2 Co-op started: server=%s campaign=%s%s%s",
                 settings_.hostServer ? "built-in" : settings_.serverAddress.c_str(), settings_.campaign.c_str(),
                 settings_.problem.empty() ? "" : " CONFIG ERROR: ", settings_.problem.c_str());
+        for (const std::string& w : settings_.warnings) logLine("%s", w.c_str());
+        uint32_t start = clockMs();
+        if (!settings_.problem.empty()) notify(start, settings_.problem);
+        else if (!settings_.warnings.empty()) notify(start, settings_.warnings.front());
 
-        bool wantAutoConnect = settings_.autoConnect || g_reconnect;
+        wantAutoConnect_ = settings_.autoConnect || g_reconnect;
         for (;;) {
             uint32_t now = clockMs();
             LARGE_INTEGER workStart;
             QueryPerformanceCounter(&workStart);
             uint32_t nativesBefore = native::g_nativeCalls;
-            game_.frame(now);
-
-            if (wantAutoConnect && game_.ready()) {
-                wantAutoConnect = false;
-                connect(now);
-            }
-            if (toggle_.pressed()) {
-                if (online_) {
-                    disconnect();
-                    g_reconnect = false;
-                } else {
-                    connect(now);
-                }
-            }
-            if (teleport_.pressed() && session_ && !session_->teleportToPeer())
-                notify(now, "Nobody else's position is known yet");
-            if (hud_.pressed()) showHud_ = !showHud_;
-            if (download_.pressed()) {
-                if (!session_ || !link_->connected()) notify(now, "Connect to the server first");
-                else if (!session_->requestCampaignSave()) notify(now, "A download is already running");
-            }
-            if (upload_.pressed()) {
-                if (!session_ || !link_->connected()) notify(now, "Connect to the server first");
-                else session_->uploadSave();
-            }
-
-            if (online_) {
-                session_->tick(now);
-                trackLinkState(now);
-                std::string text;
-                while (session_->popNotice(text)) {
-                    notify(now, text);
-                    logLine("%s", text.c_str());
-                }
+            try {
+                tick(now);
+            } catch (const std::exception& e) {
+                // Never let an error escape into Script Hook (that ends the game): drop the
+                // session, say so, and keep the game running.
+                logLine("error: %s", e.what());
+                notify(now, "Co-op stopped after an error (see RDR2Coop.log) - press the toggle key to reconnect");
+                safeDisconnect();
+            } catch (...) {
+                logLine("error");
+                notify(now, "Co-op stopped after an error (see RDR2Coop.log)");
+                safeDisconnect();
             }
             measureWork(workStart, native::g_nativeCalls - nativesBefore);
             if (showHud_) drawHud(now);
@@ -261,6 +204,46 @@ public:
     }
 
 private:
+    void tick(uint32_t now) {
+        // Connecting happens before the game layer's frame, so a fresh session starts on a frame
+        // that has all of the player's data (the offline frame only does the safety checks).
+        if (wantAutoConnect_ && game_.ready()) {
+            wantAutoConnect_ = false;
+            connect(now);
+        }
+        if (toggle_.pressed()) {
+            if (online_) {
+                disconnect();
+                g_reconnect = false;
+            } else {
+                connect(now);
+            }
+        }
+        game_.frame(now, online_);
+
+        if (teleport_.pressed() && session_ && !session_->teleportToPeer())
+            notify(now, "Nobody else's position is known yet");
+        if (hud_.pressed()) showHud_ = !showHud_;
+        if (download_.pressed()) {
+            if (!session_ || !link_->connected()) notify(now, "Connect to the server first");
+            else if (!session_->requestCampaignSave()) notify(now, "A download is already running");
+        }
+        if (upload_.pressed()) {
+            if (!session_ || !link_->connected()) notify(now, "Connect to the server first");
+            else session_->uploadSave();
+        }
+
+        if (online_) {
+            session_->tick(now);
+            trackLinkState(now);
+            std::string text;
+            while (session_->popNotice(text)) {
+                notify(now, text);
+                logLine("%s", text.c_str());
+            }
+        }
+    }
+
     void connect(uint32_t now) {
         if (!settings_.problem.empty()) {
             notify(now, settings_.problem);
@@ -269,6 +252,7 @@ private:
         std::string error;
         if (settings_.hostServer && !g_server.start(settings_, error)) {
             notify(now, "Cannot start the server: " + error);
+            logLine("cannot start the built-in server: %s", error.c_str());
             return;
         }
         LinkConfig config;
@@ -307,6 +291,18 @@ private:
         logLine("disconnected");
     }
 
+    void safeDisconnect() {
+        try {
+            disconnect();
+        } catch (...) {
+            session_.reset();
+            link_.reset();
+            socket_.close();
+            online_ = false;
+        }
+        g_reconnect = false;
+    }
+
     void trackLinkState(uint32_t now) {
         Link::State state = link_->state();
         if (state == lastState_) return;
@@ -341,65 +337,60 @@ private:
         noticeUntil_ = now + 6000;
     }
 
-    static void drawText(const std::string& text, float x, float y, float scale, int r, int g, int b) {
-        native::SET_TEXT_SCALE(scale, scale);
-        native::SET_TEXT_COLOR(r, g, b, 235);
-        native::DISPLAY_TEXT(native::LITERAL_STRING(text.c_str()), x, y);
-    }
-
     void drawHud(uint32_t now) {
         const float x = 0.012f;
         float y = 0.012f;
         char line[256];
+        const char* toggle = settings_.toggleKey.name.c_str();
         if (!online_) {
-            std::snprintf(line, sizeof(line), "Co-op: offline  [%s] connect", settings_.toggleKey.c_str());
-            drawText(line, x, y, 0.30f, 200, 200, 200);
+            std::snprintf(line, sizeof(line), "Co-op: offline  [%s] connect", toggle);
+            hud::drawText(line, x, y, 0.30f, 200, 200, 200);
         } else if (link_->state() == Link::State::Failed) {
-            drawText("Co-op: " + link_->error(), x, y, 0.30f, 255, 110, 90);
+            hud::drawText("Co-op: " + link_->error(), x, y, 0.30f, 255, 110, 90);
         } else if (!session_->status().denied.empty()) {
-            drawText("Co-op: the server refused: " + session_->status().denied, x, y, 0.30f, 255, 110, 90);
+            hud::drawText("Co-op: the server refused: " + session_->status().denied, x, y, 0.30f, 255, 110, 90);
         } else if (link_->state() != Link::State::Connected || !session_->status().welcomed) {
             std::snprintf(line, sizeof(line), "Co-op: connecting to %s...",
                           settings_.hostServer ? "the built-in server" : settings_.serverAddress.c_str());
-            drawText(line, x, y, 0.30f, 240, 220, 120);
+            hud::drawText(line, x, y, 0.30f, 240, 220, 120);
         } else {
             const SessionStatus& st = session_->status();
             std::snprintf(line, sizeof(line), "Co-op \"%s\": %d player%s  |  world: %s  |  ping %d ms  |  up %.1f / down %.1f KB/s",
                           settings_.campaign.c_str(), st.players, st.players == 1 ? "" : "s",
                           st.worldOwner ? "you" : st.ownerName.c_str(), link_->pingMs() < 0 ? 0 : link_->pingMs(),
                           link_->sendRate() / 1024.0f, link_->receiveRate() / 1024.0f);
-            drawText(line, x, y, 0.30f, 140, 230, 140);
+            hud::drawText(line, x, y, 0.30f, 140, 230, 140);
             if (st.players > 1 && (st.peerVisible || st.peerDistance > 0)) {
                 std::snprintf(line, sizeof(line), "nearest: %s %.0f m%s%s  |  smoothing %d ms  [%s] teleport",
                               st.peerName.c_str(), st.peerDistance, st.peerDead ? "  |  DEAD" : "",
-                              st.peerInMission ? "  |  in mission" : "", st.bufferMs, settings_.teleportKey.c_str());
-                drawText(line, x, y += 0.026f, 0.28f, 220, 220, 220);
+                              st.peerInMission ? "  |  in mission" : "", st.bufferMs, settings_.teleportKey.name.c_str());
+                hud::drawText(line, x, y += 0.026f, 0.28f, 220, 220, 220);
             }
             if (settings_.session.worldSync) {
                 std::snprintf(line, sizeof(line),
                               st.worldOwner ? "World: %d streamed  |  mod %.2f ms, %.0f calls/frame"
                                             : "World: %d shown  |  mod %.2f ms, %.0f calls/frame",
                               st.syncedEntities, workUs_ / 1000.0, natives_);
-                drawText(line, x, y += 0.026f, 0.28f, 220, 220, 220);
+                hud::drawText(line, x, y += 0.026f, 0.28f, 220, 220, 220);
             }
             const char* storyLine = nullptr;
             if (st.holding) storyLine = "Waiting for the others - the world is paused";
             else if (st.spectating) storyLine = "Watching the world owner's cutscene";
             else if (st.peerInCutscene) storyLine = "Someone is in a cutscene";
-            if (storyLine) drawText(storyLine, x, y += 0.026f, 0.28f, 240, 220, 120);
+            if (storyLine) hud::drawText(storyLine, x, y += 0.026f, 0.28f, 240, 220, 120);
             if (st.missionMismatch)
-                drawText("Different missions! Load the campaign save to play the story together", x, y += 0.026f, 0.28f,
-                         255, 110, 90);
+                hud::drawText("Different missions! Load the campaign save to play the story together", x, y += 0.026f,
+                              0.28f, 255, 110, 90);
             if (st.saveProgress >= 0) {
                 std::snprintf(line, sizeof(line), "Save transfer: %d%%", st.saveProgress);
-                drawText(line, x, y += 0.026f, 0.28f, 240, 220, 120);
+                hud::drawText(line, x, y += 0.026f, 0.28f, 240, 220, 120);
             }
         }
         if (!notice_.empty() && static_cast<int32_t>(noticeUntil_ - now) > 0)
-            drawText(notice_, x, y + 0.03f, 0.32f, 255, 255, 255);
+            hud::drawText(notice_, x, y + 0.03f, 0.32f, 255, 255, 255);
     }
 
-    Settings settings_;
+    settings::Settings settings_;
     Rdr2Game game_;
     Rdr2SaveStore saves_;
     UdpSocket socket_;
@@ -407,6 +398,7 @@ private:
     std::unique_ptr<CoopSession> session_;
     bool online_ = false;
     bool showHud_ = true;
+    bool wantAutoConnect_ = false;
     Link::State lastState_ = Link::State::Idle;
     Hotkey toggle_, teleport_, hud_, download_, upload_;
     std::string notice_;
@@ -424,7 +416,7 @@ void scriptMain() {
 
 }  // namespace
 
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
     static bool hooked = false;
     if (reason == DLL_PROCESS_ATTACH) {
         g_module = module;
@@ -432,8 +424,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         if (hooked) scriptRegister(module, scriptMain);
         else logLine("ScriptHookRDR2.dll not found or too old: the mod stays inactive");
     } else if (reason == DLL_PROCESS_DETACH) {
-        g_server.stop();
-        if (hooked) scriptUnregister(module);
+        bool processExit = reserved != nullptr;  // the process ends (vs. FreeLibrary)
+        g_server.stop(processExit);
+        if (hooked) scriptUnregister(module);  // Script Hook loaded us, so it is detached after us
+        if (processExit) (void)g_app.release();  // its script fiber is gone: nothing to tidy up
     }
     return TRUE;
 }
