@@ -83,6 +83,7 @@ inline Hash GET_ENTITY_SCRIPT(Entity e) {
     return invoke<Hash>(0x2A08A32B6D49906F, e, args);
 }
 inline void SET_ENTITY_AS_MISSION_ENTITY(Entity e) { call(0xDC19C288082E586E, e, 1, 1); }
+inline void SET_ENTITY_AS_NO_LONGER_NEEDED(Entity* e) { call(0x4971D2F8162B9674, e); }
 inline void SET_ENTITY_INVINCIBLE(Entity e, bool on) { call(0xA5C38736C426FCB8, e, on ? 1 : 0); }
 inline void SET_ENTITY_VISIBLE(Entity e, bool on) { call(0x1794B4FCC84D812F, e, on ? 1 : 0); }
 inline void SET_ENTITY_COLLISION(Entity e, bool on) { call(0xF66F820909453B8C, e, on ? 1 : 0, 0); }

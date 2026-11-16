@@ -38,6 +38,8 @@ public:
     bool belongsToLocalPlayer(coop::EntityHandle h) override;
 
     void listNearby(const coop::Vec3& a, const coop::Vec3& b, float radius, std::vector<coop::NearbyEntity>& out) override;
+    void listNearbyAny(const coop::Vec3* points, size_t count, float radius,
+                       std::vector<coop::NearbyEntity>& out) override;
     void readEntity(coop::EntityHandle h, coop::EntityKind kind, coop::EntityRead& out) override;
     void listForeign(std::vector<coop::ForeignEntity>& out) override;
     coop::WorldInfo readWorldInfo() override;
@@ -49,6 +51,7 @@ public:
     void park(coop::EntityHandle h) override;
     void unpark(coop::EntityHandle h, const coop::Vec3& pos, float heading) override;
     void remove(coop::EntityHandle h) override;
+    bool adopt(coop::EntityHandle h) override;
     bool exists(coop::EntityHandle h) override;
     bool isDead(coop::EntityHandle h) override;
     coop::Vec3 position(coop::EntityHandle h) override;

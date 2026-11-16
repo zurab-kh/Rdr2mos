@@ -66,6 +66,7 @@ const Spec kNativeDb[] = {
     {0x47E4E977581C5B55, "PED::IS_PED_RAGDOLL", 1, false},
     {0x4805D2B1D8CF94A9, "ENTITY::GET_ENTITY_VELOCITY", 2, false},
     {0x4859F1FC66A6278E, "PED::IS_PED_IN_COMBAT", 2, false},
+    {0x4971D2F8162B9674, "ENTITY::SET_ENTITY_AS_NO_LONGER_NEEDED", 1, false},
     {0x4A48B6E03BABB4AC, "PED::_SET_PED_PROMPT_NAME", 2, false},
     {0x4AD96EF928BD4F9A, "STREAMING::SET_MODEL_AS_NO_LONGER_NEEDED", 1, false},
     {0x4BEB42AEBCA732E9, "MISC::_GET_PREV_WEATHER_TYPE_HASH_NAME", 0, false},
@@ -395,6 +396,7 @@ World::World() {
     H["ENTITY::IS_ENTITY_A_PED"] = [](World& w) { w.retI(w.e0() && !w.e0()->vehicle); };
     H["ENTITY::_GET_ENTITY_SCRIPT"] = [](World& w) { w.retI(w.e0() && w.e0()->mission ? static_cast<int32_t>(w.e0()->script) : 0); };
     H["ENTITY::SET_ENTITY_AS_MISSION_ENTITY"] = [](World& w) { if (Ent* e = w.e0()) e->mission = true; };
+    H["ENTITY::SET_ENTITY_AS_NO_LONGER_NEEDED"] = [](World& w) { if (Ent* e = w.get(*w.p<int>(0))) e->mission = false; };
     H["ENTITY::SET_ENTITY_VISIBLE"] = [](World& w) { if (Ent* e = w.e0()) e->visible = w.i(1) != 0; };
     H["PED::CREATE_PED"] = [](World& w) {
         int h = w.addPed(w.u(0), w.v3(1));
@@ -821,6 +823,10 @@ COOP_TEST(testPluginEveryNativeMatchesTheDatabase, "plugin: every native call ma
     g.showFriendWaypoint(false, {});
     std::vector<NearbyEntity> nearby;
     g.listNearby({}, {}, 100, nearby);
+    const Vec3 viewers[3] = {{}, {50, 0, 0}, {0, 50, 0}};
+    g.listNearbyAny(viewers, 3, 100, nearby);
+    EntityHandle ridden = g.spawn(EntityKind::Ped, kHorse, {4, 4, 0}, 0, SpawnRole::Mirror);
+    CHECK(g.adopt(ridden) && !g.adopt(ridden));
     EntityRead read;
     g.readEntity(npc, EntityKind::Ped, read);
     CHECK(read.state.script == 42 && (read.state.flags & NF_InCombat) && (read.state.flags & NF_Aiming));
@@ -1241,5 +1247,54 @@ COOP_TEST(testPluginCalledHorseIsOwn, "plugin: a horse the player just called is
     int wild = w.addPed(kHorse, {6, 0, 0});
     s.step();
     CHECK(s.listed(wild) && !s.game.belongsToLocalPlayer(wild));
+    CHECK(w.problems.empty());
+}
+
+COOP_TEST(testPluginNearbyAnyAndAdopt, "plugin: one scan for any number of viewers, mirrors adopted by the local world") {
+    Solo s;
+    World& w = s.world;
+    // Four viewers spread over the map: every entity near any of them is listed exactly once.
+    const Vec3 viewers[4] = {{0, 0, 0}, {400, 0, 0}, {0, 400, 0}, {20, 0, 0}};
+    std::vector<int> near, far;
+    for (int k = 0; k < 4; ++k) near.push_back(w.addPed(kMan, viewers[k] + Vec3{5, 5, 0}));
+    near.push_back(w.addVehicle(kWagon, {10, 0, 0}));  // close to two viewers
+    far.push_back(w.addPed(kMan, {1000, 1000, 0}));
+    s.step();
+    std::vector<NearbyEntity> out;
+    uint64_t calls = s.callsOf([&] { s.game.listNearbyAny(viewers, 4, 150, out); });
+    std::vector<NearbyEntity> again;
+    uint64_t repeat = s.callsOf([&] { s.game.listNearbyAny(viewers, 4, 150, again); });
+    std::printf("    4 viewers: %llu native calls for the scan, %llu for a second one in the same frame\n",
+                static_cast<unsigned long long>(calls), static_cast<unsigned long long>(repeat));
+    CHECK(repeat == 0);
+    for (int h : near) CHECK(std::count_if(out.begin(), out.end(), [&](const NearbyEntity& e) { return e.handle == h; }) == 1);
+    for (int h : far) CHECK(std::none_of(out.begin(), out.end(), [&](const NearbyEntity& e) { return e.handle == h; }));
+    CHECK(out.size() == again.size());
+    // The pair form gives the same answer as before.
+    std::vector<NearbyEntity> pair;
+    s.game.listNearby(viewers[0], viewers[1], 150, pair);
+    for (int h : {near[0], near[1]}) CHECK(std::count_if(pair.begin(), pair.end(), [&](const NearbyEntity& e) { return e.handle == h; }) == 1);
+    CHECK(std::none_of(pair.begin(), pair.end(), [&](const NearbyEntity& e) { return e.handle == near[2]; }));
+
+    // A mirrored horse the player rides becomes an ordinary local horse: kept where it stands,
+    // its AI and damage restored, no longer managed (or removed) by the mod.
+    EntityHandle horse = s.game.spawn(EntityKind::Ped, kHorse, {3, 0, 0}, 90, SpawnRole::Mirror);
+    CHECK(horse && w.get(horse) && w.ents[horse].mission);
+    w.ride(w.playerPed, horse);
+    s.step();
+    CHECK(s.game.adopt(horse));
+    CHECK(w.get(horse) && w.ents[horse].visible && !w.ents[horse].mission);
+    CHECK(!s.game.adopt(horse));       // not ours any more
+    CHECK(!s.game.adopt(w.playerPed)); // never something the mod did not create
+    s.step();
+    // A mirrored wagon with its team: the wagon and the horses stay.
+    EntityHandle wagon = s.game.spawn(EntityKind::Vehicle, kWagon, {60, 0, 0}, 0, SpawnRole::Mirror);
+    int team = w.addPed(kHorse, {60, 0, 0});
+    w.ents[team].draftOf = wagon;
+    w.ents[wagon].harness[0] = team;
+    size_t before = w.ents.size();
+    CHECK(s.game.adopt(wagon));
+    s.step();
+    CHECK(w.ents.size() == before && w.get(wagon) && w.get(team) && w.ents[team].visible);
     CHECK(w.problems.empty());
 }

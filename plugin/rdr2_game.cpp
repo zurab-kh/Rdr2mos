@@ -452,12 +452,23 @@ void Rdr2Game::showFriendWaypoint(bool on, const Vec3& pos) {
 // ---------------------------------------------------------------- world queries
 
 void Rdr2Game::listNearby(const Vec3& a, const Vec3& b, float radius, std::vector<NearbyEntity>& out) {
-    // Called once per viewer in the same frame: the pool and every position are read only once.
+    const Vec3 points[2] = {a, b};
+    listNearbyAny(points, 2, radius, out);
+}
+
+void Rdr2Game::listNearbyAny(const Vec3* points, size_t count, float radius, std::vector<NearbyEntity>& out) {
+    // One pass over the pools for every viewer at once: each entity is listed once, and the pool
+    // and every position are read only once per frame however often this is called.
+    if (!count) return;
     const float r2 = radius * radius;
-    auto inRange = [&](const Vec3& p) {
-        Vec3 da = p - a, db = p - b;
-        return da.x * da.x + da.y * da.y + da.z * da.z <= r2 || db.x * db.x + db.y * db.y + db.z * db.z <= r2;
+    auto within = [&](const Vec3& p, float limit2) {
+        for (size_t i = 0; i < count; ++i) {
+            Vec3 d = p - points[i];
+            if (d.x * d.x + d.y * d.y + d.z * d.z <= limit2) return true;
+        }
+        return false;
     };
+    auto inRange = [&](const Vec3& p) { return within(p, r2); };
     auto farOut = [&](int h) {
         auto it = info_.find(h);
         if (it == info_.end() || !it->second.haveSeen) return false;
@@ -465,9 +476,7 @@ void Rdr2Game::listNearby(const Vec3& a, const Vec3& b, float radius, std::vecto
         uint32_t age = nowMs_ - in.seenMs;
         if (age >= kFarRecheckMs) return false;
         float reach = radius + kMaxScanSpeed * static_cast<float>(age) * 0.001f;
-        Vec3 da = in.seenPos - a, db = in.seenPos - b;
-        float r = reach * reach;
-        return da.x * da.x + da.y * da.y + da.z * da.z > r && db.x * db.x + db.y * db.y + db.z * db.z > r;
+        return !within(in.seenPos, reach * reach);
     };
     auto seen = [&](int h) -> Vec3 {
         Cached& c = cached(h);  // the pool only lists existing entities
@@ -669,6 +678,36 @@ void Rdr2Game::unpark(EntityHandle h, const Vec3& pos, float heading) {
         n::SET_BLOCKING_OF_NON_TEMPORARY_EVENTS(h, true);  // still driven by us, not by its own AI
         n::SET_ENTITY_HEALTH(h, n::GET_ENTITY_MAX_HEALTH(h), 0);
     }
+}
+
+bool Rdr2Game::adopt(EntityHandle h) {
+    // A mirror the player is riding or driving when its original goes away: it becomes an ordinary
+    // entity of this world, where it stands, instead of vanishing under the player.
+    if (!isSpawned(h) || !n::DOES_ENTITY_EXIST(h)) return false;
+    auto blip = blips_.find(h);
+    if (blip != blips_.end()) {
+        n::REMOVE_BLIP(&blip->second);
+        blips_.erase(blip);
+    }
+    npcShots_.erase(h);
+    quadruped_.erase(h);
+    bool vehicle = vehicles_.erase(h) != 0;
+    forget(h);
+    hide(h, false);
+    if (vehicle) {
+        hideDraftAnimals(h, false);
+        for (int harness = 0; harness < kDraftHarnesses; ++harness)
+            if (int horse = n::GET_PED_IN_DRAFT_HARNESS(h, harness)) forget(horse);
+    } else {
+        // Its own AI again, and the local player's weapons hurt it like any other.
+        n::SET_BLOCKING_OF_NON_TEMPORARY_EVENTS(h, false);
+        n::SET_PED_KEEP_TASK(h, false);
+        n::SET_PED_TO_PLAYER_WEAPON_DAMAGE_MODIFIER(h, 1.0f);
+    }
+    int handle = h;
+    n::SET_ENTITY_AS_NO_LONGER_NEEDED(&handle);  // the game may clean it up once nobody uses it
+    poolsChanged();
+    return true;
 }
 
 void Rdr2Game::remove(EntityHandle h) {
