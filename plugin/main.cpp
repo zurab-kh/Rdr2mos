@@ -32,6 +32,12 @@ HMODULE g_module = nullptr;
 // Script Hook restarts the script after every save load; this survives it so the co-op session
 // reconnects on its own instead of making the player press the key again.
 bool g_reconnect = false;
+// Also kept across script restarts: the character the server gave us (asked for again when we
+// reconnect), whose story this is (a ped that is our chosen character cannot tell), and becoming
+// the story hero again when the co-op has ended while we were someone else.
+std::string g_avatar;
+uint32_t g_storyHero = 0;
+HeroRestore g_heroRestore;
 
 std::string moduleDirectory() {
     char path[MAX_PATH] = {};
@@ -172,6 +178,7 @@ class App {
 public:
     void run() {
         settings_.load(moduleDirectory() + "\\RDR2Coop.ini");
+        if (!g_avatar.empty()) settings_.avatar = g_avatar;
         toggle_ = Hotkey(settings_.toggleKey.vk);
         teleport_ = Hotkey(settings_.teleportKey.vk);
         hud_ = Hotkey(settings_.hudKey.vk);
@@ -235,6 +242,12 @@ private:
             }
         }
         game_.frame(now, online_);
+        if (g_heroRestore.pending()) {
+            // The co-op is over (or was, before a script restart): the story hero comes back at
+            // the first safe moment, however long that takes.
+            if (online_) g_heroRestore.cancel();  // a new session takes care of it
+            else g_heroRestore.tick(game_, game_.ready() ? game_.readLocalPlayer().state.flags : 0, now);
+        }
 
         if (teleport_.pressed() && session_ && !session_->teleportToPeer())
             notify(now, "Nobody else's position is known yet");
@@ -278,6 +291,7 @@ private:
         }
         if (menu_.isOpen()) {
             if (!welcomed) menu_.close();
+            game_.blockInput();  // the arrows and Enter are for the menu now
             if (menuUp_.pressed()) menu_.move(-1);
             if (menuDown_.pressed()) menu_.move(+1);
             if (menuBack_.pressed()) menu_.close();
@@ -298,9 +312,10 @@ private:
         }
         // The character the server gave us is the one to ask for when we connect again.
         if (welcomed && !session_->status().character.empty() && session_->status().character != settings_.avatar) {
-            settings_.avatar = session_->status().character;
+            settings_.avatar = g_avatar = session_->status().character;
             logLine("character: %s", settings_.avatar.c_str());
         }
+        if (session_ && session_->storyHero()) g_storyHero = session_->storyHero();
     }
 
     void connect(uint32_t now) {
@@ -340,6 +355,7 @@ private:
         g_connection.start(&g_socket, config, now);
         session_ = std::make_unique<CoopSession>(game_, link(), settings_.session);
         session_->setSaveStore(&saves_);
+        session_->setStoryHero(g_storyHero);
         online_ = true;
         g_reconnect = true;
         lastState_ = Link::State::Idle;
@@ -347,7 +363,10 @@ private:
     }
 
     void disconnect() {
-        if (session_) session_->cleanup();
+        if (session_) {
+            g_heroRestore = session_->heroRestore();
+            session_->cleanup();
+        }
         g_connection.stop();
         session_.reset();
         g_socket.close();

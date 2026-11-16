@@ -36,11 +36,6 @@ const std::vector<CharacterInfo>& characterCatalog() {
     return catalog;
 }
 
-namespace {
-// How many entries at the top of the catalog are certain to exist in every game version.
-constexpr size_t kCertain = 10;
-}  // namespace
-
 bool isStoryHero(uint32_t model) { return model == joaat("player_zero") || model == joaat("player_three"); }
 
 bool isStoryHero(const std::string& avatar) {
@@ -78,8 +73,10 @@ std::string freeCharacter(const std::string& wanted, const std::vector<std::stri
     };
     std::string w = normalizeAvatar(wanted);
     if (!w.empty() && !isTaken(w)) return w;
+    // The certain ones first; past them a model may be missing in some game version (the player's
+    // game then shows its fallback), which still beats a copy of someone else.
     const std::vector<CharacterInfo>& catalog = characterCatalog();
-    for (size_t i = 0; i < catalog.size() && i < kCertain; ++i)
+    for (size_t i = 0; i < catalog.size(); ++i)
         if (!isTaken(catalog[i].model)) return catalog[i].model;
     return w.empty() ? catalog.front().model : w;
 }

@@ -29,6 +29,9 @@ constexpr float kDamagePerSecond = 600, kDamageBurst = 1200;
 //    mission change, a download). Over the budget the sender's messages are read later: it is
 //    slowed down, nothing is lost;
 constexpr float kStoryPerSecond = 20, kStoryBurst = 60;
+// Changing character respawns that player's character in every game: a few in a row, then one every
+// two seconds at most.
+constexpr float kCharacterPerSecond = 0.5f, kCharacterBurst = 3;
 //  * waypoints and appearance go to everyone, and only the latest one counts: over the budget the
 //    latest waits and goes out when the budget allows;
 constexpr float kSharedPerSecond = 10, kSharedBurst = 20;
@@ -183,7 +186,7 @@ struct Server::Client {
     uint32_t uploadCrc = 0, downloadCrc = 0;
     bool uploading = false, downloading = false;
     // limits, and the latest waypoint / appearance waiting for the budget
-    Budget damage, story, shared, bytes;
+    Budget damage, story, shared, bytes, character;
     std::vector<uint8_t> laterWaypoint, laterAppearance;
     bool haveLaterWaypoint = false, haveLaterAppearance = false;
 };
@@ -442,9 +445,12 @@ Server::Verdict Server::allow(Client& c, Msg type, size_t size, uint32_t nowMs) 
         case Msg::SaveChunk:
             // Save uploads are bounded by size, are not passed on, and should go as fast as the line allows.
             return Verdict::Handle;
+        case Msg::CharacterRequest:
+            if (c.character.take(1, kCharacterPerSecond, kCharacterBurst, nowMs)) return Verdict::Handle;
+            notice(c, "Too many character changes - wait a moment");
+            return Verdict::Drop;
         case Msg::Story:
         case Msg::SaveRequest:
-        case Msg::CharacterRequest:
             return c.story.take(1, kStoryPerSecond, kStoryBurst, nowMs) ? Verdict::Handle : Verdict::Wait;
         case Msg::Waypoint:
         case Msg::Appearance: {
@@ -875,6 +881,11 @@ void Server::handle(Client& c, Msg type, const std::vector<uint8_t>& payload, ui
             if (!decode(payload, req)) return;
             std::string want = normalizeAvatar(cleanAvatar(req.avatar));
             if (want.empty() || want == c.avatar) return;
+            const std::vector<CharacterInfo>& catalog = characterCatalog();
+            if (std::none_of(catalog.begin(), catalog.end(), [&](const CharacterInfo& ci) { return want == ci.model; })) {
+                notice(c, "Unknown character");
+                return;
+            }
             for (uint8_t other : camp.ids) {
                 Client* m = member(camp, other);
                 if (m && m != &c && normalizeAvatar(m->avatar) == want) {

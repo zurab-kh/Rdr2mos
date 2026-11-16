@@ -168,7 +168,11 @@ COOP_TEST(testCharactersBecomeAndHeroForStory, "characters: becoming the charact
     CHECK(!b.session->status().playingHero);
 
     // Disconnecting: B leaves the co-op as Arthur, in Arthur's clothes.
+    HeroRestore restore = b.session->heroRestore();
     b.session->cleanup();
+    b.session.reset();
+    CHECK(restore.pending() && restore.hero() == kArthur);
+    CHECK(!restore.tick(b.game, 0, c.now));
     CHECK(b.game.localModelHash == kArthur);
     CHECK(b.game.playerItems == (std::vector<ShopItem>{{0xA1, 0}, {0xA2, 0}}));
 }
@@ -293,4 +297,163 @@ COOP_TEST(testCharactersMenu, "characters: the menu lists what the game has, mar
           menu.cursor() > 6);
     menu.close();
     CHECK(!menu.isOpen() && menu.lines(5).empty());
+}
+
+// ---------------------------------------------------------------- from the review
+
+namespace {
+// The session ends (the player disconnects) while being Charles; the plugin keeps the restore.
+HeroRestore endAsCharles(Cluster& c, Player*& bOut) {
+    c.config.becomeCharacter = true;
+    joinAs(c, "A", "player_zero", true);
+    Player& b = joinAs(c, "B", "cs_charlessmith", false);
+    c.run(5000);
+    CHECK(b.game.localModelHash == kCharles);
+    bOut = &b;
+    HeroRestore r = b.session->heroRestore();
+    b.session->cleanup();
+    b.session.reset();
+    return r;
+}
+}  // namespace
+
+COOP_TEST(testCharactersRestoreWaitsForModel, "characters: back to the hero after the co-op, also when the model still loads") {
+    Cluster c;
+    Player* b = nullptr;
+    HeroRestore r = endAsCharles(c, b);
+    b->game.switchFailures = 3;  // Arthur's model is not loaded yet
+    int frames = 0;
+    for (uint32_t t = c.now; r.tick(b->game, 0, t) && frames < 200; t += 16) ++frames;
+    std::printf("  hero back after %d frames\n", frames);
+    CHECK(!r.pending() && b->game.localModelHash == kArthur);
+}
+
+COOP_TEST(testCharactersRestoreWaitsForGame, "characters: back to the hero after a loading screen, never in a scene") {
+    Cluster c;
+    Player* b = nullptr;
+    HeroRestore r = endAsCharles(c, b);
+    b->game.isReady = false;  // a loading screen
+    uint32_t t = c.now;
+    for (int i = 0; i < 50; ++i) CHECK(r.tick(b->game, 0, t += 16));
+    b->game.isReady = true;
+    int before = b->game.modelSwitches;
+    for (int i = 0; i < 50; ++i) CHECK(r.tick(b->game, PF_Cutscene, t += 16));  // a free-roam scene
+    CHECK(b->game.modelSwitches == before && b->game.localModelHash == kCharles);
+    for (int i = 0; i < 50; ++i) r.tick(b->game, PF_OnMount, t += 16);  // riding: later, on foot
+    CHECK(b->game.localModelHash == kCharles);
+    CHECK(!r.tick(b->game, PF_OnMount | PF_InMission, t += 300));  // but a mission does not wait
+    CHECK(b->game.localModelHash == kArthur);
+}
+
+COOP_TEST(testCharactersNoRestoreOnReconnect, "characters: a dropped connection does not swap the character back and forth") {
+    Cluster c;
+    c.config.becomeCharacter = true;
+    joinAs(c, "A", "player_zero", true);
+    Player& b = joinAs(c, "B", "cs_charlessmith", false);
+    c.run(5000);
+    int switches = b.game.modelSwitches;
+    b.link.start(b.sock, b.linkConfig, c.now);  // a new connection (the old one timed out)
+    c.run(4000);
+    CHECK(b.session->status().welcomed && b.game.localModelHash == kCharles && b.game.modelSwitches == switches);
+}
+
+COOP_TEST(testCharactersKnownHeroAcrossRestart, "characters: after a script restart the story hero is the one kept, not guessed") {
+    {
+        // B chose John and is John in Arthur's chapters when the script restarts.
+        Cluster c;
+        c.config.becomeCharacter = true;
+        Player& a = joinAs(c, "A", "player_zero", true);
+        Player& b = joinAs(c, "B", "player_three", false, [](Player& p) { p.game.localModelHash = kJohn; });
+        c.run(3000);
+        a.game.player.flags |= PF_InMission;
+        c.run(2000);
+        CHECK(b.game.localModelHash == kArthur);  // not knowing, Arthur's story is the likely one
+        CHECK(b.session->heroRestore().pending() == false);
+    }
+    {
+        // The epilogue: the plugin passes the hero it kept (John) to the new session.
+        Cluster c;
+        c.config.becomeCharacter = true;
+        Player& a = joinAs(c, "A", "player_three", true, [](Player& p) { p.game.localModelHash = kJohn; });
+        Player& b = joinAs(c, "B", "cs_charlessmith", false, [](Player& p) { p.game.localModelHash = kCharles; });
+        b.session->setStoryHero(kJohn);
+        c.run(3000);
+        a.game.player.flags |= PF_InMission;
+        c.run(2000);
+        CHECK(b.game.localModelHash == kJohn);
+        CHECK(b.session->storyHero() == kJohn);
+    }
+}
+
+COOP_TEST(testCharactersEpilogue, "characters: the story turning Arthur into John is kept, even when John is ours") {
+    Cluster c;
+    c.config.becomeCharacter = true;
+    joinAs(c, "A", "player_zero", true);
+    Player& b = joinAs(c, "B", "player_three", false);
+    c.run(6000);
+    CHECK(b.game.localModelHash == kJohn);
+    b.game.player.flags = PF_InMission;  // the last mission of chapter 6: Arthur's
+    c.run(2000);
+    CHECK(b.game.localModelHash == kArthur);
+    b.game.localModelHash = kJohn;  // the epilogue: the game itself makes the player John
+    c.run(3000);
+    CHECK(b.game.localModelHash == kJohn && b.session->storyHero() == kJohn);
+    b.game.player.flags = 0;
+    c.run(6000);
+    CHECK(b.game.localModelHash == kJohn);  // John is the hero and B's character: nothing to do
+}
+
+COOP_TEST(testCharactersOwnerStaysHero, "characters: the world owner plays as the story hero, the others see its character") {
+    Cluster c;
+    c.config.becomeCharacter = true;
+    Player& a = joinAs(c, "A", "cs_dutch", true);
+    Player& b = joinAs(c, "B", "player_zero", false);
+    c.run(6000);
+    CHECK(a.session->status().worldOwner && a.session->status().character == "cs_dutch");
+    CHECK(a.game.localModelHash == kArthur && a.game.modelSwitches == 0);  // A starts the missions
+    CHECK(a.session->status().playingHero);
+    const FakeGame::Ent* aAtB = puppetOf(b, "A");
+    CHECK(aAtB && aAtB->model == joaat("cs_dutch"));
+}
+
+COOP_TEST(testCharactersNotAtAGallop, "characters: for the others' mission, not out of a wagon or at a gallop") {
+    Cluster c;
+    c.config.becomeCharacter = true;
+    Player& a = joinAs(c, "A", "player_zero", true);
+    Player& b = joinAs(c, "B", "cs_mrsadler", false);
+    c.run(6000);
+    CHECK(b.game.localModelHash == kSadie);
+    b.game.player.flags = PF_OnMount;
+    b.game.player.vel = {12, 0, 0};  // galloping
+    a.game.player.flags = PF_InMission;
+    c.run(3000);
+    CHECK(b.game.localModelHash == kSadie);
+    b.game.player.vel = {1.5f, 0, 0};  // slows down near the marker
+    c.run(1000);
+    CHECK(b.game.localModelHash == kArthur);
+}
+
+COOP_TEST(testCharactersRequestLimits, "characters: only catalog characters, a few changes in a row at most") {
+    Cluster c;
+    Player& a = joinAs(c, "A", "player_zero", true);
+    Player& b = joinAs(c, "B", "player_three", false);
+    (void)a;
+    b.link.send(Msg::CharacterRequest, CharacterRequest{"a_c_horse_morgan_bay"}, true);
+    c.run(800);
+    CHECK(saw(b, "Unknown character") && b.session->status().character == "player_three");
+    const char* swaps[] = {"cs_lenny", "cs_dutch", "cs_lenny", "cs_dutch", "cs_lenny", "cs_dutch"};
+    for (const char* s : swaps) b.link.send(Msg::CharacterRequest, CharacterRequest{s}, true);
+    c.run(1500);
+    CHECK(saw(b, "Too many character changes"));
+    int changes = 0;
+    for (const std::string& line : c.storage.journals["default"]) changes += line.find("B is now") != std::string::npos;
+    std::printf("  %d of 6 quick changes went through\n", changes);
+    CHECK(changes == 2);  // a burst of three, and the unknown request above was one of them
+    // Thirty players: everybody still gets a character of their own.
+    std::vector<std::string> taken;
+    for (size_t i = 0; i < characterCatalog().size(); ++i) {
+        std::string got = freeCharacter("player_zero", taken);
+        CHECK(std::find(taken.begin(), taken.end(), got) == taken.end());
+        taken.push_back(got);
+    }
 }

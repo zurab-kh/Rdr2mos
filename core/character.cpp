@@ -1,6 +1,8 @@
 #include "character.h"
 
 #include "characters.h"
+
+#include <cmath>
 #include "mathx.h"
 
 namespace coop {
@@ -10,6 +12,7 @@ constexpr uint32_t kLookCheckMs = 1000;     // how often our own look is read (s
 constexpr uint32_t kSettleMs = 3000;        // free roam this long before we turn back into our character
 constexpr uint32_t kMinSwitchGapMs = 5000;  // never flip back and forth faster than this
 constexpr uint32_t kRetryMs = 250;          // a model still loading: ask again this often
+constexpr float kSafeRideSpeed = 4.0f;      // m/s: walking a horse, not galloping
 }  // namespace
 
 void CharacterSync::reset() {
@@ -55,11 +58,14 @@ void CharacterSync::sendLook(uint32_t model) {
     sentAny_ = true;
 }
 
+bool CharacterSync::isStoryHeroModel(uint32_t model) { return isStoryHero(model); }
+
 bool CharacterSync::become(uint32_t model, uint32_t nowMs) {
     uint32_t from = game_.localModel();
     if (from) remember(from, nowMs, true);  // the look we leave, to put it on again later
     if (!game_.setLocalModel(model)) return false;
     ++switches_;
+    lastSet_ = model;
     lastSwitchMs_ = nowMs ? nowMs : 1;
     lastLookMs_ = 0;
     EntityHandle ped = game_.localPlayerPed();
@@ -76,25 +82,29 @@ bool CharacterSync::become(uint32_t model, uint32_t nowMs) {
     return true;
 }
 
-void CharacterSync::tick(uint32_t nowMs, const PlayerState& local, bool needHero) {
+void CharacterSync::tick(uint32_t nowMs, const PlayerState& local, HeroNeed need) {
     if (!game_.ready()) return;
     uint32_t cur = game_.localModel();
     if (!cur) return;
-    // The story hero this game plays: the one we found, or the one the story moved on to (the
-    // epilogue turns Arthur into John), unless that is just our chosen character.
-    if (!hero_) hero_ = isStoryHero(cur) ? cur : joaat("player_zero");
-    else if (isStoryHero(cur) && cur != hero_ && cur != mineModel_) hero_ = cur;
+    lastCur_ = cur;
+    // Whose story this is: a story hero the game gave us (not one we put on ourselves) is it, also
+    // when the story moves on (the epilogue turns Arthur into John) and that is our character too.
+    // A ped that is our chosen character says nothing (we may have made it that).
+    if (isStoryHero(cur) && cur != hero_ && cur != lastSet_ && (hero_ || cur != mineModel_ || !mineModel_)) hero_ = cur;
     remember(cur, nowMs, false);
     sendLook(cur);
 
+    bool needHero = need != HeroNeed::None;
     if (needHero) {
         heroNeededMs_ = nowMs ? nowMs : 1;
         everNeededHero_ = true;
     }
+    // Not known (we already are our character, and nobody told us): Arthur's story is the likely one.
+    uint32_t hero = hero_ ? hero_ : (isStoryHero(cur) && cur != mineModel_ ? cur : joaat("player_zero"));
     bool wantHero = needHero || (everNeededHero_ && nowMs - heroNeededMs_ < kSettleMs);
-    heroForStory_ = config_.becomeCharacter && wantHero && mineModel_ && mineModel_ != hero_;
+    heroForStory_ = config_.becomeCharacter && wantHero && mineModel_ && mineModel_ != hero;
     if (!config_.becomeCharacter || !mineModel_) return;
-    uint32_t target = wantHero ? hero_ : mineModel_;
+    uint32_t target = wantHero ? hero : mineModel_;
     if (target == mineModel_ && !game_.modelExists(mineModel_)) return;
     if (target == cur) return;
 
@@ -104,17 +114,41 @@ void CharacterSync::tick(uint32_t nowMs, const PlayerState& local, bool needHero
         // Back into our character only at an easy moment, and not back and forth.
         if (f & (PF_OnMount | PF_InVehicle | PF_Aiming | PF_Shooting | PF_Ragdoll | PF_InMission | PF_Holding)) return;
         if (lastSwitchMs_ && nowMs - lastSwitchMs_ < kMinSwitchGapMs) return;
+    } else if (need != HeroNeed::Now) {
+        // The others' mission: before we reach its marker, but not out of a wagon or at a gallop.
+        float speed = std::sqrt(local.vel.x * local.vel.x + local.vel.y * local.vel.y);
+        if ((f & (PF_InVehicle | PF_Ragdoll)) || ((f & PF_OnMount) && speed > kSafeRideSpeed)) return;
     }
     if (lastTryMs_ && nowMs - lastTryMs_ < kRetryMs) return;
     lastTryMs_ = nowMs ? nowMs : 1;
     become(target, nowMs);
 }
 
-void CharacterSync::restoreHero() {
-    if (!config_.becomeCharacter || !hero_ || !game_.ready()) return;
-    uint32_t cur = game_.localModel();
-    if (cur && cur != hero_) become(hero_, lastLookMs_);
-    heroForStory_ = false;
+HeroRestore CharacterSync::heroRestore() const {
+    if (!config_.becomeCharacter || !lastCur_) return HeroRestore{};
+    uint32_t hero = hero_ ? hero_ : joaat("player_zero");
+    if (lastCur_ == hero) return HeroRestore{};
+    auto it = looks_.find(hero);
+    return HeroRestore(hero, it != looks_.end() ? &it->second : nullptr);
+}
+
+bool HeroRestore::tick(IGame& game, uint16_t flags, uint32_t nowMs) {
+    if (!pending_) return false;
+    if (!game.ready()) return true;  // a loading screen: later
+    uint32_t cur = game.localModel();
+    if (!cur) return true;
+    if (cur == hero_) {  // the game did it already (a save was loaded)
+        pending_ = false;
+        return false;
+    }
+    if (flags & (PF_Dead | PF_Cutscene)) return true;
+    if (!(flags & PF_InMission) && (flags & (PF_OnMount | PF_InVehicle | PF_Ragdoll | PF_Aiming | PF_Shooting))) return true;
+    if (lastTryMs_ && nowMs - lastTryMs_ < kRetryMs) return true;
+    lastTryMs_ = nowMs ? nowMs : 1;
+    if (!game.setLocalModel(hero_)) return true;  // still streaming in: again in a moment
+    if (haveLook_) game.applyAppearance(game.localPlayerPed(), look_);
+    pending_ = false;
+    return false;
 }
 
 void CharacterSync::cycleOutfit(int step) {

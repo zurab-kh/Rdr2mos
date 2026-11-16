@@ -32,6 +32,7 @@ const Spec kNativeDb[] = {
     {0x77FF8D35EEC6BBC4, "PED::_EQUIP_META_PED_OUTFIT_PRESET", 3, false},
     {0x90403E8107B60E81, "PED::_GET_NUM_COMPONENTS_IN_PED", 1, false},
     {0xD3A7B003ED343FD9, "PED::_APPLY_SHOP_ITEM_TO_PED", 5, false},
+    {0x0D7FFA1B2F69ED82, "PED::_REMOVE_SHOP_ITEM_FROM_PED", 4, false},
     {0xED40380076A31506, "PLAYER::SET_PLAYER_MODEL", 3, false},
     {0x0252D2B5582957A6, "CAMERA::GET_GAMEPLAY_CAM_ROT", 1, false},
     {0x028F76B6E78246EB, "PED::SET_PED_ONTO_MOUNT", 4, false},
@@ -481,6 +482,11 @@ World::World() {
             if (item.first == w.u(1)) return;
         e->items.push_back({w.u(1), 0});
     };
+    H["PED::_REMOVE_SHOP_ITEM_FROM_PED"] = [](World& w) {
+        if (Ent* e = w.e0())
+            e->items.erase(std::remove_if(e->items.begin(), e->items.end(), [&](auto& item) { return item.first == w.u(1); }),
+                           e->items.end());
+    };
     H["PED::_UPDATE_SHOP_ITEM_WEARABLE_STATE"] = [](World& w) {
         if (Ent* e = w.e0())
             for (auto& item : e->items)
@@ -874,6 +880,11 @@ COOP_TEST(testPluginEveryNativeMatchesTheDatabase, "plugin: every native call ma
     look.preset = 1;
     g.applyAppearance(passenger, look);
     CHECK(w.ents[passenger].preset == 1 && w.ents[passenger].items.size() == 2 && w.ents[passenger].items[1].second == 0x99);
+    look.preset = Appearance::kNoPreset;
+    look.items.pop_back();  // the hat comes off
+    g.applyAppearance(passenger, look);
+    CHECK(w.ents[passenger].items.size() == 1);
+    g.blockInput();
     CHECK(g.outfitPresets(g.localPlayerPed()) == 3);
     g.setOutfitPreset(g.localPlayerPed(), 2);
     CHECK(w.ents[w.playerPed].preset == 2);
@@ -1364,4 +1375,32 @@ COOP_TEST(testPluginNearbyAnyAndAdopt, "plugin: one scan for any number of viewe
     s.step();
     CHECK(w.ents.size() == before && w.get(wagon) && w.get(team) && w.ents[team].visible);
     CHECK(w.problems.empty());
+}
+COOP_TEST(testReviewApplyAppearanceRemovesItems, "review: a puppet loses the hat its player took off") {
+    Solo s;
+    World& w = s.world;
+    int puppet = w.addPed(joaat("player_zero"), {3, 3, 0});
+    s.step();
+    Appearance withHat;
+    withHat.model = joaat("player_zero");
+    withHat.items = {{0x111, 0}, {0x222, 0}};  // coat + hat
+    s.game.applyAppearance(puppet, withHat);
+    Appearance noHat = withHat;
+    noHat.items = {{0x111, 0}};  // the player took the hat off (story hero: no preset)
+    s.game.applyAppearance(puppet, noHat);
+    std::printf("  puppet wears %zu item(s), the player 1\n", w.ents[puppet].items.size());
+    CHECK(w.ents[puppet].items.size() == 1);
+}
+
+COOP_TEST(testReviewProtectionSurvivesModelSwap, "review: the new player ped is invincible while protected") {
+    Solo s;
+    World& w = s.world;
+    s.game.setLocalProtected(true);
+    uint64_t before = w.count("ENTITY::SET_ENTITY_INVINCIBLE");
+    CHECK(s.game.setLocalModel(joaat("cs_charlessmith")));
+    s.step();
+    s.step();
+    std::printf("  SET_ENTITY_INVINCIBLE calls for the new ped: %llu\n",
+                static_cast<unsigned long long>(w.count("ENTITY::SET_ENTITY_INVINCIBLE") - before));
+    CHECK(w.count("ENTITY::SET_ENTITY_INVINCIBLE") > before);
 }

@@ -31,6 +31,8 @@ public:
     void applyAppearance(coop::EntityHandle ped, const coop::Appearance& look) override;
     int outfitPresets(coop::EntityHandle ped) override;
     void setOutfitPreset(coop::EntityHandle ped, int preset) override;
+    // A menu of the mod is open: the game does not react to the keys meanwhile (this frame).
+    void blockInput();
     void setLocalProtected(bool on) override;
     void killLocalPlayer() override;
     void holdWorld(bool on) override;

@@ -124,6 +124,7 @@ inline Hash GET_SHOP_ITEM_COMPONENT_AT_INDEX(Ped ped, int index, Hash* wearableS
     return item;
 }
 inline void APPLY_SHOP_ITEM_TO_PED(Ped ped, Hash item) { call(0xD3A7B003ED343FD9, ped, item, 1, 0, 0); }
+inline void REMOVE_SHOP_ITEM_FROM_PED(Ped ped, Hash item) { call(0x0D7FFA1B2F69ED82, ped, item, 0, 0); }
 inline void UPDATE_SHOP_ITEM_WEARABLE_STATE(Ped ped, Hash item, Hash wearableState) {
     call(0x66B957AAC2EAAEAB, ped, item, wearableState, 0, 0, 1);
 }

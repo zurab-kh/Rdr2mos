@@ -103,6 +103,7 @@ void CoopSession::tick(uint32_t nowMs) {
         sendLocalState(nowMs);
         character_.tick(nowMs, local_.state, storyHeroNeeded());
         status_.playingHero = character_.playingHero();
+        localPed_ = game_.localPlayerPed();  // a new character is a new ped
         if (isOwner()) sendWorld(nowMs);
         updatePuppets(nowMs, dt);
         peers_.clear();
@@ -164,8 +165,7 @@ void CoopSession::restoreWorld() {
 }
 
 void CoopSession::cleanup() {
-    character_.restoreHero();  // the story goes on as the story hero
-    character_.reset();
+    character_.reset();  // the story hero comes back when the co-op ends for good (heroRestore())
     for (auto& [id, p] : puppets_) destroyPuppet(p);
     puppets_.clear();
     resetWorld();
@@ -506,15 +506,18 @@ void CoopSession::onRoster(const Roster& roster) {
 // Missions, scenes and the shops are made for the story hero: whoever chose another character is
 // the hero again while one is on. In the shared story the world owner's mission is everybody's, and
 // we should be the hero before we walk into its marker; in the owner's world only the owner plays.
-bool CoopSession::storyHeroNeeded() const {
+HeroNeed CoopSession::storyHeroNeeded() const {
     const uint16_t f = local_.state.flags;
-    if (f & (PF_InMission | PF_Cutscene | PF_Holding)) return true;
-    if (story_.holding()) return true;
-    if (mode_ == StoryMode::Shared && owner_ && owner_ != myId_) {
+    if (f & (PF_InMission | PF_Cutscene | PF_Holding)) return HeroNeed::Now;
+    if (story_.holding()) return HeroNeed::Now;
+    // The world owner starts the missions, by walking into a marker nobody can see coming: it plays
+    // as the story hero all along (the others still see its character).
+    if (isOwner()) return HeroNeed::Now;
+    if (mode_ == StoryMode::Shared && owner_) {
         auto it = puppets_.find(owner_);
-        if (it != puppets_.end() && it->second.haveState && (it->second.state.flags & PF_InMission)) return true;
+        if (it != puppets_.end() && it->second.haveState && (it->second.state.flags & PF_InMission)) return HeroNeed::Soon;
     }
-    return false;
+    return HeroNeed::None;
 }
 
 void CoopSession::handleMessages(uint32_t nowMs) {

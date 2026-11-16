@@ -87,6 +87,11 @@ public:
     bool chooseCharacter(const std::string& avatar) { return character_.choose(avatar); }
     // The wardrobe: next (+1) or previous (-1) outfit of the character we are right now.
     void cycleOutfit(int step) { character_.cycleOutfit(step); }
+    // Ending the co-op: what it takes to be the story hero again (finish it with HeroRestore::tick,
+    // also after this session is gone). Across script restarts, the story hero is passed on.
+    HeroRestore heroRestore() const { return character_.heroRestore(); }
+    void setStoryHero(uint32_t model) { character_.setStoryHero(model); }
+    uint32_t storyHero() const { return character_.heroModel(); }
 
 private:
     struct Mover {
@@ -165,7 +170,7 @@ private:
     void onRoster(const Roster& roster);
     void onSnapshot(const EntitySnapshot& snap, uint32_t nowMs);
     void sendLocalState(uint32_t nowMs);
-    bool storyHeroNeeded() const;
+    HeroNeed storyHeroNeeded() const;
     void sendWorld(uint32_t nowMs);
     void streamEntity(Streamed& s, uint32_t nowMs);
     void updatePuppets(uint32_t nowMs, float dt);

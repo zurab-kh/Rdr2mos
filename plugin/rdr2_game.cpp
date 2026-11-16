@@ -338,6 +338,9 @@ bool Rdr2Game::setLocalModel(uint32_t model) {
     n::REQUEST_MODEL(model);
     if (!n::HAS_MODEL_LOADED(model)) return false;  // streaming in: the session asks again
     int old = playerPed_;
+    // The new ped starts out fresh: it keeps the wounds of the old one (no free healing), and the
+    // protection of a running scene.
+    int health = n::GET_ENTITY_HEALTH(old);
     n::SET_PLAYER_MODEL(player_, model);
     n::SET_MODEL_AS_NO_LONGER_NEEDED(model);
     // A new ped for the player: nothing known about the old one applies to it.
@@ -351,6 +354,8 @@ bool Rdr2Game::setLocalModel(uint32_t model) {
         me.exists = true;
         me.have |= kHaveExists;
         own_.insert(playerPed_);
+        if (health > 0) n::SET_ENTITY_HEALTH(playerPed_, std::min(health, n::GET_ENTITY_MAX_HEALTH(playerPed_)), 0);
+        if (protected_) n::SET_ENTITY_INVINCIBLE(playerPed_, true);
     }
     ownHorsesFresh_ = false;
     playerMaxHealth_ = 0;
@@ -377,12 +382,24 @@ void Rdr2Game::applyAppearance(EntityHandle ped, const coop::Appearance& look) {
     // top, worn the same way: hats, coats, rolled-up sleeves.
     if (look.preset != coop::Appearance::kNoPreset) n::EQUIP_META_PED_OUTFIT_PRESET(ped, look.preset);
     else if (look.items.empty() && look.outfit) n::EQUIP_META_PED_OUTFIT(ped, look.outfit);
+    // What it wears now that the look does not (a hat taken off), or wears differently (sleeves
+    // rolled down again: the default state comes back with the item put on afresh), comes off.
+    coop::Appearance worn;
+    readAppearance(ped, worn);
+    for (const coop::ShopItem& have : worn.items) {
+        auto want = std::find_if(look.items.begin(), look.items.end(),
+                                 [&](const coop::ShopItem& i) { return i.component == have.component; });
+        if (want == look.items.end() || (want->wearable == 0 && have.wearable != 0))
+            n::REMOVE_SHOP_ITEM_FROM_PED(ped, have.component);
+    }
     for (const coop::ShopItem& item : look.items) {
         n::APPLY_SHOP_ITEM_TO_PED(ped, item.component);
         if (item.wearable) n::UPDATE_SHOP_ITEM_WEARABLE_STATE(ped, item.component, item.wearable);
     }
     n::UPDATE_PED_VARIATION(ped);
 }
+
+void Rdr2Game::blockInput() { n::DISABLE_ALL_CONTROL_ACTIONS(0); }
 
 int Rdr2Game::outfitPresets(EntityHandle ped) { return ped && exists(ped) ? n::GET_NUM_META_PED_OUTFITS(ped) : 0; }
 
