@@ -1,14 +1,22 @@
 // IGame implemented with RDR2 script natives. Must only be used from the script thread.
+//
+// Every native call goes through Script Hook (a hash lookup and a call into the game), and the
+// session asks many questions per frame, so this class answers from caches wherever the answer
+// cannot have changed: per frame (positions, health, the ped pool), per handle for a while
+// (model, owning script, outfit, seat), and only re-asks the game when it could be different.
 #pragma once
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include "game_api.h"
 
 class Rdr2Game final : public coop::IGame {
 public:
     // Call once per frame before the session ticks: refreshes cached handles and catches
-    // one-frame events (gunshots) that slower polling would miss.
-    void frame(uint32_t nowMs);
+    // one-frame events (gunshots) that slower polling would miss. `active` is false while the
+    // mod is offline: then only the safety checks run (a frozen world or a script camera left
+    // over from before a script restart), not the work the session needs.
+    void frame(uint32_t nowMs, bool active = true);
 
     bool ready() override;
     coop::LocalPlayer readLocalPlayer() override;
@@ -74,7 +82,8 @@ public:
 
 private:
     // Per-frame cache of the most frequent queries: the session asks the same questions about the
-    // same entities several times a frame, and each native call has a real cost.
+    // same entities several times a frame.
+    enum : uint8_t { kHaveExists = 1, kHavePos = 2, kHaveDead = 4, kHaveHeading = 8, kHaveHealth = 16 };
     struct Cached {
         uint8_t have = 0;  // which of the fields below are filled
         bool exists = false, dead = false;
@@ -85,37 +94,71 @@ private:
     Cached& cached(int h) { return cache_[h]; }
     void invalidate(int h) { cache_.erase(h); }
 
-    // Classification that never changes for an entity (is it a player, a draft animal, a train),
-    // remembered for a while so the world scan does not ask again every tick.
-    struct Skip {
-        uint32_t untilMs = 0;
-        bool skip = false;
+    // Facts about a handle that change rarely or never, re-read on a timer instead of every time.
+    // Refresh times are spread over the interval, so a crowd seen in one frame does not come due
+    // in one frame again (that would be a frame-time spike).
+    struct Info {
+        uint32_t model = 0;
+        bool human = false, player = false, train = false;  // what it is
+        bool mission = false;                               // owned by a script
+        uint32_t script = 0;
+        int draftOf = 0;                                    // draft animals: the vehicle they pull
+        uint32_t outfit = 0;
+        int seatVehicle = 0;                                // last seat found (one call to confirm)
+        int seat = -1;
+        coop::Vec3 seenPos;                                 // last position read by the world scan
+        uint32_t seenMs = 0;
+        bool haveSeen = false;
+        uint32_t kindDueMs = 0, ownerDueMs = 0, outfitDueMs = 0, aliveUntilMs = 0;
+        uint32_t usedMs = 0;
+        bool haveKind = false, haveOwner = false, haveOutfit = false;
     };
-    bool skipPed(int ped);
-    bool skipVehicle(int veh);
+    Info& kindInfo(int h, bool vehicle);   // model, human, player, train
+    Info& ownerInfo(int h, bool vehicle);  // + mission, script, draftOf
+    uint32_t outfitOf(int ped);
+    uint32_t spreadDue(int h, uint32_t intervalMs) const;
+    void forget(int h);
 
+    // The ped and vehicle pools, read once per frame (and again after we create or delete).
+    const std::vector<int>& peds();
+    const std::vector<int>& vehicles();
+    void poolsChanged() { pedsFresh_ = vehiclesFresh_ = false; }
+
+    bool missionFlag();
     int seatOf(int ped, int vehicle);
     void hide(int h, bool hidden);
     void hideDraftAnimals(int vehicle, bool hidden);
+    void refreshOwnHorses(bool force);
 
     std::unordered_map<int, Cached> cache_;
-    std::unordered_map<int, Skip> skip_;
+    std::unordered_map<int, Info> info_;
+    std::vector<int> peds_, vehiclesList_;
+    bool pedsFresh_ = false, vehiclesFresh_ = false;
+    uint32_t lastPruneMs_ = 0;
 
     uint32_t nowMs_ = 0;
+    int player_ = 0;
     int playerPed_ = 0;
     int playerMount_ = 0;
     int playerVehicle_ = 0;
+    int loading_ = -1;                              // this frame's loading screen state, -1 = not read yet
+    int missionFlag_ = -1;                          // this frame's GET_MISSION_FLAG, -1 = not read yet
     std::unordered_set<int> own_;                   // player, their horses, their vehicle and its draft animals
+    std::vector<int> ownHorses_;                    // last, owned and saddle horse, draft team of the vehicle
+    int ownHorsesPed_ = 0, ownHorsesVehicle_ = 0, ownHorsesMount_ = 0;
+    uint32_t ownHorsesDueMs_ = 0;
+    bool ownHorsesFresh_ = false;                   // refreshed this frame already
+    int playerMaxHealth_ = 0;
+    uint32_t playerMaxHealthDueMs_ = 0;
     std::unordered_set<int> vehicles_;              // vehicles we created
     std::unordered_map<int, bool> quadruped_;       // peds we created: horse/animal (different gaits)
-    int puppetPed_ = 0;                             // the friend's character, if spawned
     uint32_t lastPlayerShotMs_ = 0;
     bool playerShotSeen_ = false;
     struct ShotWatch {
         uint32_t shotMs = 0;   // last time seen firing
         uint32_t readMs = 0;   // last time the session asked about this NPC
     };
-    std::unordered_map<int, ShotWatch> npcShots_;  // streamed NPCs, watched for gunfire every frame
+    std::unordered_map<int, ShotWatch> npcShots_;  // armed streamed NPCs, watched for gunfire every frame
     std::unordered_map<int, int> blips_;
     uint32_t lastWeatherSet_ = 0;
     bool protected_ = false;
@@ -124,5 +167,6 @@ private:
     int waypointBlip_ = 0;
     std::vector<coop::MissionEntity> missionCache_;
     uint32_t missionCacheMs_ = 0;
+    bool missionCacheValid_ = false;
     bool isSpawned(int h) const { return vehicles_.count(h) || quadruped_.count(h); }
 };

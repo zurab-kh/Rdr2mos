@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "hud.h"
 #include "mathx.h"
 #include "natives.h"
 
@@ -10,20 +11,34 @@ using namespace coop;
 namespace n = native;
 
 namespace {
-constexpr uint32_t kShotHoldMs = 350;  // how long a detected gunshot keeps the "shooting" flag up
+constexpr uint32_t kShotHoldMs = 350;    // how long a detected gunshot keeps the "shooting" flag up
+constexpr uint32_t kShotWatchMs = 2000;  // an NPC the session stopped reading is no longer watched
 constexpr float kPi = 3.14159265f;
 constexpr int kMaxHandles = 1024;
+constexpr int kDraftHarnesses = 6;       // eDraftHarness: LR, RR, LM, RM, LF, RF
+// How long cached facts about a handle are trusted. A handle carries a generation counter, so the
+// game does not hand the same number to a new entity within these times.
+constexpr uint32_t kKindMs = 5000;       // model, human, player, train: fixed for an entity
+constexpr uint32_t kOwnerMs = 1000;      // mission entity / owning script / draft attachment
+constexpr uint32_t kOutfitMs = 1000;
+constexpr uint32_t kAliveMs = 250;       // our own (persistent) entities are not re-checked every frame
+constexpr uint32_t kOwnHorsesMs = 500;
+constexpr uint32_t kMaxHealthMs = 1000;
+constexpr uint32_t kInfoKeepMs = 10000;  // forget handles not asked about for this long
+// World scan: an entity far out of range cannot be in range before it could have covered the gap
+// (nothing but trains moves faster than this), so its position is not re-read every scan.
+constexpr float kMaxScanSpeed = 30.0f;   // m/s
+constexpr uint32_t kFarRecheckMs = 1000;
 const uint32_t kUnarmed = joaat("WEAPON_UNARMED");
 const uint32_t kFallbackAvatar = joaat("player_three");
 
-int g_peds[kMaxHandles];
-// Survives the script restart after a save load, so a protection we switched on is never left behind.
+// Survive the script restart after a save load, so nothing we switched on is left behind.
 bool g_protectionLeftOn = false;
 bool g_holdLeftOn = false;
-int g_vehicles[kMaxHandles];
+int g_scriptCamera = 0;
 
-int collectPeds() { return std::clamp(worldGetAllPeds(g_peds, kMaxHandles), 0, kMaxHandles); }
-int collectVehicles() { return std::clamp(worldGetAllVehicles(g_vehicles, kMaxHandles), 0, kMaxHandles); }
+bool due(uint32_t nowMs, uint32_t dueMs) { return static_cast<int32_t>(nowMs - dueMs) >= 0; }
+bool armed(uint32_t weapon) { return weapon != 0 && weapon != kUnarmed; }
 
 // Move blend ratio (1 walk, 2 run, 3 sprint / gallop) for a ground speed, blended in between so
 // the animation speed matches the friend's real speed instead of snapping between gaits.
@@ -35,10 +50,102 @@ float moveBlend(float speed, bool quadruped) {
 }
 }  // namespace
 
-void Rdr2Game::frame(uint32_t nowMs) {
+// ---------------------------------------------------------------- caches
+
+uint32_t Rdr2Game::spreadDue(int h, uint32_t intervalMs) const {
+    // Between half and the full interval, fixed per handle: refreshes of a crowd drift apart.
+    uint32_t mix = static_cast<uint32_t>(h) * 2654435761u;
+    return nowMs_ + intervalMs - (mix >> 8) % (intervalMs / 2);
+}
+
+Rdr2Game::Info& Rdr2Game::kindInfo(int h, bool vehicle) {
+    Info& in = info_[h];
+    in.usedMs = nowMs_;
+    if (!in.haveKind || due(nowMs_, in.kindDueMs)) {
+        bool newcomer = !in.haveKind;
+        in.model = n::GET_ENTITY_MODEL(h);
+        if (vehicle) {
+            in.train = n::IS_THIS_MODEL_A_TRAIN(in.model);
+        } else {
+            in.player = n::IS_PED_A_PLAYER(h);
+            in.human = n::IS_PED_HUMAN(h);
+        }
+        in.haveKind = true;
+        in.kindDueMs = spreadDue(h, kKindMs);
+        // A horse that just appeared may be the player's (called with a whistle): find out now,
+        // before a scan takes it for a world entity (or a guest deletes it as foreign).
+        if (newcomer && !vehicle && !in.human && playerPed_ && !ownHorsesFresh_) refreshOwnHorses(true);
+    }
+    return in;
+}
+
+Rdr2Game::Info& Rdr2Game::ownerInfo(int h, bool vehicle) {
+    Info& in = kindInfo(h, vehicle);
+    if (!in.haveOwner || due(nowMs_, in.ownerDueMs)) {
+        in.mission = n::IS_ENTITY_A_MISSION_ENTITY(h);
+        in.script = in.mission ? n::GET_ENTITY_SCRIPT(h) : 0;
+        in.draftOf = vehicle || in.human ? 0 : n::GET_VEHICLE_DRAFT_HORSE_IS_ATTACHED_TO(h);  // only animals pull
+        in.haveOwner = true;
+        in.ownerDueMs = spreadDue(h, kOwnerMs);
+    }
+    return in;
+}
+
+uint32_t Rdr2Game::outfitOf(int ped) {
+    Info& in = info_[ped];
+    in.usedMs = nowMs_;
+    if (!in.haveOutfit || due(nowMs_, in.outfitDueMs)) {
+        in.outfit = n::GET_PED_META_OUTFIT_HASH(ped);
+        in.haveOutfit = true;
+        in.outfitDueMs = spreadDue(ped, kOutfitMs);
+    }
+    return in.outfit;
+}
+
+void Rdr2Game::forget(int h) {
+    cache_.erase(h);
+    info_.erase(h);
+    npcShots_.erase(h);
+}
+
+const std::vector<int>& Rdr2Game::peds() {
+    if (!pedsFresh_) {
+        peds_.resize(kMaxHandles);
+        peds_.resize(static_cast<size_t>(std::clamp(worldGetAllPeds(peds_.data(), kMaxHandles), 0, kMaxHandles)));
+        pedsFresh_ = true;
+    }
+    return peds_;
+}
+
+const std::vector<int>& Rdr2Game::vehicles() {
+    if (!vehiclesFresh_) {
+        vehiclesList_.resize(kMaxHandles);
+        vehiclesList_.resize(
+            static_cast<size_t>(std::clamp(worldGetAllVehicles(vehiclesList_.data(), kMaxHandles), 0, kMaxHandles)));
+        vehiclesFresh_ = true;
+    }
+    return vehiclesList_;
+}
+
+bool Rdr2Game::missionFlag() {
+    if (missionFlag_ < 0) missionFlag_ = n::GET_MISSION_FLAG() ? 1 : 0;
+    return missionFlag_ != 0;
+}
+
+// ---------------------------------------------------------------- frame
+
+void Rdr2Game::frame(uint32_t nowMs, bool active) {
     nowMs_ = nowMs;
     cache_.clear();
-    if (skip_.size() > 4096) skip_.clear();
+    poolsChanged();
+    missionFlag_ = -1;
+    loading_ = -1;
+    ownHorsesFresh_ = false;
+    if (nowMs - lastPruneMs_ >= 2000) {
+        lastPruneMs_ = nowMs;
+        for (auto it = info_.begin(); it != info_.end();)
+            it = nowMs - it->second.usedMs > kInfoKeepMs ? info_.erase(it) : std::next(it);
+    }
     playerPed_ = n::PLAYER_PED_ID();
     playerMount_ = playerVehicle_ = 0;
     own_.clear();
@@ -46,6 +153,10 @@ void Rdr2Game::frame(uint32_t nowMs) {
         playerPed_ = 0;
         return;
     }
+    Cached& me = cached(playerPed_);
+    me.exists = true;
+    me.have |= kHaveExists;
+
     if (g_protectionLeftOn && !protected_) {
         n::SET_ENTITY_INVINCIBLE(playerPed_, false);
         g_protectionLeftOn = false;
@@ -55,93 +166,138 @@ void Rdr2Game::frame(uint32_t nowMs) {
         n::DO_SCREEN_FADE_IN(500);
         g_holdLeftOn = false;
     }
-    if (held_) {
-        n::SET_TIME_SCALE(0.0f);
-        n::DISABLE_ALL_CONTROL_ACTIONS(0);
+    if (g_scriptCamera && !camera_) {  // ... or while the spectator camera was on
+        n::RENDER_SCRIPT_CAMS(false, 0);
+        n::DESTROY_CAM(g_scriptCamera);
+        n::CLEAR_FOCUS();
+        g_scriptCamera = 0;
     }
-    if (camera_) n::DISABLE_ALL_CONTROL_ACTIONS(0);
-    int player = n::PLAYER_ID();
+    if (held_) n::SET_TIME_SCALE(0.0f);
+    if (held_ || camera_) n::DISABLE_ALL_CONTROL_ACTIONS(0);
+    if (!active) return;
+
+    player_ = n::PLAYER_ID();
     if (n::IS_PED_ON_MOUNT(playerPed_)) playerMount_ = n::GET_MOUNT(playerPed_);
     if (n::IS_PED_IN_ANY_VEHICLE(playerPed_)) playerVehicle_ = n::GET_VEHICLE_PED_IS_IN(playerPed_);
     own_.insert(playerPed_);
-    for (int horse : {playerMount_, n::GET_LAST_MOUNT(playerPed_), n::GET_MOUNT_OWNED_BY_PLAYER(player),
-                      n::GET_SADDLE_HORSE_FOR_PLAYER(player)})
-        if (horse) own_.insert(horse);
-    if (playerVehicle_) {
-        own_.insert(playerVehicle_);
-        for (int harness = 0; harness < 4; ++harness)
-            if (int horse = n::GET_PED_IN_DRAFT_HARNESS(playerVehicle_, harness)) own_.insert(horse);
-    }
+    if (playerMount_) own_.insert(playerMount_);
+    if (playerVehicle_) own_.insert(playerVehicle_);
+    own_.insert(ownHorses_.begin(), ownHorses_.end());
+    refreshOwnHorses(false);
 
     if (n::IS_PED_SHOOTING(playerPed_)) {
         lastPlayerShotMs_ = nowMs;
         playerShotSeen_ = true;
     }
-    // Gunfire lasts a single frame, so streamed NPCs are watched every frame (cheap: one call each).
+    // Gunfire lasts a single frame, so armed streamed NPCs are watched every frame (one call each).
+    // A handle that vanished just answers "no"; it drops out once the session stops reading it.
     for (auto it = npcShots_.begin(); it != npcShots_.end();) {
-        // Stop watching NPCs that left the stream (not read for a while) or no longer exist.
-        if (nowMs - it->second.readMs > 2000 || !n::DOES_ENTITY_EXIST(it->first)) {
+        if (nowMs - it->second.readMs > kShotWatchMs) {
             it = npcShots_.erase(it);
             continue;
         }
         if (n::IS_PED_SHOOTING(it->first)) it->second.shotMs = nowMs ? nowMs : 1;
         ++it;
     }
-    if (puppetPed_ && !n::DOES_ENTITY_EXIST(puppetPed_)) puppetPed_ = 0;
 }
 
-bool Rdr2Game::ready() { return playerPed_ != 0 && !n::GET_IS_LOADING_SCREEN_ACTIVE(); }
+// The player's horses and the team of their vehicle change rarely: refreshed twice a second, or
+// at once when the player mounts, dismounts or changes vehicle.
+void Rdr2Game::refreshOwnHorses(bool force) {
+    bool changed = playerPed_ != ownHorsesPed_ || playerMount_ != ownHorsesMount_ || playerVehicle_ != ownHorsesVehicle_;
+    if (!force && !changed && !due(nowMs_, ownHorsesDueMs_)) return;
+    ownHorsesFresh_ = true;
+    for (int horse : ownHorses_) own_.erase(horse);
+    ownHorses_.clear();
+    for (int horse : {n::GET_LAST_MOUNT(playerPed_), n::GET_MOUNT_OWNED_BY_PLAYER(player_),
+                      n::GET_SADDLE_HORSE_FOR_PLAYER(player_)})
+        if (horse) ownHorses_.push_back(horse);
+    if (playerVehicle_)
+        for (int harness = 0; harness < kDraftHarnesses; ++harness)
+            if (int horse = n::GET_PED_IN_DRAFT_HARNESS(playerVehicle_, harness)) ownHorses_.push_back(horse);
+    ownHorsesPed_ = playerPed_;
+    ownHorsesMount_ = playerMount_;
+    ownHorsesVehicle_ = playerVehicle_;
+    ownHorsesDueMs_ = nowMs_ + kOwnHorsesMs;
+    own_.insert(ownHorses_.begin(), ownHorses_.end());
+    own_.insert(playerPed_);
+    if (playerMount_) own_.insert(playerMount_);
+    if (playerVehicle_) own_.insert(playerVehicle_);
+}
 
+bool Rdr2Game::ready() {
+    if (!playerPed_) return false;
+    if (loading_ < 0) loading_ = n::GET_IS_LOADING_SCREEN_ACTIVE() ? 1 : 0;
+    return loading_ == 0;
+}
+
+// The seat a ped sits in: the last one found is confirmed with one call, the full search only
+// runs when the ped moved.
 int Rdr2Game::seatOf(int ped, int vehicle) {
+    Info& in = info_[ped];
+    in.usedMs = nowMs_;
+    if (in.seatVehicle == vehicle && n::GET_PED_IN_VEHICLE_SEAT(vehicle, in.seat) == ped) return in.seat;
+    in.seatVehicle = vehicle;
+    in.seat = -1;
     for (int seat = -1; seat < 8; ++seat)
-        if (n::GET_PED_IN_VEHICLE_SEAT(vehicle, seat) == ped) return seat;
-    return -1;
+        if (n::GET_PED_IN_VEHICLE_SEAT(vehicle, seat) == ped) {
+            in.seat = seat;
+            break;
+        }
+    return in.seat;
 }
 
 LocalPlayer Rdr2Game::readLocalPlayer() {
     LocalPlayer lp;
     PlayerState& s = lp.state;
-    int player = n::PLAYER_ID();
     // While riding or driving, report the motion of what carries the player.
     int body = playerVehicle_ ? playerVehicle_ : playerMount_ ? playerMount_ : playerPed_;
-    s.pos = n::GET_ENTITY_COORDS(body);
+    s.pos = position(body);
     s.vel = n::GET_ENTITY_VELOCITY(body);
-    s.heading = n::GET_ENTITY_HEADING(body);
+    s.heading = heading(body);
     s.health = static_cast<uint16_t>(std::clamp(n::GET_ENTITY_HEALTH(playerPed_), 0, 65535));
-    s.maxHealth = static_cast<uint16_t>(std::clamp(n::GET_ENTITY_MAX_HEALTH(playerPed_), 0, 65535));
+    if (due(nowMs_, playerMaxHealthDueMs_)) {
+        playerMaxHealth_ = n::GET_ENTITY_MAX_HEALTH(playerPed_);
+        playerMaxHealthDueMs_ = nowMs_ + kMaxHealthMs;
+    }
+    s.maxHealth = static_cast<uint16_t>(std::clamp(playerMaxHealth_, 0, 65535));
     s.weapon = n::GET_PED_CURRENT_HELD_WEAPON(playerPed_);
     if (playerVehicle_) {
         s.flags |= PF_InVehicle;
-        s.vehicleModel = n::GET_ENTITY_MODEL(playerVehicle_);
+        s.vehicleModel = kindInfo(playerVehicle_, true).model;
         s.seat = static_cast<int8_t>(seatOf(playerPed_, playerVehicle_));
         lp.vehicle = playerVehicle_;
     } else if (playerMount_) {
         s.flags |= PF_OnMount;
-        s.mountModel = n::GET_ENTITY_MODEL(playerMount_);
+        s.mountModel = kindInfo(playerMount_, false).model;
         lp.mount = playerMount_;
     }
     bool shooting = playerShotSeen_ && nowMs_ - lastPlayerShotMs_ < kShotHoldMs;
+    bool aiming = n::IS_PLAYER_FREE_AIMING(player_) || n::IS_PLAYER_TARGETTING_ANYTHING(player_);
     if (shooting) s.flags |= PF_Shooting;
-    if (n::IS_PLAYER_FREE_AIMING(player)) s.flags |= PF_Aiming;
-    if (n::IS_ENTITY_DEAD(playerPed_)) s.flags |= PF_Dead;
+    if (aiming) s.flags |= PF_Aiming;
+    if (isDead(playerPed_)) s.flags |= PF_Dead;
     if (n::IS_PED_RAGDOLL(playerPed_)) s.flags |= PF_Ragdoll;
     if (n::GET_PED_CROUCH_MOVEMENT(playerPed_)) s.flags |= PF_Crouching;
-    if (n::GET_MISSION_FLAG()) {
+    if (missionFlag()) {
         s.flags |= PF_InMission;
         // RDR2 plays its story scenes as scripted scenes during which the player has no control.
-        if (!n::IS_PLAYER_CONTROL_ON(player)) s.flags |= PF_Cutscene;
+        if (!n::IS_PLAYER_CONTROL_ON(player_)) s.flags |= PF_Cutscene;
     }
 
-    // Aim point: where the last bullet landed, otherwise a point far along the camera direction.
+    // Aim point (only used while aiming or shooting): where the last bullet landed, otherwise a
+    // point far along the camera direction.
     n::Vector3 impact{};
     if (shooting && n::GET_PED_LAST_WEAPON_IMPACT_COORD(playerPed_, &impact)) {
         s.aim = impact.vec();
-    } else {
+    } else if (shooting || aiming) {
         Vec3 cam = n::GET_GAMEPLAY_CAM_COORD();
         Vec3 rot = n::GET_GAMEPLAY_CAM_ROT();
         float pitch = rot.x * kPi / 180.0f, yaw = rot.z * kPi / 180.0f;
         Vec3 dir{-std::sin(yaw) * std::cos(pitch), std::cos(yaw) * std::cos(pitch), std::sin(pitch)};
         s.aim = cam + dir * 60.0f;
+    } else {
+        s.aim = s.pos;
     }
     return lp;
 }
@@ -150,11 +306,14 @@ void Rdr2Game::damageLocalPlayer(int amount) {
     if (!playerPed_ || n::IS_ENTITY_DEAD(playerPed_)) return;
     int health = n::GET_ENTITY_HEALTH(playerPed_);
     n::SET_ENTITY_HEALTH(playerPed_, std::max(health - amount, 0), 0);
+    invalidate(playerPed_);
 }
 
 void Rdr2Game::teleportLocalPlayer(const Vec3& pos) {
     if (!playerPed_) return;
-    n::SET_ENTITY_COORDS(playerVehicle_ ? playerVehicle_ : playerMount_ ? playerMount_ : playerPed_, pos);
+    int body = playerVehicle_ ? playerVehicle_ : playerMount_ ? playerMount_ : playerPed_;
+    n::SET_ENTITY_COORDS(body, pos);
+    invalidate(body);
 }
 
 bool Rdr2Game::belongsToLocalPlayer(EntityHandle h) { return own_.count(h) != 0; }
@@ -171,6 +330,7 @@ void Rdr2Game::killLocalPlayer() {
     if (playerPed_ && !n::IS_ENTITY_DEAD(playerPed_)) {
         n::SET_ENTITY_INVINCIBLE(playerPed_, false);
         n::SET_ENTITY_HEALTH(playerPed_, 0, 0);
+        invalidate(playerPed_);
     }
 }
 
@@ -183,37 +343,43 @@ void Rdr2Game::holdWorld(bool on) {
     else n::DO_SCREEN_FADE_IN(800);
 }
 
+// ---------------------------------------------------------------- story
+
 void Rdr2Game::listMissionEntities(std::vector<MissionEntity>& out) {
-    auto add = [&](int h, EntityKind kind) {
-        if (!h || own_.count(h) || isSpawned(h) || !n::DOES_ENTITY_EXIST(h) || !n::IS_ENTITY_A_MISSION_ENTITY(h)) return;
-        uint32_t script = n::GET_ENTITY_SCRIPT(h);
-        if (!script) return;
-        out.push_back({h, kind, n::GET_ENTITY_MODEL(h), script, n::GET_ENTITY_COORDS(h)});
-    };
-    int peds = collectPeds();
-    for (int i = 0; i < peds; ++i)
-        if (!n::IS_PED_A_PLAYER(g_peds[i])) add(g_peds[i], EntityKind::Ped);
-    int vehicles = collectVehicles();
-    for (int i = 0; i < vehicles; ++i) add(g_vehicles[i], EntityKind::Vehicle);
+    // The whole pool is scanned four times a second; who owns an entity is cached per handle, so
+    // a scan mostly costs one position per story entity.
+    for (int ped : peds()) {
+        if (!ped || own_.count(ped) || isSpawned(ped)) continue;
+        const Info& in = ownerInfo(ped, false);
+        if (in.player || !in.mission || !in.script || own_.count(ped)) continue;
+        out.push_back({ped, EntityKind::Ped, in.model, in.script, position(ped)});
+    }
+    for (int veh : vehicles()) {
+        if (!veh || own_.count(veh) || isSpawned(veh)) continue;
+        const Info& in = ownerInfo(veh, true);
+        if (!in.mission || !in.script) continue;
+        out.push_back({veh, EntityKind::Vehicle, in.model, in.script, position(veh)});
+    }
     missionCache_ = out;
     missionCacheMs_ = nowMs_;
+    missionCacheValid_ = true;
 }
 
 uint32_t Rdr2Game::localMissionScript() {
-    if (!playerPed_ || !n::GET_MISSION_FLAG()) return 0;
-    if (missionCache_.empty() || nowMs_ - missionCacheMs_ > 1000) {
+    if (!playerPed_ || !missionFlag()) return 0;
+    if (!missionCacheValid_ || nowMs_ - missionCacheMs_ > 1000) {
         std::vector<MissionEntity> fresh;
         listMissionEntities(fresh);
     }
     // The mission script is the one that owns most of the story entities around the player.
-    Vec3 me = n::GET_ENTITY_COORDS(playerPed_);
+    Vec3 me = position(playerPed_);
     std::unordered_map<uint32_t, int> votes;
     for (const MissionEntity& e : missionCache_)
         if (distance(e.pos, me) < 150.0f) ++votes[e.script];
     uint32_t best = 0;
     int bestVotes = 0;
     for (const auto& [script, count] : votes)
-        if (count > bestVotes) {
+        if (count > bestVotes || (count == bestVotes && script < best)) {  // ties: same answer every time
             best = script;
             bestVotes = count;
         }
@@ -243,12 +409,13 @@ void Rdr2Game::spectate(bool on, const CameraState& cam) {
         if (!camera_) {
             camera_ = n::CREATE_CAM("DEFAULT_SCRIPTED_CAMERA");
             if (!camera_) return;
+            g_scriptCamera = camera_;
             n::SET_CAM_ACTIVE(camera_, true);
             n::RENDER_SCRIPT_CAMS(true, 500);
         }
         n::SET_CAM_COORD(camera_, cam.pos);
         n::SET_CAM_ROT(camera_, cam.rot);
-        n::SET_CAM_FOV(camera_, cam.fov);
+        n::SET_CAM_FOV(camera_, std::clamp(cam.fov, 1.0f, 130.0f));
         n::SET_FOCUS_POS_AND_VEL(cam.pos);  // stream the world in where the camera is, not where we stand
     } else if (camera_) {
         n::RENDER_SCRIPT_CAMS(false, 500);
@@ -256,6 +423,7 @@ void Rdr2Game::spectate(bool on, const CameraState& cam) {
         n::DESTROY_CAM(camera_);
         n::CLEAR_FOCUS();
         camera_ = 0;
+        g_scriptCamera = 0;
     }
 }
 
@@ -281,69 +449,78 @@ void Rdr2Game::showFriendWaypoint(bool on, const Vec3& pos) {
     if (waypointBlip_) n::SET_BLIP_NAME(waypointBlip_, n::LITERAL_STRING("Friend's waypoint"));
 }
 
-bool Rdr2Game::skipPed(int ped) {
-    Skip& s = skip_[ped];
-    if (static_cast<int32_t>(nowMs_ - s.untilMs) >= 0) {
-        s.skip = n::IS_PED_A_PLAYER(ped) || n::GET_VEHICLE_DRAFT_HORSE_IS_ATTACHED_TO(ped) != 0;
-        s.untilMs = nowMs_ + 2000;
-    }
-    return s.skip;
-}
-
-bool Rdr2Game::skipVehicle(int veh) {
-    Skip& s = skip_[veh];
-    if (static_cast<int32_t>(nowMs_ - s.untilMs) >= 0) {
-        s.skip = n::IS_THIS_MODEL_A_TRAIN(n::GET_ENTITY_MODEL(veh));
-        s.untilMs = nowMs_ + 5000;
-    }
-    return s.skip;
-}
+// ---------------------------------------------------------------- world queries
 
 void Rdr2Game::listNearby(const Vec3& a, const Vec3& b, float radius, std::vector<NearbyEntity>& out) {
+    // Called once per viewer in the same frame: the pool and every position are read only once.
     const float r2 = radius * radius;
     auto inRange = [&](const Vec3& p) {
         Vec3 da = p - a, db = p - b;
         return da.x * da.x + da.y * da.y + da.z * da.z <= r2 || db.x * db.x + db.y * db.y + db.z * db.z <= r2;
     };
-    int peds = collectPeds();
-    for (int i = 0; i < peds; ++i) {
-        int ped = g_peds[i];
-        if (!ped || own_.count(ped) || !n::DOES_ENTITY_EXIST(ped)) continue;
-        Vec3 pos = n::GET_ENTITY_COORDS(ped);  // distance first: the cheapest way to drop most peds
-        if (!inRange(pos) || skipPed(ped)) continue;
-        Cached& c = cached(ped);
-        c.have |= 3;
+    auto farOut = [&](int h) {
+        auto it = info_.find(h);
+        if (it == info_.end() || !it->second.haveSeen) return false;
+        const Info& in = it->second;
+        uint32_t age = nowMs_ - in.seenMs;
+        if (age >= kFarRecheckMs) return false;
+        float reach = radius + kMaxScanSpeed * static_cast<float>(age) * 0.001f;
+        Vec3 da = in.seenPos - a, db = in.seenPos - b;
+        float r = reach * reach;
+        return da.x * da.x + da.y * da.y + da.z * da.z > r && db.x * db.x + db.y * db.y + db.z * db.z > r;
+    };
+    auto seen = [&](int h) -> Vec3 {
+        Cached& c = cached(h);  // the pool only lists existing entities
         c.exists = true;
-        c.pos = pos;
+        c.have |= kHaveExists;
+        bool fresh = !(c.have & kHavePos);
+        Vec3 pos = position(h);
+        if (fresh) {
+            Info& in = info_[h];
+            in.usedMs = nowMs_;
+            in.seenPos = pos;
+            in.seenMs = nowMs_;
+            in.haveSeen = true;
+        }
+        return pos;
+    };
+    for (int ped : peds()) {
+        if (!ped || own_.count(ped) || farOut(ped)) continue;
+        Vec3 pos = seen(ped);  // distance first: the cheapest way to drop most peds
+        if (!inRange(pos)) continue;
+        const Info& in = ownerInfo(ped, false);
+        if (in.player || in.draftOf || own_.count(ped)) continue;  // draft animals belong to their vehicle
         out.push_back({ped, EntityKind::Ped, pos});
     }
-    int vehicles = collectVehicles();
-    for (int i = 0; i < vehicles; ++i) {
-        int veh = g_vehicles[i];
-        if (!veh || vehicles_.count(veh) || !n::DOES_ENTITY_EXIST(veh)) continue;
-        Vec3 pos = n::GET_ENTITY_COORDS(veh);
-        if (!inRange(pos) || skipVehicle(veh)) continue;
+    for (int veh : vehicles()) {
+        if (!veh || vehicles_.count(veh) || farOut(veh)) continue;
+        Vec3 pos = seen(veh);
+        if (!inRange(pos) || kindInfo(veh, true).train) continue;
         out.push_back({veh, EntityKind::Vehicle, pos});
     }
 }
 
 void Rdr2Game::readEntity(EntityHandle h, EntityKind kind, EntityRead& out) {
     EntityState& st = out.state;
+    const bool vehicle = kind == EntityKind::Vehicle;
+    const Info& in = ownerInfo(h, vehicle);
     st.kind = kind;
-    st.model = n::GET_ENTITY_MODEL(h);
-    st.pos = n::GET_ENTITY_COORDS(h);
+    st.model = in.model;
+    st.script = in.mission ? in.script : 0;
+    st.pos = position(h);
     st.vel = n::GET_ENTITY_VELOCITY(h);
-    st.heading = n::GET_ENTITY_HEADING(h);
-    if (n::IS_ENTITY_A_MISSION_ENTITY(h)) st.script = n::GET_ENTITY_SCRIPT(h);
-    if (kind == EntityKind::Vehicle) {
+    st.heading = heading(h);
+    if (vehicle) {
         Vec3 rot = n::GET_ENTITY_ROTATION(h);
         st.pitch = rot.x;
         st.roll = rot.y;
         return;
     }
-    st.health = static_cast<int16_t>(std::clamp(n::GET_ENTITY_HEALTH(h), 0, 32767));
-    if (n::IS_ENTITY_DEAD(h)) {
+    const bool human = in.human;
+    st.health = static_cast<int16_t>(std::clamp(health(h), 0, 32767));
+    if (isDead(h)) {
         st.flags |= NF_Dead;
+        npcShots_.erase(h);
         return;
     }
     if (n::IS_PED_IN_ANY_VEHICLE(h)) {
@@ -353,30 +530,39 @@ void Rdr2Game::readEntity(EntityHandle h, EntityKind kind, EntityRead& out) {
         out.mount = n::GET_MOUNT(h);
     }
     if (n::IS_PED_RAGDOLL(h)) st.flags |= NF_Ragdoll;
-    st.outfit = n::GET_PED_META_OUTFIT_HASH(h);
-    if (!n::IS_PED_HUMAN(h)) return;
+    st.outfit = outfitOf(h);
+    if (!human) return;
     st.weapon = n::GET_PED_CURRENT_HELD_WEAPON(h);
-    bool combat = n::IS_PED_IN_COMBAT(h, 0);
-    if (combat) {
+    if (n::IS_PED_IN_COMBAT(h, 0)) {
         st.flags |= NF_InCombat;
         out.target = n::GET_CURRENT_TARGET_FOR_PED(h);
-        if (out.target && st.weapon != kUnarmed) st.flags |= NF_Aiming;
+        if (out.target && armed(st.weapon)) st.flags |= NF_Aiming;
     }
-    ShotWatch& watch = npcShots_[h];  // starts watching this one for gunfire every frame
-    watch.readMs = nowMs_;
-    if (watch.shotMs && nowMs_ - watch.shotMs < kShotHoldMs) st.flags |= NF_Shooting;
+    // Only a ped holding a weapon can fire: those are watched for gunfire every frame. Drawing a
+    // weapon takes longer than the time between two reads, so the first shot is not missed.
+    if (armed(st.weapon)) {
+        ShotWatch& watch = npcShots_[h];
+        watch.readMs = nowMs_;
+        if (watch.shotMs && nowMs_ - watch.shotMs < kShotHoldMs) st.flags |= NF_Shooting;
+    } else {
+        npcShots_.erase(h);
+    }
 }
 
 void Rdr2Game::listForeign(std::vector<ForeignEntity>& out) {
-    int peds = collectPeds();
-    for (int i = 0; i < peds; ++i)
-        if (g_peds[i] && g_peds[i] != playerPed_)
-            out.push_back({g_peds[i], n::GET_VEHICLE_DRAFT_HORSE_IS_ATTACHED_TO(g_peds[i]),
-                           n::IS_ENTITY_A_MISSION_ENTITY(g_peds[i]) && !isSpawned(g_peds[i])});
-    int vehicles = collectVehicles();
-    for (int i = 0; i < vehicles; ++i)
-        if (g_vehicles[i])
-            out.push_back({g_vehicles[i], 0, n::IS_ENTITY_A_MISSION_ENTITY(g_vehicles[i]) && !isSpawned(g_vehicles[i])});
+    for (int ped : peds()) {
+        if (!ped || ped == playerPed_) continue;
+        if (isSpawned(ped)) {  // ours: no need to ask the game
+            out.push_back({ped, 0, false});
+            continue;
+        }
+        const Info& in = ownerInfo(ped, false);
+        out.push_back({ped, in.draftOf, in.mission});
+    }
+    for (int veh : vehicles()) {
+        if (!veh) continue;
+        out.push_back({veh, 0, !isSpawned(veh) && ownerInfo(veh, true).mission});
+    }
 }
 
 WorldInfo Rdr2Game::readWorldInfo() {
@@ -392,18 +578,24 @@ void Rdr2Game::applyWorldInfo(const WorldInfo& info, bool clock, bool weather) {
     if (clock) {
         // Only correct real drift, so the local clock keeps ticking smoothly in between.
         int local = n::GET_CLOCK_HOURS() * 60 + n::GET_CLOCK_MINUTES();
-        int remote = info.hour * 60 + info.minute;
+        int remote = (info.hour % 24) * 60 + info.minute % 60;
         int diff = std::abs(local - remote);
         diff = std::min(diff, 24 * 60 - diff);
-        if (diff >= 3) n::SET_CLOCK_TIME(info.hour, info.minute, info.second);
+        if (diff >= 3) n::SET_CLOCK_TIME(info.hour % 24, info.minute % 60, info.second % 60);
     }
-    if (weather && info.weather && info.weather != lastWeatherSet_) {
-        // First sync: switch at once; later changes blend in like natural weather.
-        float transition = lastWeatherSet_ ? 30.0f : 0.0f;
-        if (n::GET_PREV_WEATHER_TYPE_HASH_NAME() != info.weather) n::SET_WEATHER_TYPE(info.weather, transition);
+    if (weather && info.weather) {
+        // The local game keeps cycling its own weather, so this is checked every time, not only
+        // when the owner's weather changes. A transition already heading there is left alone.
+        bool there = n::GET_PREV_WEATHER_TYPE_HASH_NAME() == info.weather || n::GET_NEXT_WEATHER_TYPE_HASH_NAME() == info.weather;
+        if (!there) {
+            // First sync: switch at once; later changes blend in like natural weather.
+            n::SET_WEATHER_TYPE(info.weather, lastWeatherSet_ ? 30.0f : 0.0f);
+        }
         lastWeatherSet_ = info.weather;
     }
 }
+
+// ---------------------------------------------------------------- entities we create and drive
 
 EntityHandle Rdr2Game::spawn(EntityKind kind, uint32_t model, const Vec3& pos, float heading, SpawnRole role) {
     if (!n::IS_MODEL_VALID(model)) {
@@ -416,6 +608,8 @@ EntityHandle Rdr2Game::spawn(EntityKind kind, uint32_t model, const Vec3& pos, f
     if (kind == EntityKind::Vehicle) {
         int veh = n::CREATE_VEHICLE(model, pos, heading);  // draft vehicles get their horses automatically
         if (!veh) return 0;
+        poolsChanged();
+        forget(veh);
         n::SET_ENTITY_AS_MISSION_ENTITY(veh);
         n::SET_MODEL_AS_NO_LONGER_NEEDED(model);
         vehicles_.insert(veh);
@@ -424,6 +618,8 @@ EntityHandle Rdr2Game::spawn(EntityKind kind, uint32_t model, const Vec3& pos, f
 
     int ped = n::CREATE_PED(model, pos, heading);
     if (!ped) return 0;
+    poolsChanged();
+    forget(ped);
     n::SET_RANDOM_OUTFIT_VARIATION(ped);  // without a variation RDR2 peds are invisible
     n::SET_ENTITY_AS_MISSION_ENTITY(ped);
     n::SET_MODEL_AS_NO_LONGER_NEEDED(model);
@@ -436,7 +632,6 @@ EntityHandle Rdr2Game::spawn(EntityKind kind, uint32_t model, const Vec3& pos, f
         n::SET_PED_RELATIONSHIP_GROUP_HASH(ped, n::GET_PED_RELATIONSHIP_GROUP_HASH(playerPed_));
     }
     quadruped_[ped] = !n::IS_PED_HUMAN(ped);
-    if (role == SpawnRole::PlayerPuppet) puppetPed_ = ped;
     return ped;
 }
 
@@ -445,7 +640,7 @@ void Rdr2Game::prefetchModel(uint32_t model) {
 }
 
 void Rdr2Game::hideDraftAnimals(int vehicle, bool hidden) {
-    for (int harness = 0; harness < 4; ++harness)
+    for (int harness = 0; harness < kDraftHarnesses; ++harness)
         if (int horse = n::GET_PED_IN_DRAFT_HARNESS(vehicle, harness)) hide(horse, hidden);
 }
 
@@ -477,23 +672,23 @@ void Rdr2Game::unpark(EntityHandle h, const Vec3& pos, float heading) {
 }
 
 void Rdr2Game::remove(EntityHandle h) {
-    invalidate(h);
     auto blip = blips_.find(h);
     if (blip != blips_.end()) {
         n::REMOVE_BLIP(&blip->second);
         blips_.erase(blip);
     }
-    if (h == puppetPed_) puppetPed_ = 0;
-    npcShots_.erase(h);
+    forget(h);
     quadruped_.erase(h);
     bool vehicle = vehicles_.erase(h) != 0;
     if (!n::DOES_ENTITY_EXIST(h)) return;
+    poolsChanged();
     int handle = h;
     n::SET_ENTITY_AS_MISSION_ENTITY(handle);
     if (vehicle) {
-        for (int harness = 0; harness < 4; ++harness) {  // take the draft animals with it
+        for (int harness = 0; harness < kDraftHarnesses; ++harness) {  // take the draft animals with it
             int horse = n::GET_PED_IN_DRAFT_HARNESS(handle, harness);
             if (horse) {
+                forget(horse);
                 n::SET_ENTITY_AS_MISSION_ENTITY(horse);
                 n::DELETE_PED(&horse);
             }
@@ -507,41 +702,52 @@ void Rdr2Game::remove(EntityHandle h) {
 bool Rdr2Game::exists(EntityHandle h) {
     if (h == 0) return false;
     Cached& c = cached(h);
-    if (!(c.have & 1)) {
-        c.exists = n::DOES_ENTITY_EXIST(h);
-        c.have |= 1;
+    if (!(c.have & kHaveExists)) {
+        // Our own entities are persistent (mission entities): asking every frame is not needed.
+        auto known = isSpawned(h) ? info_.find(h) : info_.end();
+        if (known != info_.end() && !due(nowMs_, known->second.aliveUntilMs)) {
+            c.exists = true;
+        } else {
+            c.exists = n::DOES_ENTITY_EXIST(h);
+            if (c.exists && isSpawned(h)) {
+                Info& in = info_[h];
+                in.usedMs = nowMs_;
+                in.aliveUntilMs = nowMs_ + kAliveMs;
+            }
+        }
+        c.have |= kHaveExists;
     }
     return c.exists;
 }
 bool Rdr2Game::isDead(EntityHandle h) {
     Cached& c = cached(h);
-    if (!(c.have & 4)) {
+    if (!(c.have & kHaveDead)) {
         c.dead = n::IS_ENTITY_DEAD(h);
-        c.have |= 4;
+        c.have |= kHaveDead;
     }
     return c.dead;
 }
 Vec3 Rdr2Game::position(EntityHandle h) {
     Cached& c = cached(h);
-    if (!(c.have & 2)) {
+    if (!(c.have & kHavePos)) {
         c.pos = n::GET_ENTITY_COORDS(h);
-        c.have |= 2;
+        c.have |= kHavePos;
     }
     return c.pos;
 }
 float Rdr2Game::heading(EntityHandle h) {
     Cached& c = cached(h);
-    if (!(c.have & 8)) {
+    if (!(c.have & kHaveHeading)) {
         c.heading = n::GET_ENTITY_HEADING(h);
-        c.have |= 8;
+        c.have |= kHaveHeading;
     }
     return c.heading;
 }
 int Rdr2Game::health(EntityHandle h) {
     Cached& c = cached(h);
-    if (!(c.have & 16)) {
+    if (!(c.have & kHaveHealth)) {
         c.health = isDead(h) ? 0 : n::GET_ENTITY_HEALTH(h);
-        c.have |= 16;
+        c.have |= kHaveHealth;
     }
     return c.health;
 }
@@ -570,7 +776,7 @@ void Rdr2Game::nudge(EntityHandle h, const Vec3& delta) {
 
 void Rdr2Game::moveTo(EntityHandle h, const Vec3& pos, float speed, float heading) {
     auto it = quadruped_.find(h);
-    bool quadruped = it != quadruped_.end() ? it->second : !n::IS_PED_HUMAN(h);
+    bool quadruped = it != quadruped_.end() ? it->second : !kindInfo(h, false).human;
     n::TASK_GO_STRAIGHT_TO_COORD(h, pos, moveBlend(speed, quadruped), heading);
 }
 
@@ -590,7 +796,7 @@ void Rdr2Game::shootAt(EntityHandle h, const Vec3& target) {
 }
 
 void Rdr2Game::setWeapon(EntityHandle h, uint32_t weapon) {
-    if (weapon == 0 || weapon == kUnarmed) {
+    if (!armed(weapon)) {
         n::SET_CURRENT_PED_WEAPON(h, kUnarmed);
         return;
     }
@@ -601,11 +807,13 @@ void Rdr2Game::setWeapon(EntityHandle h, uint32_t weapon) {
 }
 
 void Rdr2Game::setMount(EntityHandle rider, EntityHandle mount) {
+    invalidate(rider);
     if (mount) n::SET_PED_ONTO_MOUNT(rider, mount);
     else n::REMOVE_PED_FROM_MOUNT(rider);
 }
 
 void Rdr2Game::setVehicle(EntityHandle ped, EntityHandle vehicle, int seat) {
+    invalidate(ped);
     if (vehicle) n::SET_PED_INTO_VEHICLE(ped, vehicle, seat);
     else n::CLEAR_PED_TASKS_IMMEDIATELY(ped);  // pops the ped out of its seat
 }
@@ -616,12 +824,18 @@ void Rdr2Game::ragdoll(EntityHandle h) { n::SET_PED_TO_RAGDOLL(h, 800, 2500); }
 
 void Rdr2Game::setLabel(EntityHandle h, const char* name) {
     static const uint32_t kFriendlyBlip = joaat("BLIP_STYLE_FRIENDLY");
+    const std::string label = hud::printable(name ? name : "", 48);  // a name from the network
+    auto old = blips_.find(h);  // a second label replaces the first instead of leaking its blip
+    if (old != blips_.end()) {
+        n::REMOVE_BLIP(&old->second);
+        blips_.erase(old);
+    }
     int blip = n::BLIP_ADD_FOR_ENTITY(kFriendlyBlip, h);
     if (blip) {
-        n::SET_BLIP_NAME(blip, n::LITERAL_STRING(name));
+        n::SET_BLIP_NAME(blip, n::LITERAL_STRING(label.c_str()));
         blips_[h] = blip;
     }
-    n::SET_PED_PROMPT_NAME(h, n::LITERAL_STRING(name));
+    n::SET_PED_PROMPT_NAME(h, n::LITERAL_STRING(label.c_str()));
 }
 
 void Rdr2Game::setOutfit(EntityHandle h, uint32_t outfit) {
@@ -643,6 +857,8 @@ void Rdr2Game::steerVehicle(EntityHandle h, const Vec3& velocity, float targetHe
         invalidate(h);
     }
 }
+
+// ---------------------------------------------------------------- shared-world helpers
 
 void Rdr2Game::damageNpc(EntityHandle npc, int amount, EntityHandle attacker) {
     invalidate(npc);
@@ -685,13 +901,19 @@ void Rdr2Game::hide(int h, bool hidden) {
 
 ForeignAction Rdr2Game::removeForeign(EntityHandle h) {
     invalidate(h);
-    if (!n::DOES_ENTITY_EXIST(h)) return ForeignAction::Deleted;
+    if (!n::DOES_ENTITY_EXIST(h)) {
+        forget(h);
+        return ForeignAction::Deleted;
+    }
     // Ambient population is deleted: hidden entities would still cost AI and physics time.
-    // Entities owned by a story script are only hidden, so the script does not break.
+    // Entities owned by a story script are only hidden, so the script does not break. Asked fresh
+    // here (not from the cache): deleting a script's entity is not something to get wrong.
     if (n::IS_ENTITY_A_MISSION_ENTITY(h)) {
         hide(h, true);
         return ForeignAction::Hidden;
     }
+    forget(h);
+    poolsChanged();
     int handle = h;
     n::SET_ENTITY_AS_MISSION_ENTITY(handle);
     if (n::IS_ENTITY_A_PED(handle)) n::DELETE_PED(&handle);

@@ -51,6 +51,8 @@ inline bool test(uint64_t hash, Args... args) { return invoke<int>(hash, args...
 inline int PLAYER_ID() { return invoke<int>(0x217E9DC48139933D); }
 inline Ped PLAYER_PED_ID() { return invoke<Ped>(0x096275889B8E0EE0); }
 inline bool IS_PLAYER_FREE_AIMING(int player) { return test(0x936F967D4BE1CE9D, player); }
+// Aiming with lock-on (the default with a controller) is not free aiming.
+inline bool IS_PLAYER_TARGETTING_ANYTHING(int player) { return test(0x4605C66E0F935F83, player); }
 inline bool IS_PLAYER_CONTROL_ON(int player) { return test(0x7964097FCE4C244B, player); }
 inline Ped GET_MOUNT_OWNED_BY_PLAYER(int player) { return invoke<Ped>(0xF49F14462F0AE27C, player); }
 inline Ped GET_SADDLE_HORSE_FOR_PLAYER(int player) { return invoke<Ped>(0xB48050D326E9A2F3, player); }
@@ -61,7 +63,6 @@ inline bool IS_ENTITY_DEAD(Entity e) { return test(0x7D5B1F88E7504BBA, e); }
 inline coop::Vec3 GET_ENTITY_COORDS(Entity e) { return invoke<Vector3>(0xA86D5F069399F44D, e, 1, 1).vec(); }
 inline float GET_ENTITY_HEADING(Entity e) { return invoke<float>(0xC230DD956E2F5507, e); }
 inline coop::Vec3 GET_ENTITY_VELOCITY(Entity e) { return invoke<Vector3>(0x4805D2B1D8CF94A9, e, 0).vec(); }
-inline float GET_ENTITY_SPEED(Entity e) { return invoke<float>(0xFB6BA510A533DF81, e); }
 inline int GET_ENTITY_HEALTH(Entity e) { return invoke<int>(0x82368787EA73C0F7, e); }
 inline int GET_ENTITY_MAX_HEALTH(Entity e) { return invoke<int>(0x15D757606D170C3C, e, 0); }
 inline Hash GET_ENTITY_MODEL(Entity e) { return invoke<Hash>(0xDA76A9F39210D365, e); }
@@ -81,7 +82,6 @@ inline Hash GET_ENTITY_SCRIPT(Entity e) {
     int args[8] = {};
     return invoke<Hash>(0x2A08A32B6D49906F, e, args);
 }
-inline void SET_ENTITY_HEADING(Entity e, float heading) { call(0xCF2B9C0645C4651B, e, heading); }
 inline void SET_ENTITY_AS_MISSION_ENTITY(Entity e) { call(0xDC19C288082E586E, e, 1, 1); }
 inline void SET_ENTITY_INVINCIBLE(Entity e, bool on) { call(0xA5C38736C426FCB8, e, on ? 1 : 0); }
 inline void SET_ENTITY_VISIBLE(Entity e, bool on) { call(0x1794B4FCC84D812F, e, on ? 1 : 0); }
@@ -99,7 +99,6 @@ inline Ped CREATE_PED(Hash model, coop::Vec3 p, float heading) {
 inline void DELETE_PED(Ped* ped) { call(0xCC0EF140F99365C5, ped); }
 inline void RESURRECT_PED(Ped ped) { call(0x71BC8E838B9C6035, ped); }
 inline void REVIVE_INJURED_PED(Ped ped) { call(0x8D8ACD8388CD99CE, ped); }
-inline bool IS_PED_WEAPON_READY_TO_SHOOT(Ped ped) { return test(0xB80CA294F2F26749, ped); }
 inline Entity GET_CURRENT_TARGET_FOR_PED(Ped ped) { return invoke<Entity>(0xCD66FEA29400A0B5, ped); }
 inline void SET_PED_INTO_VEHICLE(Ped ped, int vehicle, int seat) { call(0xF75B0D629E1C063D, ped, vehicle, seat); }
 inline int GET_VEHICLE_PED_IS_IN(Ped ped) { return invoke<int>(0x9A9112A0FE9A4713, ped, 0); }
@@ -201,10 +200,14 @@ inline int GET_CLOCK_SECONDS() { return invoke<int>(0xB6101ABE62B5F080); }
 inline void SET_CLOCK_TIME(int h, int m, int s) { call(0x3A52C59FFB2DEED8, h, m, s); }
 inline bool GET_MISSION_FLAG() { return test(0xB15CD1CF58771DE1); }
 inline bool GET_IS_LOADING_SCREEN_ACTIVE() { return test(0x71D4BF5890659B0C); }
+// The weather blends from "prev" to "next"; without a transition both are the current weather.
 inline uint32_t GET_PREV_WEATHER_TYPE_HASH_NAME() { return invoke<uint32_t>(0x4BEB42AEBCA732E9); }
+inline uint32_t GET_NEXT_WEATHER_TYPE_HASH_NAME() { return invoke<uint32_t>(0x51021D36F62AAA83); }
 inline void SET_WEATHER_TYPE(Hash weather, float transitionSeconds) {
-    call(0x59174F1AFE095B5A, weather, 1, 1, 1, transitionSeconds, 0);
+    call(0x59174F1AFE095B5A, weather, 1, 1, transitionSeconds > 0.0f ? 1 : 0, transitionSeconds, 0);
 }
+// MISC::VAR_STRING(flags, "LITERAL_STRING", text): the game's way to show arbitrary text. The result
+// lives in a short-lived game buffer: pass it straight to the native that uses it.
 inline const char* LITERAL_STRING(const char* text) { return invoke<const char*>(0xFA925AC00EB830B9, 10, "LITERAL_STRING", text); }
 
 // --- MAP / HUD
@@ -215,8 +218,11 @@ inline int BLIP_ADD_FOR_COORDS(Hash style, coop::Vec3 p) { return invoke<int>(0x
 inline void SET_BLIP_COORDS(int blip, coop::Vec3 p) { call(0x4FF674F5E23D49CE, blip, p.x, p.y, p.z); }
 inline bool IS_WAYPOINT_ACTIVE() { return test(0x202B1BBFC6AB5EE4); }
 inline coop::Vec3 GET_WAYPOINT_COORDS() { return invoke<Vector3>(0x29B30D07C3F7873B).vec(); }
-inline void SET_TEXT_SCALE(float x, float y) { call(0x4170B650590B3B00, x, y); }
-inline void SET_TEXT_COLOR(int r, int g, int b, int a) { call(0x50A41AD966910F03, r, g, b, a); }
-inline void DISPLAY_TEXT(const char* varString, float x, float y) { call(0xD79334A4BB99BAD1, varString, x, y); }
+// On-screen text. HUD::_SET_TEXT_COLOR / _DISPLAY_TEXT are empty since game build 1436 (and the
+// text scale native has no HUD:: counterpart at all): the working ones live in UIDEBUG. They
+// draw for one frame, so they are called every frame. The text must come from VAR_STRING.
+inline void BG_SET_TEXT_SCALE(float x, float y) { call(0xA1253A3C870B6843, x, y); }
+inline void BG_SET_TEXT_COLOR(int r, int g, int b, int a) { call(0x16FA5CE47F184F1E, r, g, b, a); }
+inline void BG_DISPLAY_TEXT(const char* varString, float x, float y) { call(0x16794E044C9EFB58, varString, x, y); }
 
 }  // namespace native
