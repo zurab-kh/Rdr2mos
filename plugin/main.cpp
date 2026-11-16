@@ -425,12 +425,15 @@ void scriptMain() {
 }  // namespace
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
+    static bool hooked = false;
     if (reason == DLL_PROCESS_ATTACH) {
         g_module = module;
-        scriptRegister(module, scriptMain);
+        hooked = scripthook::load();  // Script Hook loads .asi plugins, so it is already in the process
+        if (hooked) scriptRegister(module, scriptMain);
+        else logLine("ScriptHookRDR2.dll not found or too old: the mod stays inactive");
     } else if (reason == DLL_PROCESS_DETACH) {
         g_server.stop();
-        scriptUnregister(module);
+        if (hooked) scriptUnregister(module);
     }
     return TRUE;
 }

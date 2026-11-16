@@ -1,43 +1,36 @@
-// Declarations of the ScriptHookRDR2.dll entry points the plugin uses (same signatures as the
-// official SDK's main.h).
+// The ScriptHookRDR2.dll entry points the plugin uses (same signatures as the official SDK's main.h).
 //
-// MSVC derives the DLL's decorated export names straight from the C++ declarations. GCC mangles
-// C++ names differently, so for MinGW the functions are imported under plain C aliases that
-// ScriptHookRDR2.mingw.def maps onto the real export names.
+// They are looked up at load time with GetProcAddress, by their exported (MSVC-decorated) names.
+// No import library is needed, so the plugin builds the same way with any compiler and linker.
 #pragma once
 #include <windows.h>
 #include <cstdint>
 
-#ifdef _MSC_VER
+namespace scripthook {
 
-__declspec(dllimport) void scriptRegister(HMODULE module, void (*scriptMain)());
-__declspec(dllimport) void scriptUnregister(HMODULE module);
-__declspec(dllimport) void scriptWait(DWORD timeMs);
-__declspec(dllimport) void nativeInit(UINT64 hash);
-__declspec(dllimport) void nativePush64(UINT64 value);
-__declspec(dllimport) PUINT64 nativeCall();
-__declspec(dllimport) int worldGetAllPeds(int* handles, int capacity);
-__declspec(dllimport) int worldGetAllVehicles(int* handles, int capacity);
+struct Api {
+    void (*scriptRegister)(HMODULE module, void (*scriptMain)()) = nullptr;
+    void (*scriptUnregister)(HMODULE module) = nullptr;
+    void (*scriptWait)(DWORD timeMs) = nullptr;
+    void (*nativeInit)(UINT64 hash) = nullptr;
+    void (*nativePush64)(UINT64 value) = nullptr;
+    PUINT64 (*nativeCall)() = nullptr;
+    int (*worldGetAllPeds)(int* handles, int capacity) = nullptr;
+    int (*worldGetAllVehicles)(int* handles, int capacity) = nullptr;
+};
 
-#else
+extern Api g_api;
 
-extern "C" {
-__declspec(dllimport) void sh_scriptRegister(HMODULE module, void (*scriptMain)());
-__declspec(dllimport) void sh_scriptUnregister(HMODULE module);
-__declspec(dllimport) void sh_scriptWait(DWORD timeMs);
-__declspec(dllimport) void sh_nativeInit(UINT64 hash);
-__declspec(dllimport) void sh_nativePush64(UINT64 value);
-__declspec(dllimport) PUINT64 sh_nativeCall();
-__declspec(dllimport) int sh_worldGetAllPeds(int* handles, int capacity);
-__declspec(dllimport) int sh_worldGetAllVehicles(int* handles, int capacity);
-}
-inline void scriptRegister(HMODULE module, void (*scriptMain)()) { sh_scriptRegister(module, scriptMain); }
-inline void scriptUnregister(HMODULE module) { sh_scriptUnregister(module); }
-inline void scriptWait(DWORD timeMs) { sh_scriptWait(timeMs); }
-inline void nativeInit(UINT64 hash) { sh_nativeInit(hash); }
-inline void nativePush64(UINT64 value) { sh_nativePush64(value); }
-inline PUINT64 nativeCall() { return sh_nativeCall(); }
-inline int worldGetAllPeds(int* handles, int capacity) { return sh_worldGetAllPeds(handles, capacity); }
-inline int worldGetAllVehicles(int* handles, int capacity) { return sh_worldGetAllVehicles(handles, capacity); }
+// Resolves every entry point; false if ScriptHookRDR2.dll is not loaded or lacks one of them.
+bool load();
 
-#endif
+}  // namespace scripthook
+
+inline void scriptRegister(HMODULE module, void (*scriptMain)()) { scripthook::g_api.scriptRegister(module, scriptMain); }
+inline void scriptUnregister(HMODULE module) { scripthook::g_api.scriptUnregister(module); }
+inline void scriptWait(DWORD timeMs) { scripthook::g_api.scriptWait(timeMs); }
+inline void nativeInit(UINT64 hash) { scripthook::g_api.nativeInit(hash); }
+inline void nativePush64(UINT64 value) { scripthook::g_api.nativePush64(value); }
+inline PUINT64 nativeCall() { return scripthook::g_api.nativeCall(); }
+inline int worldGetAllPeds(int* handles, int capacity) { return scripthook::g_api.worldGetAllPeds(handles, capacity); }
+inline int worldGetAllVehicles(int* handles, int capacity) { return scripthook::g_api.worldGetAllVehicles(handles, capacity); }

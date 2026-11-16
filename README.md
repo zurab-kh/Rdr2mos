@@ -175,8 +175,8 @@ world_owner = 1             ; этот игрок хочет вести мир (
 
 ## Сборка
 
-Нужны CMake ≥ 3.16 и компилятор C++17. SDK Script Hook **не нужен**: библиотека импорта
-генерируется из `plugin/ScriptHookRDR2.def`.
+Нужны CMake ≥ 3.16 и компилятор C++17. SDK Script Hook **не нужен**: функции
+`ScriptHookRDR2.dll` находятся при загрузке плагина (`plugin/scripthook.cpp`).
 
 ```bash
 # Windows, Visual Studio 2019/2022 ("x64 Native Tools Command Prompt"):
