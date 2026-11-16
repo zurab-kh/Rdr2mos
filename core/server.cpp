@@ -1,13 +1,26 @@
 #include "server.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <random>
 #include <set>
 
 namespace coop {
 
 namespace {
 constexpr size_t kMaxClients = 512;
+constexpr uint16_t kMaxClientsPerIp = 16;    // a LAN party behind one address still fits two campaigns
+constexpr int kMaxDatagramsPerPump = 4096;   // a flood must not keep pump() from serving the players
+constexpr uint32_t kCookieWindowMs = 30000;  // a Challenge cookie stays good for 30-60 s
+constexpr size_t kMaxCachedEntities = 4096;  // world copy per campaign (a session streams far fewer)
+constexpr size_t kMaxUploadBytes = 256u << 20;  // all save uploads in progress together
+constexpr uint32_t kMaxAuthFailures = 10;    // wrong passwords per address and minute
+constexpr uint32_t kAuthWindowMs = 60000;
+// Per player: messages with side effects (damage, story, waypoints, save requests, ...) and bytes of
+// everything that gets passed on. Real play stays far below both.
+constexpr float kControlPerSecond = 60, kControlBurst = 120;
+constexpr float kBytesPerSecond = 256 * 1024, kBytesBurst = 512 * 1024;
 constexpr uint32_t kForgetMs = 20000;        // a client that is gone this long is dropped
 constexpr uint32_t kDeniedLingerMs = 1500;   // time for the "denied" message to get out
 constexpr uint32_t kStoryTickMs = 50;
@@ -15,32 +28,101 @@ constexpr uint32_t kPersistMs = 30000;
 constexpr uint32_t kJoinWaitMs = 45000;
 constexpr uint32_t kSettleMs = 1500;
 constexpr uint32_t kFailGuardMs = 3000;      // race guard: a death right after a shared failure is not passed on
-constexpr size_t kDownloadWindow = 48;
+constexpr size_t kDownloadWindow = 64;
 
-std::string cleanName(const std::string& raw) {
+// Length of the valid UTF-8 sequence at s[i], or 0 (overlong forms, surrogates and stray bytes too).
+size_t utf8Sequence(const std::string& s, size_t i) {
+    auto at = [&](size_t k) { return static_cast<unsigned char>(s[k]); };
+    unsigned char c = at(i);
+    if (c < 0x80) return 1;
+    size_t n = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC2 ? 2 : 0;
+    if (!n || c > 0xF4 || i + n > s.size()) return 0;
+    for (size_t k = 1; k < n; ++k)
+        if ((at(i + k) & 0xC0) != 0x80) return 0;
+    unsigned char c1 = at(i + 1);
+    if ((c == 0xE0 && c1 < 0xA0) || (c == 0xED && c1 > 0x9F) || (c == 0xF0 && c1 < 0x90) || (c == 0xF4 && c1 > 0x8F))
+        return 0;
+    return n;
+}
+
+// Names end up in the HUD, the journal and players.ini: printable, valid UTF-8, no '=', at most 24
+// bytes (never cut inside a character), no spaces around.
+std::string cleanName(const std::string& raw, size_t maxBytes = 24) {
     std::string out;
-    for (char c : raw)
-        if (static_cast<unsigned char>(c) >= 32 && c != '=' && c != '\n') out += c;
-    if (out.size() > 24) out.resize(24);
+    for (size_t i = 0; i < raw.size();) {
+        size_t n = utf8Sequence(raw, i);
+        if (!n) {
+            ++i;
+            continue;
+        }
+        unsigned char c = static_cast<unsigned char>(raw[i]);
+        bool c1Control = c == 0xC2 && static_cast<unsigned char>(raw[i + 1]) < 0xA0;  // U+0080..U+009F
+        bool keep = (n > 1 && !c1Control) || (c > 32 && c != 127 && c != '=') || (c == ' ' && !out.empty());
+        if (keep) {
+            if (out.size() + n > maxBytes) break;
+            out.append(raw, i, n);
+        }
+        i += n;
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
     return out.empty() ? "Player" : out;
 }
+
+// Avatars are ped model names.
+std::string cleanAvatar(const std::string& raw) {
+    std::string out;
+    for (char c : raw) {
+        unsigned char u = static_cast<unsigned char>(c);
+        if (std::isalnum(u) || c == '_') out += c;
+        if (out.size() >= 48) break;
+    }
+    return out;
+}
+
+// SipHash-2-4 of two words: Challenge cookies must not be predictable for another address.
+uint64_t rotl(uint64_t x, int b) { return (x << b) | (x >> (64 - b)); }
+uint64_t siphash(const uint64_t key[2], uint64_t m0, uint64_t m1) {
+    uint64_t v0 = key[0] ^ 0x736f6d6570736575ull, v1 = key[1] ^ 0x646f72616e646f6dull;
+    uint64_t v2 = key[0] ^ 0x6c7967656e657261ull, v3 = key[1] ^ 0x7465646279746573ull;
+    auto round = [&] {
+        v0 += v1; v1 = rotl(v1, 13); v1 ^= v0; v0 = rotl(v0, 32);
+        v2 += v3; v3 = rotl(v3, 16); v3 ^= v2;
+        v0 += v3; v3 = rotl(v3, 21); v3 ^= v0;
+        v2 += v1; v1 = rotl(v1, 17); v1 ^= v2; v2 = rotl(v2, 32);
+    };
+    for (uint64_t m : {m0, m1, uint64_t(16) << 56}) {
+        v3 ^= m;
+        round();
+        round();
+        v0 ^= m;
+    }
+    v2 ^= 0xff;
+    for (int i = 0; i < 4; ++i) round();
+    return v0 ^ v1 ^ v2 ^ v3;
+}
+
+// A per-player allowance that refills over time.
+struct Budget {
+    float tokens = -1;
+    uint32_t lastMs = 0;
+    bool take(float cost, float perSecond, float burst, uint32_t nowMs) {
+        if (tokens < 0) tokens = burst;
+        else tokens = std::min(burst, tokens + static_cast<float>(nowMs - lastMs) * perSecond / 1000.0f);
+        lastMs = nowMs;
+        if (tokens < cost) return false;
+        tokens -= cost;
+        return true;
+    }
+};
 }  // namespace
 
-// The real socket, seen by one client's link: only that client's datagrams, sends go to it.
+// The real socket, seen by one client's link: sends go to that client. Its datagrams are handed to
+// the link directly (Link::receive), so nothing is queued or copied per datagram.
 class Server::ClientSocket final : public IDatagramSocket {
 public:
     ClientSocket(IDatagramSocket& real, Endpoint ep) : real_(real), ep_(ep) {}
     bool sendTo(const Endpoint&, const uint8_t* data, size_t size) override { return real_.sendTo(ep_, data, size); }
-    int recvFrom(Endpoint& from, uint8_t* buffer, size_t capacity) override {
-        if (queue.empty()) return -1;
-        std::vector<uint8_t>& d = queue.front();
-        size_t n = std::min(capacity, d.size());
-        std::copy(d.begin(), d.begin() + static_cast<std::ptrdiff_t>(n), buffer);
-        from = ep_;
-        queue.pop_front();
-        return static_cast<int>(n);
-    }
-    std::deque<std::vector<uint8_t>> queue;
+    int recvFrom(Endpoint&, uint8_t*, size_t) override { return -1; }
 
 private:
     IDatagramSocket& real_;
@@ -67,11 +149,14 @@ struct Server::Client {
     uint16_t prevFlags = 0;
     bool holding = false, mismatch = false;
     uint32_t holdStartMs = 0, readySinceMs = 0, failGuardUntil = 0;
-    // save transfer
-    std::vector<uint8_t> upload, download;
-    size_t uploadOffset = 0, downloadOffset = 0;
+    // save transfer: an upload grows as its pieces arrive, a download shares the campaign's copy
+    std::vector<uint8_t> upload;
+    std::shared_ptr<const std::vector<uint8_t>> download;
+    size_t uploadTotal = 0, downloadOffset = 0;
     uint32_t uploadCrc = 0, downloadCrc = 0;
-    bool downloading = false;
+    bool uploading = false, downloading = false;
+    // limits
+    Budget control, bytes;
 };
 
 struct Server::Campaign {
@@ -84,14 +169,46 @@ struct Server::Campaign {
     std::vector<uint8_t> worldInfo, waypoint;
     uint8_t waypointFrom = 0;
     bool hasSave = false;
+    std::shared_ptr<const std::vector<uint8_t>> save;  // the latest campaign save, read once
+    uint32_t saveCrc = 0;
     uint32_t ownerMissionStartMs = 0;
     bool ownerInMission = false;
     std::map<uint8_t, Client*> byId;
 };
 
 Server::Server(IDatagramSocket& socket, const ServerConfig& config, IServerStorage& storage)
-    : socket_(socket), config_(config), storage_(storage) {}
+    : socket_(socket), config_(config), storage_(storage) {
+    std::random_device rd;
+    for (uint64_t& k : cookieKey_) k = (uint64_t(rd()) << 32) ^ rd();
+}
 Server::~Server() = default;
+
+ServerStats Server::stats() const {
+    ServerStats s = stats_;
+    s.uploadBytes = uploadBytes();
+    return s;
+}
+
+size_t Server::uploadBytes() const {
+    size_t n = 0;
+    for (const auto& [ep, c] : clients_) n += c->upload.size();
+    return n;
+}
+
+void Server::shutdown(uint32_t nowMs) {
+    for (auto& [ep, c] : clients_) {
+        if (c->admitted) {
+            if (c->haveState) storage_.storePlayer(c->campaign, c->name, c->state.pos);
+            storage_.journal(c->campaign, c->name + " left (server stopped)");
+        }
+        c->link.stop();  // a Bye: the player starts reconnecting at once instead of timing out
+    }
+    clients_.clear();
+    clientsPerIp_.clear();
+    campaigns_.clear();
+    ++revision_;
+    (void)nowMs;
+}
 
 size_t Server::playerCount() const {
     size_t n = 0;
@@ -125,8 +242,12 @@ Server::Client* Server::member(Campaign& camp, uint8_t id) {
 void Server::pump(uint32_t nowMs) {
     uint8_t buffer[2048];
     Endpoint from;
-    int size;
-    while ((size = socket_.recvFrom(from, buffer, sizeof(buffer))) >= 0) dispatch(from, buffer, static_cast<size_t>(size), nowMs);
+    for (int n = 0; n < kMaxDatagramsPerPump; ++n) {
+        int size = socket_.recvFrom(from, buffer, sizeof(buffer));
+        if (size < 0) break;
+        ++stats_.datagrams;
+        dispatch(from, buffer, static_cast<size_t>(size), nowMs);
+    }
 
     for (auto it = clients_.begin(); it != clients_.end();) {
         Client& c = *it->second;
@@ -139,8 +260,11 @@ void Server::pump(uint32_t nowMs) {
                 admit(c, nowMs);
             }
             Msg type;
-            std::vector<uint8_t> payload;
-            while (c.link.poll(type, payload)) handle(c, type, payload, nowMs);
+            while (c.link.poll(type, message_)) {
+                if (!c.admitted) continue;
+                if (allow(c, type, message_.size(), nowMs)) handle(c, type, message_, nowMs);
+                else ++stats_.rateLimited;
+            }
             if (c.downloading) pumpDownload(c);
         } else {
             if (c.admitted) leave(c, nowMs, "left");
@@ -151,6 +275,8 @@ void Server::pump(uint32_t nowMs) {
         bool neverJoined = !c.link.connected() && !c.linkEpoch && nowMs - c.createdMs > kForgetMs;
         if (deniedDone || gone || neverJoined) {
             if (c.admitted) leave(c, nowMs, "left");
+            auto ip = clientsPerIp_.find(c.ep.ip);
+            if (ip != clientsPerIp_.end() && --ip->second == 0) clientsPerIp_.erase(ip);
             it = clients_.erase(it);
             continue;
         }
@@ -163,33 +289,108 @@ void Server::pump(uint32_t nowMs) {
     }
     if (nowMs - lastPersistMs_ >= kPersistMs) {
         lastPersistMs_ = nowMs;
+        for (auto f = authFailures_.begin(); f != authFailures_.end();)
+            f = nowMs - f->second.sinceMs > kAuthWindowMs ? authFailures_.erase(f) : std::next(f);
         for (auto& [ep, c] : clients_)
             if (c->admitted && c->haveState) storage_.storePlayer(c->campaign, c->name, c->state.pos);
     }
     for (auto& [ep, c] : clients_) c->link.flush(nowMs);
 }
 
+uint32_t Server::cookie(const Endpoint& ep, uint32_t window) const {
+    uint32_t c = static_cast<uint32_t>(siphash(cookieKey_, (uint64_t(ep.ip) << 16) | ep.port, window));
+    return c ? c : 1;
+}
+
 void Server::dispatch(const Endpoint& from, const uint8_t* data, size_t size, uint32_t nowMs) {
-    if (size > kMaxDatagram + 64) return;
-    auto it = clients_.find(from);
-    if (it == clients_.end()) {
-        // Only a proper Hello opens a new client: random traffic costs nothing.
-        ByteReader r(data, size);
-        PacketType type;
-        bool versionOk;
-        if (!readPacketHeader(r, type, versionOk) || type != PacketType::Hello || clients_.size() >= kMaxClients) return;
-        auto c = std::make_unique<Client>();
-        c->ep = from;
-        c->socket = std::make_unique<ClientSocket>(socket_, from);
-        c->createdMs = nowMs;
-        LinkConfig lc;
-        lc.listen = true;
-        lc.local.role = Role::Host;
-        lc.local.name = "server";
-        c->link.start(c->socket.get(), lc, nowMs);
-        it = clients_.emplace(from, std::move(c)).first;
+    ByteReader r(data, size);
+    PacketType type;
+    bool versionOk = false;
+    if (size > kMaxDatagram + 64 || !readPacketHeader(r, type, versionOk)) {
+        ++stats_.dropped;
+        return;
     }
-    it->second->socket->queue.emplace_back(data, data + size);
+    auto it = clients_.find(from);
+    if (type == PacketType::Hello) {
+        // Nothing here may answer with more bytes than it got: the sender address is not proven yet.
+        if (!versionOk) {
+            // Our own Hello, so the player's mod shows "version mismatch" (older mods understand it too).
+            ByteWriter w;
+            writePacketHeader(w, PacketType::Hello);
+            write(w, HelloInfo{});
+            if (w.data.size() <= size) socket_.sendTo(from, w.data.data(), w.data.size());
+            return;
+        }
+        HelloInfo hello;
+        if (!read(r, hello) || hello.role != Role::Guest) {
+            ++stats_.dropped;
+            return;
+        }
+        // Only a Hello that echoes a cookie for its own address opens (or restarts) a session; any
+        // other gets the cookie, in a datagram smaller than the Hello. A forged sender address never
+        // sees it, so it can neither take a slot here nor make the server send someone else more.
+        uint32_t window = nowMs / kCookieWindowMs;
+        if (hello.cookie != cookie(from, window) && hello.cookie != cookie(from, window - 1)) {
+            ByteWriter w;
+            writePacketHeader(w, PacketType::Challenge);
+            w.u32(cookie(from, window));
+            socket_.sendTo(from, w.data.data(), w.data.size());
+            ++stats_.challenges;
+            return;
+        }
+        if (it == clients_.end()) {
+            auto ip = clientsPerIp_.find(from.ip);
+            if (clients_.size() >= kMaxClients || (ip != clientsPerIp_.end() && ip->second >= kMaxClientsPerIp)) {
+                ++stats_.dropped;
+                return;
+            }
+            auto c = std::make_unique<Client>();
+            c->ep = from;
+            c->socket = std::make_unique<ClientSocket>(socket_, from);
+            c->createdMs = nowMs;
+            LinkConfig lc;
+            lc.listen = true;
+            lc.local.role = Role::Host;
+            lc.local.name = "server";
+            c->link.start(c->socket.get(), lc, nowMs);
+            it = clients_.emplace(from, std::move(c)).first;
+            ++clientsPerIp_[from.ip];
+        }
+    } else if (it == clients_.end()) {
+        ++stats_.dropped;  // random traffic costs nothing
+        return;
+    }
+    it->second->link.receive(from, data, size, nowMs);
+}
+
+bool Server::allow(Client& c, Msg type, size_t size, uint32_t nowMs) {
+    // Save uploads are bounded by size, are not passed on, and should go as fast as the line allows.
+    if (type == Msg::SaveChunk) return true;
+    if (!c.bytes.take(static_cast<float>(size), kBytesPerSecond, kBytesBurst, nowMs)) return false;
+    bool stream = type == Msg::PlayerState || type == Msg::EntitySnapshot || type == Msg::Camera || type == Msg::WorldInfo;
+    return stream || c.control.take(1, kControlPerSecond, kControlBurst, nowMs);
+}
+
+bool Server::authBlocked(uint32_t ip, uint32_t nowMs) {
+    auto it = authFailures_.find(ip);
+    if (it == authFailures_.end()) return false;
+    if (nowMs - it->second.sinceMs > kAuthWindowMs) {
+        authFailures_.erase(it);
+        return false;
+    }
+    return it->second.count >= kMaxAuthFailures;
+}
+
+void Server::authFailed(uint32_t ip, uint32_t nowMs) {
+    if (authFailures_.size() >= 4096 && !authFailures_.count(ip)) return;
+    AuthFailures& f = authFailures_[ip];
+    if (!f.count || nowMs - f.sinceMs > kAuthWindowMs) f = AuthFailures{0, nowMs};
+    ++f.count;
+}
+
+void Server::dropUpload(Client& c) {
+    c.uploading = false;
+    std::vector<uint8_t>().swap(c.upload);
 }
 
 // ---------------------------------------------------------------- joining and leaving
@@ -202,13 +403,25 @@ void Server::admit(Client& c, uint32_t nowMs) {
         c.deniedAtMs = nowMs ? nowMs : 1;
     };
     if (campaignName.empty()) return deny("invalid campaign name");
-    if (!config_.password.empty() && hello.password != config_.password) return deny("wrong password");
+    if (!config_.password.empty()) {
+        // Guessing is slow: a few wrong passwords per address and minute, then not even checked.
+        if (authBlocked(c.ep.ip, nowMs)) return deny("too many wrong passwords - wait a minute");
+        if (hello.password != config_.password) {
+            authFailed(c.ep.ip, nowMs);
+            return deny("wrong password");
+        }
+    }
     auto& slot = campaigns_[campaignName];
     if (!slot) {
         slot = std::make_unique<Campaign>();
         slot->name = campaignName;
-        std::vector<uint8_t> probe;
-        slot->hasSave = storage_.loadSave(campaignName, probe);
+        // Read once and kept: every download of this campaign shares the copy.
+        std::vector<uint8_t> data;
+        slot->hasSave = storage_.loadSave(campaignName, data);
+        if (slot->hasSave && !data.empty() && data.size() <= kMaxSaveBytes) {
+            slot->saveCrc = crc32(data.data(), data.size());
+            slot->save = std::make_shared<const std::vector<uint8_t>>(std::move(data));
+        }
     }
     Campaign& camp = *slot;
     if (static_cast<int>(camp.ids.size()) >= std::min<int>(config_.maxPlayers, kMaxPlayers)) return deny("campaign is full");
@@ -216,14 +429,17 @@ void Server::admit(Client& c, uint32_t nowMs) {
     uint8_t id = 1;
     while (camp.byId.count(id)) ++id;
     std::string name = cleanName(hello.name);
-    for (int n = 2; std::any_of(camp.byId.begin(), camp.byId.end(), [&](auto& kv) { return kv.second->name == name; }); ++n)
-        name = cleanName(hello.name) + " " + std::to_string(n);
+    for (int n = 2; std::any_of(camp.byId.begin(), camp.byId.end(), [&](auto& kv) { return kv.second->name == name; }); ++n) {
+        std::string suffix = " " + std::to_string(n);
+        name = cleanName(hello.name, 24 - suffix.size()) + suffix;  // still within the 24 bytes
+    }
 
     c.admitted = true;
+    c.deniedAtMs = 0;  // an earlier attempt on this address may have been turned away
     c.id = id;
     c.campaign = campaignName;
     c.name = name;
-    c.avatar = hello.avatar.substr(0, 48);
+    c.avatar = cleanAvatar(hello.avatar);
     c.wantsWorld = hello.wantsWorld != 0;
     c.joinedMs = nowMs;
     c.haveState = false;
@@ -232,10 +448,12 @@ void Server::admit(Client& c, uint32_t nowMs) {
     c.missionScript = 0;
     c.prevFlags = 0;
     c.holding = c.mismatch = false;
-    c.upload.clear();
+    dropUpload(c);
     c.downloading = false;
+    c.download.reset();
     camp.ids.push_back(id);
     camp.byId[id] = &c;
+    ++revision_;
 
     Welcome w;
     w.playerId = id;
@@ -254,11 +472,11 @@ void Server::admit(Client& c, uint32_t nowMs) {
     for (uint8_t other : camp.ids) {
         Client* o = member(camp, other);
         if (!o || o == &c) continue;
-        if (!o->stateBytes.empty()) c.link.send(Msg::PlayerState, withSource(o->id, o->stateBytes), false);
-        if (!o->appearanceBytes.empty()) c.link.send(Msg::Appearance, withSource(o->id, o->appearanceBytes), true);
+        if (!o->stateBytes.empty()) c.link.sendFrom(o->id, Msg::PlayerState, o->stateBytes, false);
+        if (!o->appearanceBytes.empty()) c.link.sendFrom(o->id, Msg::Appearance, o->appearanceBytes, true);
     }
     if (camp.owner != id) sendWorldTo(camp, c);
-    if (!camp.waypoint.empty()) c.link.send(Msg::Waypoint, withSource(camp.waypointFrom, camp.waypoint), true);
+    if (!camp.waypoint.empty()) c.link.sendFrom(camp.waypointFrom, Msg::Waypoint, camp.waypoint, true);
     for (uint8_t other : camp.ids)
         if (Client* o = member(camp, other); o && o != &c) notice(*o, name + " joined the campaign");
 }
@@ -266,6 +484,10 @@ void Server::admit(Client& c, uint32_t nowMs) {
 void Server::leave(Client& c, uint32_t nowMs, const char* why) {
     if (!c.admitted) return;
     c.admitted = false;
+    dropUpload(c);
+    c.downloading = false;
+    c.download.reset();
+    ++revision_;
     auto cit = campaigns_.find(c.campaign);
     if (cit == campaigns_.end()) return;
     Campaign& camp = *cit->second;
@@ -296,6 +518,7 @@ void Server::electOwner(Campaign& camp, uint32_t nowMs, uint8_t preferred) {
     if (chosen == camp.owner) return;
     camp.owner = chosen;
     ++camp.epoch;
+    ++revision_;
     // A new world: whatever was cached belongs to the old one.
     camp.cache.clear();
     camp.worldInfo.clear();
@@ -322,7 +545,12 @@ void Server::sendRoster(Campaign& camp) {
 void Server::mergeSnapshot(Campaign& camp, const EntitySnapshot& snap) {
     camp.cacheTimeMs = snap.timeMs;
     for (const EntityState& e : snap.entities) {
-        EntityState& c = camp.cache[e.id];
+        auto it = camp.cache.find(e.id);
+        if (it == camp.cache.end()) {
+            if (camp.cache.size() >= kMaxCachedEntities) continue;
+            it = camp.cache.emplace(e.id, EntityState{}).first;
+        }
+        EntityState& c = it->second;
         if ((e.fields & EF_Static) && (c.fields & EF_Static) && (c.model != e.model || c.kind != e.kind)) c = EntityState{};
         c.id = e.id;
         if (e.fields & EF_Static) {
@@ -371,10 +599,12 @@ void Server::sendWorldTo(Campaign& camp, Client& c) {
 
 void Server::forward(Campaign& camp, const Client& from, Msg type, const std::vector<uint8_t>& payload, bool reliable,
                      bool prefix) {
-    std::vector<uint8_t> out = prefix ? withSource(from.id, payload) : payload;
+    // Written straight into each player's outgoing buffer: no copy of the message per player.
     for (uint8_t id : camp.ids) {
         Client* m = member(camp, id);
-        if (m && m != &from) m->link.send(type, out, reliable);
+        if (!m || m == &from) continue;
+        if (prefix) m->link.sendFrom(from.id, type, payload, reliable);
+        else m->link.send(type, payload, reliable);
     }
 }
 
@@ -399,7 +629,7 @@ void Server::handle(Client& c, Msg type, const std::vector<uint8_t>& payload, ui
             return;
         }
         case Msg::EntitySnapshot: {
-            EntitySnapshot snap;
+            EntitySnapshot& snap = snapshot_;
             if (!isOwner || !decode(payload, snap)) return;  // only the world owner describes the world
             mergeSnapshot(camp, snap);
             forward(camp, c, type, payload, false, false);
@@ -416,7 +646,7 @@ void Server::handle(Client& c, Msg type, const std::vector<uint8_t>& payload, ui
             // Players take their own damage; everything else lives in the owner's world.
             uint8_t to = isPlayerRef(d.target) ? playerOfRef(d.target) : camp.owner;
             Client* target = member(camp, to);
-            if (target && target != &c) target->link.send(type, withSource(c.id, payload), true);
+            if (target && target != &c) target->link.sendFrom(c.id, type, payload, true);
             return;
         }
         case Msg::Appearance:
@@ -459,31 +689,40 @@ void Server::handle(Client& c, Msg type, const std::vector<uint8_t>& payload, ui
         }
         case Msg::SaveRequest: {
             if (c.downloading) return;
-            if (!storage_.loadSave(camp.name, c.download) || c.download.empty() || c.download.size() > kMaxSaveBytes) {
-                c.download.clear();
+            if (!camp.save) {
                 c.link.send(Msg::SaveChunk, SaveChunk{}, true);  // total 0: nothing stored yet
                 return;
             }
-            c.downloadCrc = crc32(c.download.data(), c.download.size());
+            c.download = camp.save;
+            c.downloadCrc = camp.saveCrc;
             c.downloadOffset = 0;
             c.downloading = true;
             pumpDownload(c);
             return;
         }
         case Msg::SaveChunk: {
-            SaveChunk chunk;
+            SaveChunk& chunk = uploadChunk_;
             if (!decode(payload, chunk) || chunk.total == 0) return;
             // The campaign save comes from the world owner (or from anyone, to start a campaign).
             if (!isOwner && camp.hasSave) return;
             if (chunk.offset == 0) {
-                c.upload.assign(chunk.total, 0);
+                // The buffer grows with what really arrives: announcing 64 MB costs the sender 64 MB.
+                dropUpload(c);
+                c.uploading = true;
+                c.uploadTotal = chunk.total;
                 c.uploadCrc = chunk.crc;
-                c.uploadOffset = 0;
+                c.upload.reserve(std::min<size_t>(chunk.total, 1u << 20));
             }
-            if (chunk.offset != c.uploadOffset || chunk.total != c.upload.size() || chunk.crc != c.uploadCrc) return;
-            std::copy(chunk.data.begin(), chunk.data.end(), c.upload.begin() + static_cast<std::ptrdiff_t>(chunk.offset));
-            c.uploadOffset += chunk.data.size();
-            if (c.uploadOffset >= c.upload.size()) finishUpload(c, camp, nowMs);
+            if (!c.uploading || chunk.offset != c.upload.size() || chunk.total != c.uploadTotal ||
+                chunk.crc != c.uploadCrc)
+                return;
+            if (uploadBytes() + chunk.data.size() > kMaxUploadBytes) {
+                dropUpload(c);
+                notice(c, "The server is busy - upload your save again later");
+                return;
+            }
+            c.upload.insert(c.upload.end(), chunk.data.begin(), chunk.data.end());
+            if (c.upload.size() >= c.uploadTotal) finishUpload(c, camp, nowMs);
             return;
         }
         default:
@@ -494,8 +733,11 @@ void Server::handle(Client& c, Msg type, const std::vector<uint8_t>& payload, ui
 void Server::finishUpload(Client& c, Campaign& camp, uint32_t nowMs) {
     (void)nowMs;
     bool ok = crc32(c.upload.data(), c.upload.size()) == c.uploadCrc && storage_.storeSave(camp.name, c.upload, c.name);
-    c.upload.clear();
-    c.upload.shrink_to_fit();
+    if (ok) {
+        camp.saveCrc = c.uploadCrc;
+        camp.save = std::make_shared<const std::vector<uint8_t>>(std::move(c.upload));
+    }
+    dropUpload(c);
     if (!ok) {
         notice(c, "The server could not store your save");
         return;
@@ -507,19 +749,18 @@ void Server::finishUpload(Client& c, Campaign& camp, uint32_t nowMs) {
 
 void Server::pumpDownload(Client& c) {
     while (c.downloading && c.link.pendingReliable() < kDownloadWindow) {
-        SaveChunk chunk;
-        chunk.total = static_cast<uint32_t>(c.download.size());
+        const std::vector<uint8_t>& save = *c.download;
+        SaveChunk& chunk = chunk_;
+        chunk.total = static_cast<uint32_t>(save.size());
         chunk.crc = c.downloadCrc;
         chunk.offset = static_cast<uint32_t>(c.downloadOffset);
-        size_t n = std::min(kSaveChunkBytes, c.download.size() - c.downloadOffset);
-        chunk.data.assign(c.download.begin() + static_cast<std::ptrdiff_t>(c.downloadOffset),
-                          c.download.begin() + static_cast<std::ptrdiff_t>(c.downloadOffset + n));
+        size_t n = std::min(kSaveChunkBytes, save.size() - c.downloadOffset);
+        chunk.data.assign(save.data() + c.downloadOffset, save.data() + c.downloadOffset + n);
         c.link.send(Msg::SaveChunk, chunk, true);
         c.downloadOffset += n;
-        if (c.downloadOffset >= c.download.size()) {
+        if (c.downloadOffset >= save.size()) {
             c.downloading = false;
-            c.download.clear();
-            c.download.shrink_to_fit();
+            c.download.reset();
         }
     }
 }

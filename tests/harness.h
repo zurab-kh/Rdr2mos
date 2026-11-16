@@ -63,6 +63,9 @@ public:
     public:
         Socket(MemoryNetwork& net, Endpoint self) : net_(net), self_(self) {}
         bool sendTo(const Endpoint& to, const uint8_t* data, size_t size) override {
+            bytesSent += size;
+            ++datagramsSent;
+            if (net_.tap) net_.tap(self_, to, data, size);
             if (std::uniform_real_distribution<double>(0, 1)(net_.rng) < net_.loss) return true;
             if (!net_.sockets_.count(self_)) return true;  // unplugged: nothing gets out either
             auto it = net_.sockets_.find(to);
@@ -88,6 +91,7 @@ public:
             return static_cast<int>(n);
         }
         Endpoint self() const { return self_; }
+        uint64_t bytesSent = 0, datagramsSent = 0;  // everything this socket put on the network
 
     private:
         friend class MemoryNetwork;
@@ -109,6 +113,13 @@ public:
     }
     void unplug(Socket* s) { sockets_.erase(s->self()); }
     void plug(Socket* s) { sockets_[s->self()] = s; }
+    // Sees every datagram sent (before loss); for tests that capture or count traffic.
+    std::function<void(const Endpoint& from, const Endpoint& to, const uint8_t* data, size_t size)> tap;
+    // Delivers a datagram with any sender address: a forged source, or a mutated copy of real traffic.
+    void inject(const Endpoint& from, const Endpoint& to, const uint8_t* data, size_t size) {
+        auto it = sockets_.find(to);
+        if (it != sockets_.end()) it->second->queue_.push_back({now, from, std::vector<uint8_t>(data, data + size)});
+    }
 
 private:
     std::map<Endpoint, Socket*> sockets_;

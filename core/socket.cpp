@@ -12,6 +12,9 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
 using socklen_t = int;
 using NativeSocket = SOCKET;
 static const NativeSocket kInvalid = INVALID_SOCKET;
@@ -74,9 +77,19 @@ bool UdpSocket::open(uint16_t port, std::string* error) {
 #ifdef _WIN32
     u_long nonBlocking = 1;
     ioctlsocket(s, FIONBIO, &nonBlocking);
+    // Windows reports an ICMP "port unreachable" (a player that just quit) as an error on the next
+    // receive of this socket. Those errors carry no datagram; switch them off at the source.
+    BOOL reportResets = FALSE;
+    DWORD returned = 0;
+    WSAIoctl(s, SIO_UDP_CONNRESET, &reportResets, sizeof(reportResets), nullptr, 0, &returned, nullptr, nullptr);
 #else
     fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
 #endif
+    // Bigger kernel buffers (best effort): a save transfer sends a window of ~64 KB at once, which
+    // would overflow the small defaults while a game frame or a loading screen delays the next read.
+    int bufferBytes = 1 << 20;
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bufferBytes), sizeof(bufferBytes));
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&bufferBytes), sizeof(bufferBytes));
     fd_ = static_cast<intptr_t>(s);
     return true;
 }

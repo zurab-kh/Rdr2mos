@@ -27,7 +27,10 @@ public:
         return true;
     }
     bool storeSave(const std::string& campaign, const std::vector<uint8_t>& data, const std::string&) override {
-        saves[campaign].push_back(data);
+        auto& history = saves[campaign];
+        history.push_back(data);
+        // Saves can be large; a long-running server without a data folder keeps only recent ones.
+        if (history.size() > keep) history.erase(history.begin());
         return true;
     }
     void journal(const std::string& campaign, const std::string& line) override { journals[campaign].push_back(line); }
@@ -35,6 +38,7 @@ public:
         players[campaign][name] = lastPos;
     }
 
+    size_t keep = 5;
     std::map<std::string, std::vector<std::vector<uint8_t>>> saves;
     std::map<std::string, std::vector<std::string>> journals;
     std::map<std::string, std::map<std::string, Vec3>> players;
@@ -55,7 +59,8 @@ private:
     size_t keep_;
 };
 
-// Campaign names become folder names: keep letters, digits, '-' and '_' only.
+// Campaign names become folder names: keep letters, digits, '-' and '_' only (lower case, at most 32),
+// and never a Windows device name.
 std::string sanitizeCampaign(const std::string& name);
 
 }  // namespace coop

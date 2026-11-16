@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace coop {
 
@@ -12,7 +13,13 @@ constexpr float kPlayerVelStep = 0.01f;
 constexpr float kAimStep = 0.05f;
 constexpr float kTiltStep = 1.5f;   // degrees per unit
 
-int32_t quantize(float v, float step) { return static_cast<int32_t>(std::lround(v / step)); }
+// Clamped before rounding: lround of a value outside `long` (or of NaN) gives an unspecified result.
+int32_t quantize(float v, float step) {
+    float q = v / step;
+    if (!(q > -2.0e9f)) q = -2.0e9f;
+    if (!(q < 2.0e9f)) q = 2.0e9f;
+    return static_cast<int32_t>(std::lround(q));
+}
 int16_t q16(float v, float step) { return static_cast<int16_t>(std::clamp(quantize(v, step), -32767, 32767)); }
 int8_t q8(float v, float step) { return static_cast<int8_t>(std::clamp(quantize(v, step), -127, 127)); }
 bool fits16(float v, float step) { int32_t q = quantize(v, step); return q >= -32767 && q <= 32767; }
@@ -52,6 +59,7 @@ void write(ByteWriter& w, const HelloInfo& v) {
     w.str(v.campaign);
     w.str(v.password);
     w.u8(v.wantsWorld);
+    w.u32(v.cookie);
 }
 bool read(ByteReader& r, HelloInfo& v) {
     uint8_t role = r.u8();
@@ -61,6 +69,7 @@ bool read(ByteReader& r, HelloInfo& v) {
     v.campaign = r.str();
     v.password = r.str();
     v.wantsWorld = r.u8();
+    v.cookie = r.u32();
     if (!r.ok() || role > 1) return false;
     v.role = static_cast<Role>(role);
     return true;
@@ -237,7 +246,10 @@ bool read(ByteReader& r, EntitySnapshot& v) {
     v.timeMs = r.u32();
     v.anchor = r.vec3();
     size_t n = r.u8();
-    if (!r.ok() || !std::isfinite(v.anchor.x) || !std::isfinite(v.anchor.y) || !std::isfinite(v.anchor.z)) return false;
+    // Every entity takes at least 3 bytes: reject a count the datagram cannot hold before allocating.
+    if (!r.ok() || r.remaining() < n * 3 + 1 || !std::isfinite(v.anchor.x) || !std::isfinite(v.anchor.y) ||
+        !std::isfinite(v.anchor.z))
+        return false;
     v.entities.resize(n);
     for (auto& e : v.entities)
         if (!readEntity(r, e, v.anchor)) return false;
@@ -315,7 +327,8 @@ bool read(ByteReader& r, CameraState& v) {
     v.rot.y = r.i16() * 0.01f;
     v.rot.z = unpackHeading(r.u16());
     v.fov = r.u16() / 100.0f;
-    return r.ok() && std::isfinite(v.pos.x) && std::isfinite(v.pos.y) && std::isfinite(v.pos.z);
+    return r.ok() && std::isfinite(v.pos.x) && std::isfinite(v.pos.y) && std::isfinite(v.pos.z) && v.fov >= 1.0f &&
+           v.fov <= 170.0f;
 }
 
 void write(ByteWriter& w, const WaypointInfo& v) {
@@ -355,19 +368,42 @@ bool read(ByteReader& r, SaveChunk& v) {
     return true;
 }
 
-uint32_t crc32(const uint8_t* data, size_t size, uint32_t crc) {
-    static uint32_t table[256];
-    static bool ready = false;
-    if (!ready) {
+namespace {
+// Slicing-by-8 tables. A function-local static is initialised exactly once even when the built-in
+// server thread and the game thread both check a save at the same moment.
+struct Crc32Tables {
+    uint32_t t[8][256];
+    Crc32Tables() {
         for (uint32_t i = 0; i < 256; ++i) {
             uint32_t c = i;
             for (int k = 0; k < 8; ++k) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-            table[i] = c;
+            t[0][i] = c;
         }
-        ready = true;
+        for (uint32_t i = 0; i < 256; ++i)
+            for (int s = 1; s < 8; ++s) t[s][i] = (t[s - 1][i] >> 8) ^ t[0][t[s - 1][i] & 0xFF];
     }
+};
+const Crc32Tables& crcTables() {
+    static const Crc32Tables tables;
+    return tables;
+}
+}  // namespace
+
+uint32_t crc32(const uint8_t* data, size_t size, uint32_t crc) {
+    const auto& t = crcTables().t;
     crc = ~crc;
-    for (size_t i = 0; i < size; ++i) crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    // Eight bytes per step (little-endian loads, like the rest of the protocol).
+    while (size >= 8) {
+        uint32_t lo, hi;
+        std::memcpy(&lo, data, 4);
+        std::memcpy(&hi, data + 4, 4);
+        lo ^= crc;
+        crc = t[7][lo & 0xFF] ^ t[6][(lo >> 8) & 0xFF] ^ t[5][(lo >> 16) & 0xFF] ^ t[4][lo >> 24] ^
+              t[3][hi & 0xFF] ^ t[2][(hi >> 8) & 0xFF] ^ t[1][(hi >> 16) & 0xFF] ^ t[0][hi >> 24];
+        data += 8;
+        size -= 8;
+    }
+    while (size--) crc = t[0][(crc ^ *data++) & 0xFF] ^ (crc >> 8);
     return ~crc;
 }
 
@@ -415,13 +451,15 @@ bool read(ByteReader& r, Roster& v) {
     v.worldOwner = r.u8();
     v.worldEpoch = r.u16();
     size_t n = r.u8();
-    if (!r.ok() || n > kMaxPlayers) return false;
+    if (!r.ok() || n > kMaxPlayers || r.remaining() < n * 3) return false;
     v.players.resize(n);
+    uint64_t seen = 0;
     for (auto& p : v.players) {
         p.id = r.u8();
         p.name = r.str();
         p.avatar = r.str();
-        if (p.id == 0 || p.id > kMaxPlayers) return false;
+        if (p.id == 0 || p.id > kMaxPlayers || (seen >> p.id & 1)) return false;
+        seen |= uint64_t(1) << p.id;
     }
     return r.ok();
 }
@@ -440,7 +478,8 @@ bool read(ByteReader& r, StoryCommandMsg& v) {
     v.pos = r.vec3();
     v.distance = r.f32();
     v.text = r.str();
-    return r.ok() && c >= 1 && c <= 6 && std::isfinite(v.pos.x) && std::isfinite(v.pos.y) && std::isfinite(v.pos.z);
+    return r.ok() && c >= 1 && c <= 6 && std::isfinite(v.pos.x) && std::isfinite(v.pos.y) && std::isfinite(v.pos.z) &&
+           std::isfinite(v.distance);
 }
 
 void write(ByteWriter& w, const Denied& v) { w.str(v.reason); }

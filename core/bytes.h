@@ -32,8 +32,12 @@ public:
     }
 
 private:
-    // The protocol is little-endian; every supported target (x64) is too.
-    void raw(const void* p, size_t n) { bytes(p, n); }
+    // The protocol is little-endian; every supported target (x64) is too. Fields are a few bytes:
+    // inlined push_backs cost far less than a call into vector::insert for each one.
+    void raw(const void* p, size_t n) {
+        const uint8_t* b = static_cast<const uint8_t*>(p);
+        for (size_t i = 0; i < n; ++i) data.push_back(b[i]);
+    }
 };
 
 class ByteReader {
