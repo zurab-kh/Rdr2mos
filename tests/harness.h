@@ -493,7 +493,9 @@ public:
     std::vector<uint8_t> latest;
     uint64_t stamp = 0;
     std::vector<std::vector<uint8_t>> written;
+    uint64_t time = 0;  // Unix seconds of `latest`, 0 = not known
     uint64_t latestStamp() override { return latest.empty() ? 0 : stamp; }
+    uint64_t latestTime() override { return latest.empty() ? 0 : time; }
     bool readLatest(std::vector<uint8_t>& data, std::string& name) override {
         if (latest.empty()) return false;
         data = latest;

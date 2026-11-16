@@ -176,6 +176,7 @@ COOP_TEST(testReviewSaveAndQuit, "review saves: a save made just before the owne
     c.run(4000);  // just after a save check
     a.saves.latest = std::vector<uint8_t>(3000, 2);
     a.saves.stamp = 2;
+    a.saves.time = static_cast<uint64_t>(std::time(nullptr)) + 60;  // written after the server's copy
     c.run(1000);
     dropPlayer(c, a);
     c.run(25000);
@@ -199,6 +200,7 @@ COOP_TEST(testFixSaveQuitMidUpload, "fix saves: a save whose upload the owner's 
         CHECK(c.storage.saves["default"].size() == 1);
         a.saves.latest = fixBytes(600000, seed + 1);
         a.saves.stamp = 2;
+        a.saves.time = static_cast<uint64_t>(std::time(nullptr)) + 60;  // written after the server's copy
         bool quit = false;
         c.each = [&] {
             if (!quit && a.session->status().saveProgress >= 30) {
@@ -330,6 +332,8 @@ COOP_TEST(testFixSaveRaceToStartCampaign, "fix saves: an upload overtaken by the
 
 namespace {
 
+constexpr uint32_t kCampaignSaveTime = 1800000000;  // when the scripted server "stored" its save
+
 // One StorySync against a scripted server: what it answers to an upload is up to the test.
 struct ScriptedServer {
     enum class Answer { Silent, Refuse, Store, WrongCrc };
@@ -354,6 +358,7 @@ struct ScriptedServer {
         net.loss = 0.01;
         server.start(serverSock, hostConfig(), now);
         player.start(playerSock, guestConfig(), now);
+        store.time = kCampaignSaveTime + 600;  // our saves were written after the campaign save
         story.setSaveStore(&store);
     }
     void run(uint32_t ms) {
@@ -401,11 +406,41 @@ struct ScriptedServer {
 
 }  // namespace
 
+COOP_TEST(testFixSaveOlderLocalNeverReplaces, "fix saves: an owner's save older than the campaign save is never sent by itself") {
+    for (uint32_t seed : kFixSeeds) {
+        // Older than the server's copy (someone else moved the story on), or of unknown age: kept back.
+        for (uint64_t localTime : {static_cast<uint64_t>(kCampaignSaveTime - 3600), uint64_t(0)}) {
+            ScriptedServer s(seed);
+            std::vector<uint8_t> campaign = fixBytes(4000, seed);
+            s.story.setCampaignSave(true, crc32(campaign.data(), campaign.size()), kCampaignSaveTime);
+            s.store.latest = fixBytes(40000, seed + 1);
+            s.store.stamp = 1;
+            s.store.time = localTime;
+            s.run(10000);
+            CHECK(s.uploads.empty() && !s.saw("Uploading"));
+            // A save made while we play still goes up: that one is new for sure.
+            s.answer = ScriptedServer::Answer::Store;
+            s.store.latest = fixBytes(40000, seed + 2);
+            s.store.stamp = 2;
+            s.run(12000);
+            CHECK(s.uploads.size() == 1 && s.uploads[0] == s.store.latest);
+        }
+        // The server did not say when it got its copy (an older server): nothing goes up by itself.
+        ScriptedServer s(seed);
+        std::vector<uint8_t> campaign = fixBytes(4000, seed);
+        s.story.setCampaignSave(true, crc32(campaign.data(), campaign.size()), 0);
+        s.store.latest = fixBytes(40000, seed + 1);
+        s.store.stamp = 1;
+        s.run(10000);
+        CHECK(s.uploads.empty());
+    }
+}
+
 COOP_TEST(testFixSaveSilentServer, "fix saves: an upload the server never answers is reported, not taken as stored") {
     for (uint32_t seed : kFixSeeds) {
         ScriptedServer s(seed);
         std::vector<uint8_t> campaign = fixBytes(4000, seed);
-        s.story.setCampaignSave(true, crc32(campaign.data(), campaign.size()));
+        s.story.setCampaignSave(true, crc32(campaign.data(), campaign.size()), kCampaignSaveTime);
         s.store.latest = fixBytes(40000, seed + 1);  // newer than the campaign save: goes up
         s.store.stamp = 1;
         s.run(10000);
@@ -429,7 +464,7 @@ COOP_TEST(testFixSaveRefused, "fix saves: a refused upload stops with the server
         ScriptedServer s(seed);
         s.answer = ScriptedServer::Answer::Refuse;
         std::vector<uint8_t> campaign = fixBytes(4000, seed);
-        s.story.setCampaignSave(true, crc32(campaign.data(), campaign.size()));
+        s.story.setCampaignSave(true, crc32(campaign.data(), campaign.size()), kCampaignSaveTime);
         s.store.latest = fixBytes(40000, seed + 1);
         s.store.stamp = 1;
         s.run(10000);
@@ -440,7 +475,7 @@ COOP_TEST(testFixSaveRefused, "fix saves: a refused upload stops with the server
         s.store.stamp = 2;
         s.run(8000);
         s.story.reset();
-        s.story.setCampaignSave(true, crc32(campaign.data(), campaign.size()));
+        s.story.setCampaignSave(true, crc32(campaign.data(), campaign.size()), kCampaignSaveTime);
         s.run(8000);
         CHECK(s.uploads.size() == 1);
         CHECK(!s.saw("did not confirm"));
@@ -459,7 +494,7 @@ COOP_TEST(testFixSaveStoredOnlyOnMatchingResult, "fix saves: only the server's a
         ScriptedServer w(seed);
         w.answer = ScriptedServer::Answer::WrongCrc;
         std::vector<uint8_t> campaign = fixBytes(4000, seed);
-        w.story.setCampaignSave(true, crc32(campaign.data(), campaign.size()));
+        w.story.setCampaignSave(true, crc32(campaign.data(), campaign.size()), kCampaignSaveTime);
         w.store.latest = fixBytes(40000, seed + 1);
         w.store.stamp = 1;
         w.run(45000);
@@ -470,7 +505,7 @@ COOP_TEST(testFixSaveStoredOnlyOnMatchingResult, "fix saves: only the server's a
         // reconnect whose Welcome still names the old campaign save.
         ScriptedServer s(seed);
         s.answer = ScriptedServer::Answer::Store;
-        s.story.setCampaignSave(true, crc32(campaign.data(), campaign.size()));
+        s.story.setCampaignSave(true, crc32(campaign.data(), campaign.size()), kCampaignSaveTime);
         s.store.latest = fixBytes(40000, seed + 1);
         s.store.stamp = 1;
         s.run(45000);
@@ -479,7 +514,7 @@ COOP_TEST(testFixSaveStoredOnlyOnMatchingResult, "fix saves: only the server's a
         s.store.stamp = 2;
         s.run(8000);
         s.story.reset();
-        s.story.setCampaignSave(true, crc32(campaign.data(), campaign.size()));
+        s.story.setCampaignSave(true, crc32(campaign.data(), campaign.size()), kCampaignSaveTime);
         s.run(8000);
         CHECK(s.uploads.size() == 1);
     }

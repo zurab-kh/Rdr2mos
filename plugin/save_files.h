@@ -156,6 +156,17 @@ public:
         return settled_;
     }
 
+    // When the newest save was written, in Unix seconds (0: none). file_time_type has no portable
+    // epoch in C++17, so it is shifted by the two clocks' "now".
+    uint64_t latestTime() {
+        Found f;
+        if (root_.empty() || !findLatest(root_, f)) return 0;
+        auto sys = std::chrono::system_clock::now() +
+                   std::chrono::duration_cast<std::chrono::system_clock::duration>(f.time - fs::file_time_type::clock::now());
+        auto secs = std::chrono::duration_cast<std::chrono::seconds>(sys.time_since_epoch()).count();
+        return secs > 0 ? static_cast<uint64_t>(secs) : 0;
+    }
+
     // Stores a copy in the first free manual slot of the newest profile, never overwriting a file:
     // the data goes to a temporary file first and is then linked to a name that must not exist
     // yet, so neither a crash nor the game saving at the same moment can leave a broken or lost save.

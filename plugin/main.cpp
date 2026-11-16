@@ -425,12 +425,13 @@ std::unique_ptr<App> g_app;
 
 // Script Hook calls this on its script thread, again after every save load. The previous
 // instance's fiber is gone by then (never resumed, its stack not unwound): its App is dropped first,
-// since its session refers to the link, and then the session it left behind is ended with a Bye,
-// at once, instead of lingering on the server until the link times out. The reconnect, if the
-// player was online, follows from the same port once the game is ready (g_reconnect).
+// since its session refers to the link. If the player was online (g_reconnect), the reconnect
+// follows from the same port once the game is ready, and the server gives it the old session's
+// place (no Bye: that would hand the world to someone else for the loading screen). Otherwise the
+// session it left behind is ended with a Bye at once.
 void scriptMain() {
     g_app.reset();
-    g_connection.retire(g_socket.isOpen() ? &g_socket : nullptr);
+    g_connection.retire(g_socket.isOpen() ? &g_socket : nullptr, g_reconnect);
     g_app = std::make_unique<App>();
     g_app->run();
 }

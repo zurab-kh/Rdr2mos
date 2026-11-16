@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -149,9 +150,29 @@ std::string FileStorage::dir(const std::string& campaign) const {
 bool FileStorage::loadSave(const std::string& campaign, std::vector<uint8_t>& data) {
     std::vector<fs::path> files = listSaves(fs::path(dir(campaign)) / "saves");
     for (auto it = files.rbegin(); it != files.rend(); ++it)
-        if (readSave(*it, data)) return true;
+        if (readSave(*it, data)) {
+            // file_time_type has no portable epoch in C++17: shift it by the two clocks' "now".
+            std::error_code ec;
+            fs::file_time_type written = fs::last_write_time(*it, ec);
+            uint64_t unix = 0;
+            if (!ec) {
+                auto sys = std::chrono::system_clock::now() +
+                           std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                               written - fs::file_time_type::clock::now());
+                auto secs = std::chrono::duration_cast<std::chrono::seconds>(sys.time_since_epoch()).count();
+                unix = secs > 0 ? static_cast<uint64_t>(secs) : 0;
+            }
+            loadedTime_[campaign] = unix;
+            return true;
+        }
     data.clear();
+    loadedTime_.erase(campaign);
     return false;
+}
+
+uint64_t FileStorage::loadedSaveTime(const std::string& campaign) {
+    auto it = loadedTime_.find(campaign);
+    return it == loadedTime_.end() ? 0 : it->second;
 }
 
 bool FileStorage::hasSaveFiles(const std::string& campaign) {

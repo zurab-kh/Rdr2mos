@@ -1,6 +1,7 @@
 // Where the server keeps a campaign: save games (with history), the journal, players.
 #pragma once
 #include <cstdint>
+#include <ctime>
 #include <map>
 #include <string>
 #include <vector>
@@ -18,6 +19,11 @@ public:
         (void)campaign;
         return false;
     }
+    // When the save that the last loadSave() returned was stored, in Unix seconds (0: not known).
+    virtual uint64_t loadedSaveTime(const std::string& campaign) {
+        (void)campaign;
+        return 0;
+    }
     virtual bool storeSave(const std::string& campaign, const std::vector<uint8_t>& data, const std::string& by) = 0;
     virtual void journal(const std::string& campaign, const std::string& line) = 0;
     virtual void storePlayer(const std::string& campaign, const std::string& name, const Vec3& lastPos) = 0;
@@ -32,6 +38,10 @@ public:
         data = it->second.back();
         return true;
     }
+    uint64_t loadedSaveTime(const std::string& campaign) override {
+        auto it = savedAt.find(campaign);
+        return it == savedAt.end() ? 0 : it->second;
+    }
     bool hasSaveFiles(const std::string& campaign) override {
         auto it = saves.find(campaign);
         return it != saves.end() && !it->second.empty();
@@ -39,6 +49,7 @@ public:
     bool storeSave(const std::string& campaign, const std::vector<uint8_t>& data, const std::string&) override {
         auto& history = saves[campaign];
         history.push_back(data);
+        savedAt[campaign] = static_cast<uint64_t>(std::time(nullptr));
         // Saves can be large; a long-running server without a data folder keeps only recent ones.
         if (history.size() > keep) history.erase(history.begin());
         return true;
@@ -50,6 +61,7 @@ public:
 
     size_t keep = 5;
     std::map<std::string, std::vector<std::vector<uint8_t>>> saves;
+    std::map<std::string, uint64_t> savedAt;  // when the latest of each campaign was stored
     std::map<std::string, std::vector<std::string>> journals;
     std::map<std::string, std::map<std::string, Vec3>> players;
 };
@@ -62,11 +74,13 @@ public:
     // full disk) does not hide the older ones.
     bool loadSave(const std::string& campaign, std::vector<uint8_t>& data) override;
     bool hasSaveFiles(const std::string& campaign) override;
+    uint64_t loadedSaveTime(const std::string& campaign) override;
     bool storeSave(const std::string& campaign, const std::vector<uint8_t>& data, const std::string& by) override;
     void journal(const std::string& campaign, const std::string& line) override;
     void storePlayer(const std::string& campaign, const std::string& name, const Vec3& lastPos) override;
 
 private:
+    std::map<std::string, uint64_t> loadedTime_;  // modification time of the file loadSave() returned
     std::string dir(const std::string& campaign) const;
     std::string root_;
     size_t keep_;

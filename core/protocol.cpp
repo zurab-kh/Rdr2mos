@@ -429,6 +429,7 @@ void write(ByteWriter& w, const Welcome& v) {
     w.u8(v.hasCampaignSave);
     w.str(v.campaign);
     w.u32(v.campaignSaveCrc);
+    w.u32(v.campaignSaveTime);
 }
 bool read(ByteReader& r, Welcome& v) {
     v.playerId = r.u8();
@@ -436,6 +437,7 @@ bool read(ByteReader& r, Welcome& v) {
     v.hasCampaignSave = r.u8();
     v.campaign = r.str();
     v.campaignSaveCrc = r.u32();
+    v.campaignSaveTime = r.u32();
     if (!r.ok() || mode > 1 || v.playerId == 0 || v.playerId > kMaxPlayers) return false;
     v.storyMode = static_cast<StoryMode>(mode);
     return true;
@@ -452,6 +454,7 @@ void write(ByteWriter& w, const Roster& v) {
     }
     w.u8(v.hasCampaignSave);
     w.u32(v.campaignSaveCrc);
+    w.u32(v.campaignSaveTime);
 }
 bool read(ByteReader& r, Roster& v) {
     v.worldOwner = r.u8();
@@ -469,6 +472,7 @@ bool read(ByteReader& r, Roster& v) {
     }
     v.hasCampaignSave = r.u8();
     v.campaignSaveCrc = r.u32();
+    v.campaignSaveTime = r.u32();
     return r.ok() && v.hasCampaignSave <= 1;
 }
 

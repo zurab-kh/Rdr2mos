@@ -18,6 +18,15 @@ void netConditions(Cluster& c) {
     c.net.jitterMs += 4;
 }
 
+// Joins and waits until the server has let the player in: under loss a Hello can be lost, and a
+// fixed wait would let whoever joins next arrive first (and take the world, ids and names).
+Player& joinWelcomed(Cluster& c, const std::string& name, bool wantsWorld) {
+    Player& p = c.join(name, wantsWorld);
+    for (int i = 0; i < 400 && !(p.session->status().welcomed && p.session->status().players >= 1); ++i) c.run(16);
+    c.run(100);
+    return p;
+}
+
 // A player without a game: a bare link the test drives itself, keeping everything it receives.
 struct RawClient {
     MemoryNetwork::Socket* sock = nullptr;
@@ -174,8 +183,7 @@ COOP_TEST(testFixNetGuestNewPortFullCampaign, "fix-net: a guest back on a new po
 COOP_TEST(testFixNetSameAddressNewSession, "fix-net: a new session from the same address keeps the player's place and world") {
     Cluster c;
     netConditions(c);
-    Player& a = c.join("A", true);
-    c.run(300);
+    Player& a = joinWelcomed(c, "A", true);
     Player& b = c.join("B", true);  // wants the world too: it would keep it, had A left
     c.run(2000);
     CHECK(a.session->status().worldOwner);
@@ -196,8 +204,7 @@ COOP_TEST(testFixNetSameAddressNewSession, "fix-net: a new session from the same
 COOP_TEST(testFixNetSameNameSameAddress, "fix-net: two players with one name behind one address both stay in") {
     Cluster c;
     netConditions(c);
-    Player& a = c.join("A", true);
-    c.run(300);
+    Player& a = joinWelcomed(c, "A", true);
     // Two machines behind one NAT, both called "Pat": the second must not take the first one's place.
     auto pat = [&](uint16_t port) -> Player& {
         c.extra.push_back(std::make_unique<Player>());
@@ -362,8 +369,7 @@ COOP_TEST(testFixNetBurningEnemiesKeepDeath, "fix-net: enemies set on fire do no
     netConditions(c);
     c.net.latencyMs = 30;
     const uint32_t kOutlaw = joaat("g_m_m_uniduster_01");
-    Player& a = c.join("A", true);
-    c.run(300);
+    Player& a = joinWelcomed(c, "A", true);  // the campaign's first world: epoch 1
     Player& b = c.join("B");
     a.game.player.pos = {0, 0, 0};
     b.game.player.pos = {3, 0, 0};
@@ -525,8 +531,7 @@ COOP_TEST(testFixNetStaleWorldDamage, "fix-net: a hit aimed at the previous worl
     Cluster c;
     netConditions(c);
     const uint32_t kOutlaw = joaat("g_m_m_uniduster_01");
-    Player& a = c.join("A", true);
-    c.run(300);
+    Player& a = joinWelcomed(c, "A", true);  // the campaign's first world: epoch 1
     Player& b = c.join("B");
     a.game.player.pos = {0, 0, 0};
     b.game.player.pos = {3, 0, 0};
@@ -540,12 +545,12 @@ COOP_TEST(testFixNetStaleWorldDamage, "fix-net: a hit aimed at the previous worl
     b.link.send(Msg::Damage, Damage{1, 30, 7}, true);  // sent in a world that is gone
     c.run(500);
     int afterStale = a.game.ents[outlaw].health;
-    b.link.send(Msg::Damage, Damage{1, 30, 0}, true);  // a sender that does not say (no roster yet)
+    b.link.send(Msg::Damage, Damage{1, 30, 0}, true);  // a sender without a roster names no world
     c.run(500);
     std::printf("  outlaw health: %d after a current hit, %d after a stale one, %d after one without epoch\n",
                 afterCurrent, afterStale, a.game.ents[outlaw].health);
-    CHECK(afterCurrent == 370 && afterStale == 370 && a.game.ents[outlaw].health == 340);
-    CHECK(c.server->stats().staleDamage == 1);
+    CHECK(afterCurrent == 370 && afterStale == 370 && a.game.ents[outlaw].health == 370);
+    CHECK(c.server->stats().staleDamage == 2);
 }
 
 // ---------------------------------------------------------------- 12: refused uploads

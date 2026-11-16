@@ -221,6 +221,7 @@ struct Welcome {
     uint8_t hasCampaignSave = 0;
     std::string campaign;
     uint32_t campaignSaveCrc = 0;      // CRC-32 of the campaign save the server holds (0: none)
+    uint32_t campaignSaveTime = 0;     // when the server got it, Unix seconds (0: not known)
 };
 
 struct RosterEntry {
@@ -235,6 +236,7 @@ struct Roster {
     std::vector<RosterEntry> players;
     uint8_t hasCampaignSave = 0;       // the campaign has a save on the server (changes when the first one arrives)
     uint32_t campaignSaveCrc = 0;      // its CRC-32 (0: none)
+    uint32_t campaignSaveTime = 0;     // when the server got it, Unix seconds (0: not known)
 };
 
 // Server -> the player who uploaded a save: the outcome. Only `stored` with a matching CRC means

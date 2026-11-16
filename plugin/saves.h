@@ -7,6 +7,7 @@ class Rdr2SaveStore final : public coop::ISaveStore {
 public:
     bool readLatest(std::vector<uint8_t>& data, std::string& name) override;
     uint64_t latestStamp() override;
+    uint64_t latestTime() override;
     bool writeCopy(const std::vector<uint8_t>& data, std::string& placedAs, std::string& error) override;
 
 private:

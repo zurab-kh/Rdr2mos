@@ -501,7 +501,7 @@ void CoopSession::handleMessages(uint32_t nowMs) {
                 myId_ = w.playerId;
                 mode_ = w.storyMode;
                 story_.setMode(mode_);
-                story_.setCampaignSave(w.hasCampaignSave != 0, w.campaignSaveCrc);
+                story_.setCampaignSave(w.hasCampaignSave != 0, w.campaignSaveCrc, w.campaignSaveTime);
                 status_.welcomed = true;
                 status_.playerId = myId_;
                 status_.storyMode = mode_;
@@ -518,7 +518,7 @@ void CoopSession::handleMessages(uint32_t nowMs) {
                 Roster r;
                 if (decode(payload, r)) {
                     onRoster(r);
-                    story_.setCampaignSave(r.hasCampaignSave != 0, r.campaignSaveCrc);
+                    story_.setCampaignSave(r.hasCampaignSave != 0, r.campaignSaveCrc, r.campaignSaveTime);
                     status_.campaignHasSave = r.hasCampaignSave != 0;
                 }
                 break;

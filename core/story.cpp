@@ -339,8 +339,13 @@ void StorySync::tick(uint32_t nowMs, const PlayerState& local, const std::vector
             // not have it. That is a save made just before we quit last time (the session ended
             // before the check saw it, or during its upload) or while we were offline. startUpload()
             // leaves out what the server has, gave us, or turned down; a file it already answered
-            // for is not even read again.
-            catchUp = iOwn && campaignHasSave_ && campaignSaveCrc_ && stamp && stamp != answeredStamp_;
+            // for is not even read again. Only a file written after the server stored the campaign
+            // save, though: an older one of ours (a save from before someone else moved the story
+            // on, or of another play-through) must never replace it by itself. When either time is
+            // not known nothing goes up automatically; the upload key still works.
+            uint64_t localTime = store_->latestTime();
+            catchUp = iOwn && campaignHasSave_ && campaignSaveCrc_ && stamp && stamp != answeredStamp_ &&
+                      localTime && campaignSaveTime_ && localTime > campaignSaveTime_;
         }
         bool fresh = stampKnown_ && stamp && stamp != lastStamp_;
         bool upload = config_.autoUploadSaves && iOwn && (fresh || seed || catchUp);

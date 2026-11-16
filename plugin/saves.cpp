@@ -26,6 +26,8 @@ bool Rdr2SaveStore::readLatest(std::vector<uint8_t>& data, std::string& name) { 
 
 uint64_t Rdr2SaveStore::latestStamp() { return folder().latestStamp(); }
 
+uint64_t Rdr2SaveStore::latestTime() { return folder().latestTime(); }
+
 bool Rdr2SaveStore::writeCopy(const std::vector<uint8_t>& data, std::string& placedAs, std::string& error) {
     return folder().writeCopy(data, placedAs, error);
 }

@@ -38,10 +38,11 @@ public:
     void setMode(StoryMode mode) { mode_ = mode; }
     void setCampaignHasSave(bool has) { campaignHasSave_ = has; }
     // What the server holds for the campaign (from Welcome and every Roster): whether it has a save,
-    // and that save's CRC-32 (0: none).
-    void setCampaignSave(bool has, uint32_t crc) {
+    // that save's CRC-32 (0: none) and when the server stored it (Unix seconds, 0: not known).
+    void setCampaignSave(bool has, uint32_t crc, uint32_t time = 0) {
         campaignHasSave_ = has;
         campaignSaveCrc_ = crc;
+        campaignSaveTime_ = time;
     }
 
     // Call every frame. `peers` are the other players we know the state of.
@@ -126,6 +127,7 @@ private:
     bool stampKnown_ = false, seedChecked_ = false;
     bool campaignHasSave_ = true;
     uint32_t campaignSaveCrc_ = 0;
+    uint32_t campaignSaveTime_ = 0;
     // the newest file the server and we agree on (sent up, or received): never sent again by itself
     uint32_t uploadedCrc_ = 0, downloadedCrc_ = 0;
     bool haveUploadedCrc_ = false, haveDownloadedCrc_ = false;

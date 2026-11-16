@@ -33,12 +33,13 @@ struct PluginPlayer {
         p->session->setSaveStore(&p->saves);
     }
     // Script Hook restarts the script: the old App (and with it the session) is dropped, then
-    // scriptMain() ends the session it left behind. `byeLost` drops the goodbye on the way.
-    void restart(Cluster& c, bool byeLost) {
+    // scriptMain() retires the session it left behind; a reconnect follows (g_reconnect), so no
+    // Bye is sent. `cutOff` loses anything the socket would send meanwhile.
+    void restart(Cluster& c, bool cutOff) {
         p->session.reset();
-        if (byeLost) c.net.unplug(p->sock);
-        conn.retire(p->sock);
-        if (byeLost) c.net.plug(p->sock);
+        if (cutOff) c.net.unplug(p->sock);
+        conn.retire(p->sock, true);
+        if (cutOff) c.net.plug(p->sock);
     }
 };
 
@@ -92,7 +93,7 @@ COOP_TEST(testFixPluginSaveLoadKeepsWorldAndName, "fix plugin: the world owner l
         const Endpoint before = a.p->sock->self();
 
         a.restart(c, false);
-        c.run(48);  // the Bye is in, before the new script even looks at the game
+        c.run(48);
         size_t duringLoad = c.server->playerCount();
         c.run(1500);  // the new script waits for the game to be ready
         a.connect(c);
@@ -103,7 +104,8 @@ COOP_TEST(testFixPluginSaveLoadKeepsWorldAndName, "fix plugin: the world owner l
                     seed, lines.empty() ? "-" : lines[0].c_str(), duringLoad, b.session->status().players,
                     b.session->status().ownerName.c_str(), a.p->session->status().worldOwner, mirrorOf(b.game, kFolk) != 0);
         CHECK(a.p->sock->self() == before);  // the same port: the server sees A coming back
-        if (seed == 1) CHECK(duringLoad == 1);  // no ghost of A while A's game loads (lossless run)
+        CHECK(duringLoad == 2);  // A keeps its place while its game loads...
+        CHECK(!journalHas(c, "default", "B now owns the world"));  // ...and the world is not handed to B and back
         CHECK(a.p->session->status().welcomed);
         CHECK(a.p->session->status().worldOwner);
         CHECK(b.session->status().ownerName == "A");
@@ -172,7 +174,7 @@ COOP_TEST(testFixPluginGuestRestart, "fix plugin: a guest loading a save comes b
         std::vector<std::string> lines = c.server->describe();
         std::printf("    seed %u: %s | A sees %d players while B loads, %d after\n", seed, lines.empty() ? "-" : lines[0].c_str(),
                     playersWhileLoading, a.session->status().players);
-        if (seed == 21) CHECK(playersWhileLoading == 1);  // B's old puppet went with the Bye
+        CHECK(playersWhileLoading == 2);  // B keeps its place while its game loads
         CHECK(b.p->session->status().welcomed);
         CHECK(a.session->status().players == 2 && c.server->playerCount() == 2);
         CHECK(lines.size() == 1 && !anyNameWithSuffix(lines));

@@ -63,6 +63,9 @@ public:
     virtual bool readLatest(std::vector<uint8_t>& data, std::string& name) = 0;
     // Changes whenever a newer save appears (e.g. its modification time), 0 if there is none.
     virtual uint64_t latestStamp() = 0;
+    // When the most recent save was written, in Unix seconds (0: not known). Used to tell a save
+    // made after the campaign save on the server from an older one of this player.
+    virtual uint64_t latestTime() { return 0; }
     // Stores a copy in a free slot, never overwriting anything. `placedAs` names the slot.
     virtual bool writeCopy(const std::vector<uint8_t>& data, std::string& placedAs, std::string& error) = 0;
 };

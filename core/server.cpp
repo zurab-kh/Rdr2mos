@@ -198,6 +198,7 @@ struct Server::Campaign {
     bool hasSave = false;
     std::shared_ptr<const std::vector<uint8_t>> save;  // the latest campaign save, read once
     uint32_t saveCrc = 0;
+    uint32_t saveTime = 0;  // when it was stored, Unix seconds (0: not known)
     uint32_t ownerMissionStartMs = 0;
     bool ownerInMission = false;
     std::map<uint8_t, Client*> byId;
@@ -548,6 +549,7 @@ void Server::admit(Client& c, uint32_t nowMs) {
         slot->hasSave = storage_.loadSave(campaignName, data);
         if (slot->hasSave && !data.empty() && data.size() <= kMaxSaveBytes) {
             slot->saveCrc = crc32(data.data(), data.size());
+            slot->saveTime = static_cast<uint32_t>(storage_.loadedSaveTime(campaignName));
             slot->save = std::make_shared<const std::vector<uint8_t>>(std::move(data));
         } else if (storage_.hasSaveFiles(campaignName)) {
             // Saves are there but none can be read (a broken disk, a folder without permissions).
@@ -637,6 +639,7 @@ void Server::admit(Client& c, uint32_t nowMs) {
     w.storyMode = config_.storyMode;
     w.hasCampaignSave = camp.hasSave;
     w.campaignSaveCrc = camp.hasSave ? camp.saveCrc : 0;
+    w.campaignSaveTime = camp.hasSave ? camp.saveTime : 0;
     w.campaign = campaignName;
     c.link.send(Msg::Welcome, w, true);
     storage_.journal(campaignName, name + (twin ? " reconnected" : " joined"));
@@ -730,6 +733,7 @@ void Server::sendRoster(Campaign& camp) {
     r.worldEpoch = camp.epoch;
     r.hasCampaignSave = camp.hasSave ? 1 : 0;
     r.campaignSaveCrc = camp.hasSave ? camp.saveCrc : 0;
+    r.campaignSaveTime = camp.hasSave ? camp.saveTime : 0;
     for (uint8_t id : camp.ids)
         if (Client* m = member(camp, id)) r.players.push_back({m->id, m->name, m->avatar});
     std::vector<uint8_t> bytes = encode(r);
@@ -842,8 +846,9 @@ void Server::handle(Client& c, Msg type, const std::vector<uint8_t>& payload, ui
             if (!decode(payload, d)) return;
             // World entities are numbered afresh in every world: a hit sent before its sender heard
             // of a new world owner names an entity of the old world, and the new owner would apply
-            // it to whatever has that id in its own. (0: the sender has no roster yet, or is older.)
-            if (!isPlayerRef(d.target) && d.worldEpoch && d.worldEpoch != camp.epoch) {
+            // it to whatever has that id in its own. Epoch 0 names no world: the sender had no
+            // roster yet, so it cannot have seen any of this world's entities.
+            if (!isPlayerRef(d.target) && d.worldEpoch != camp.epoch) {
                 ++stats_.staleDamage;
                 return;
             }
@@ -954,6 +959,7 @@ void Server::finishUpload(Client& c, Campaign& camp, uint32_t nowMs) {
     if (!storage_.storeSave(camp.name, c.upload, c.name))
         return refuseUpload(c, c.uploadCrc, "The server could not store your save");
     camp.saveCrc = c.uploadCrc;
+    camp.saveTime = static_cast<uint32_t>(std::time(nullptr));
     camp.save = std::make_shared<const std::vector<uint8_t>>(std::move(c.upload));
     dropUpload(c);
     SaveResult result;
