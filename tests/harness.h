@@ -161,6 +161,8 @@ public:
     WorldInfo world{12, 0, 0, 0, 0};
     int modelLoadDelay = 0;  // spawn() returns 0 this many times first
     int readCalls = 0;
+    int nearbyCalls = 0, existsCalls = 0;  // game queries, for the CPU benchmarks
+    int adoptions = 0;
     int spawns = 0, removals = 0, prefetches = 0;
     uint32_t playerOutfit = 0;
     bool playerProtected = false;
@@ -226,6 +228,9 @@ public:
 
     bool ready() override { return isReady; }
     LocalPlayer readLocalPlayer() override {
+        // What the player sat on was deleted: the game drops them where they are.
+        if (playerMount && !ents.count(playerMount)) playerMount = 0;
+        if (playerVehicle && !ents.count(playerVehicle)) playerVehicle = 0;
         LocalPlayer lp;
         lp.state = player;
         lp.state.health = static_cast<uint16_t>(playerHealth);
@@ -280,6 +285,7 @@ public:
     }
 
     void listNearby(const Vec3& a, const Vec3& b, float radius, std::vector<NearbyEntity>& out) override {
+        ++nearbyCalls;
         for (auto& [h, e] : ents) {
             if (belongsToLocalPlayer(h) || e.draftOf || e.parked) continue;
             if (distance(e.pos, a) > radius && distance(e.pos, b) > radius) continue;
@@ -351,7 +357,15 @@ public:
             if (e.vehicle == h) e.vehicle = 0;
         }
     }
-    bool exists(EntityHandle h) override { return ents.count(h) != 0; }
+    bool adopt(EntityHandle h) override {
+        ents.at(h).ours = false;
+        ++adoptions;
+        return true;
+    }
+    bool exists(EntityHandle h) override {
+        ++existsCalls;
+        return ents.count(h) != 0;
+    }
     bool isDead(EntityHandle h) override { return ents.at(h).health <= 0; }
     Vec3 position(EntityHandle h) override {
         ++ents.at(h).queries;

@@ -10,6 +10,10 @@ inline Vec3 operator-(Vec3 a, Vec3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}
 inline Vec3 operator*(Vec3 a, float s) { return {a.x * s, a.y * s, a.z * s}; }
 inline float length(Vec3 a) { return std::sqrt(a.x * a.x + a.y * a.y + a.z * a.z); }
 inline float distance(Vec3 a, Vec3 b) { return length(a - b); }
+inline float distanceSq(Vec3 a, Vec3 b) {
+    Vec3 d = a - b;
+    return d.x * d.x + d.y * d.y + d.z * d.z;
+}
 inline Vec3 lerp(Vec3 a, Vec3 b, float t) { return a + (b - a) * t; }
 
 // Shortest signed difference between two headings in degrees, in (-180, 180].
