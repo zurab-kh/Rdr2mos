@@ -39,7 +39,10 @@ struct ServerStats {
     uint64_t datagrams = 0;        // received
     uint64_t dropped = 0;          // datagrams ignored: malformed, unknown sender, over a limit
     uint64_t challenges = 0;       // Hellos answered with a Challenge (no or stale cookie)
-    uint64_t rateLimited = 0;      // messages of admitted players dropped by the per-player limits
+    uint64_t rateLimited = 0;      // messages of admitted players dropped (or superseded) by the per-player limits
+    uint64_t resets = 0;           // Byes sent for Data of a session the server does not have (any more)
+    uint64_t staleDamage = 0;      // hits on world entities sent before the sender heard of a new world
+    uint64_t takeovers = 0;        // players who came back on a new connection and took their old place
     size_t uploadBytes = 0;        // save uploads in progress, held in memory
 };
 
@@ -66,18 +69,33 @@ private:
     class ClientSocket;
     struct Client;
     struct Campaign;
+    // An allowance that refills over time.
+    struct Budget {
+        float tokens = -1;
+        uint32_t lastMs = 0;
+        bool take(float cost, float perSecond, float burst, uint32_t nowMs);
+    };
+    // What becomes of a message, by the sender's budgets: handled now, dropped, kept until the
+    // budget allows (only the latest of its kind), or left in the sender's inbox for a later pump.
+    enum class Verdict { Handle, Drop, Later, Wait };
 
     void dispatch(const Endpoint& from, const uint8_t* data, size_t size, uint32_t nowMs);
     uint32_t cookie(const Endpoint& ep, uint32_t window) const;
-    bool allow(Client& c, Msg type, size_t size, uint32_t nowMs);
+    void answerStaleData(const Endpoint& from, ByteReader& r, uint32_t nowMs);
+    Verdict allow(Client& c, Msg type, size_t size, uint32_t nowMs);
+    void keepForLater(Client& c, Msg type, const std::vector<uint8_t>& payload);
+    void sendLater(Client& c, uint32_t nowMs);
     void dropUpload(Client& c);
+    void refuseUpload(Client& c, uint32_t crc, const std::string& why);
     size_t uploadBytes() const;
     bool authBlocked(uint32_t ip, uint32_t nowMs);
     void authFailed(uint32_t ip, uint32_t nowMs);
+    bool sameSeat(Client& c, uint32_t nowMs);
     void admit(Client& c, uint32_t nowMs);
     void leave(Client& c, uint32_t nowMs, const char* why);
     void handle(Client& c, Msg type, const std::vector<uint8_t>& payload, uint32_t nowMs);
     void electOwner(Campaign& camp, uint32_t nowMs, uint8_t preferred);
+    void newWorld(Campaign& camp, uint8_t owner);
     void sendRoster(Campaign& camp);
     void sendWorldTo(Campaign& camp, Client& c);
     void mergeSnapshot(Campaign& camp, const EntitySnapshot& snap);
@@ -104,6 +122,10 @@ private:
         uint32_t count = 0, sinceMs = 0;
     };
     std::unordered_map<uint32_t, AuthFailures> authFailures_;  // wrong passwords, per IP
+    // Addresses turned away a moment ago, and when: their Data gets no reset (that would only make
+    // them ask again at once and be turned away again).
+    std::map<Endpoint, uint32_t> quiet_;
+    Budget resets_;                      // resets for Data without a session, all senders together
     ServerStats stats_;
     uint32_t revision_ = 0;
     EntitySnapshot snapshot_;            // decode buffer, reused

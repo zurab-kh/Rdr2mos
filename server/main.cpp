@@ -122,7 +122,10 @@ int main(int argc, char** argv) {
     }
     server.shutdown(clock());  // players hear it now instead of after a timeout
     coop::ServerStats s = server.stats();
-    std::printf("stopped (%llu datagrams, %llu dropped, %llu rate limited)\n", static_cast<unsigned long long>(s.datagrams),
-                static_cast<unsigned long long>(s.dropped), static_cast<unsigned long long>(s.rateLimited));
+    std::printf("stopped (%llu datagrams, %llu dropped, %llu rate limited, %llu resets, %llu reconnects on a new port or "
+                "session, %llu stale hits)\n",
+                static_cast<unsigned long long>(s.datagrams), static_cast<unsigned long long>(s.dropped),
+                static_cast<unsigned long long>(s.rateLimited), static_cast<unsigned long long>(s.resets),
+                static_cast<unsigned long long>(s.takeovers), static_cast<unsigned long long>(s.staleDamage));
     return 0;
 }

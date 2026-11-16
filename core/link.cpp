@@ -12,6 +12,7 @@ constexpr uint32_t kHelloIntervalMs = 300;
 constexpr uint32_t kKeepAliveMs = 250;
 constexpr uint32_t kPingIntervalMs = 1000;
 constexpr uint32_t kTimeoutMs = 10000;
+constexpr uint32_t kResetIntervalMs = 200;  // answers to Data of a session we no longer have
 // Resend timeout: srtt + max(4 * rttvar, slack), within [min, max]; doubled per repeated resend.
 constexpr uint32_t kInitialRtoMs = 200;
 constexpr uint32_t kMinRtoMs = 30;
@@ -193,6 +194,13 @@ bool Link::poll(Msg& type, std::vector<uint8_t>& payload) {
     return true;
 }
 
+bool Link::peek(Msg& type, size_t& size) const {
+    if (inbox_.empty()) return false;
+    type = inbox_.front().type;
+    size = inbox_.front().size;
+    return true;
+}
+
 bool Link::deliver(Msg type, const uint8_t* body, size_t size) {
     if (inbox_.size() >= kMaxInbox || inboxBytes_.size() + size > kMaxInboxBytes) return false;
     inbox_.push_back(Inbound{type, static_cast<uint32_t>(inboxBytes_.size()), static_cast<uint32_t>(size)});
@@ -269,6 +277,7 @@ void Link::handleDatagram(const Endpoint& from, const uint8_t* data, size_t size
             break;
         case PacketType::Data:
             if (state_ == State::Connected) handleData(r, nowMs);
+            else if (config_.listen && state_ == State::Connecting) answerStaleData(from, r, nowMs);
             break;
         case PacketType::Bye:
             if (state_ == State::Connected && r.u16() == sessionKey() && r.ok()) beginConnecting(nowMs);
@@ -314,6 +323,22 @@ void Link::handleHello(const Endpoint& from, ByteReader& r, uint32_t nowMs) {
     lastReceiveMs_ = nowMs;
     // Answer so the peer learns about us even if our earlier Hello was lost (rate limited).
     if (newSession || nowMs - lastHelloMs_ >= kHelloIntervalMs / 2) sendHello(remote_, nowMs);
+}
+
+void Link::answerStaleData(const Endpoint& from, ByteReader& r, uint32_t nowMs) {
+    // The peer still sends in a session we have dropped (we timed out while its game was stuck in a
+    // loading screen). Without a word from us it would wait for its own timeout, ten more seconds of
+    // a frozen world: a Bye with the key it uses makes it start over at once. The Bye is smaller than
+    // the Data it answers and at most one goes out per interval, so a forged sender address gains
+    // nothing from it.
+    uint16_t key = r.u16();
+    if (!r.ok() || (resetSent_ && nowMs - lastResetMs_ < kResetIntervalMs)) return;
+    ByteWriter w;
+    writePacketHeader(w, PacketType::Bye);
+    w.u16(key);
+    transmit(from, w.data.data(), w.data.size());
+    lastResetMs_ = nowMs;
+    resetSent_ = true;
 }
 
 void Link::handleChallenge(ByteReader& r, uint32_t nowMs) {

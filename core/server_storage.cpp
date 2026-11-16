@@ -9,6 +9,13 @@
 #include <fstream>
 #include <iterator>
 
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 #include "protocol.h"
 
 namespace fs = std::filesystem;
@@ -49,6 +56,70 @@ std::vector<fs::path> listSaves(const fs::path& saves) {
     });
     return files;
 }
+
+std::FILE* openForWriting(const fs::path& file) {
+#ifdef _WIN32
+    return _wfopen(file.c_str(), L"wb");  // the data folder may have any characters in its path
+#else
+    return std::fopen(file.c_str(), "wb");
+#endif
+}
+
+// Writes `file` whole or not at all: the data goes to a file aside, which replaces `file` once it is
+// complete. With `durable`, the data is on the disk before the rename (and the rename too, on POSIX):
+// without that, a power cut or an OS crash can leave the new name pointing at an empty file, since
+// the file system may write the rename before the data.
+bool writeWhole(const fs::path& file, const void* data, size_t size, bool durable) {
+    fs::path part = file;
+    part += ".part";
+    std::error_code ec;
+    std::FILE* f = openForWriting(part);
+    if (!f) return false;
+    bool ok = (size == 0 || std::fwrite(data, 1, size, f) == size) && std::fflush(f) == 0;
+    if (ok && durable) {
+#ifdef _WIN32
+        ok = _commit(_fileno(f)) == 0;  // FlushFileBuffers
+#else
+        ok = ::fsync(fileno(f)) == 0;
+#endif
+    }
+    ok = std::fclose(f) == 0 && ok;
+    if (ok) {
+        fs::rename(part, file, ec);
+        ok = !ec;
+    }
+    if (!ok) {
+        fs::remove(part, ec);
+        return false;
+    }
+#ifndef _WIN32
+    if (durable) {
+        // The rename lives in the directory: sync it too, or the old name may come back after a crash.
+        int dirFd = ::open(file.parent_path().c_str(), O_RDONLY);
+        if (dirFd >= 0) {
+            ::fsync(dirFd);
+            ::close(dirFd);
+        }
+    }
+#endif
+    return true;
+}
+
+// The whole file, if it is something a player could load: not empty, within kMaxSaveBytes, read completely.
+bool readSave(const fs::path& file, std::vector<uint8_t>& data) {
+    std::error_code ec;
+    uintmax_t size = fs::file_size(file, ec);
+    if (ec || size == 0 || size > kMaxSaveBytes) return false;
+    std::ifstream in(file, std::ios::binary);
+    if (!in) return false;
+    data.resize(static_cast<size_t>(size));
+    in.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(size));
+    if (in.gcount() != static_cast<std::streamsize>(size)) {
+        data.clear();
+        return false;
+    }
+    return true;
+}
 }  // namespace
 
 std::string sanitizeCampaign(const std::string& name) {
@@ -77,19 +148,23 @@ std::string FileStorage::dir(const std::string& campaign) const {
 
 bool FileStorage::loadSave(const std::string& campaign, std::vector<uint8_t>& data) {
     std::vector<fs::path> files = listSaves(fs::path(dir(campaign)) / "saves");
-    if (files.empty()) return false;
+    for (auto it = files.rbegin(); it != files.rend(); ++it)
+        if (readSave(*it, data)) return true;
+    data.clear();
+    return false;
+}
+
+bool FileStorage::hasSaveFiles(const std::string& campaign) {
+    fs::path saves = fs::path(dir(campaign)) / "saves";
     std::error_code ec;
-    uintmax_t size = fs::file_size(files.back(), ec);
-    if (ec || size == 0 || size > kMaxSaveBytes) return false;  // not something a player could load
-    std::ifstream in(files.back(), std::ios::binary);
-    if (!in) return false;
-    data.resize(static_cast<size_t>(size));
-    in.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(size));
-    if (in.gcount() != static_cast<std::streamsize>(size)) {
-        data.clear();
-        return false;
+    fs::directory_iterator it(saves, ec);
+    // A folder that is there but cannot be listed may well hold the campaign's saves.
+    if (ec) {
+        std::error_code existsError;
+        bool there = fs::exists(saves, existsError);
+        return there || static_cast<bool>(existsError);
     }
-    return true;
+    return !listSaves(saves).empty();
 }
 
 bool FileStorage::storeSave(const std::string& campaign, const std::vector<uint8_t>& data, const std::string& by) {
@@ -101,25 +176,9 @@ bool FileStorage::storeSave(const std::string& campaign, const std::vector<uint8
     char name[64];
     std::snprintf(name, sizeof(name), "save-%06lu-%s.sav", next, timestamp(true).c_str());
     fs::path file = saves / name;
-    // Written aside and renamed when complete: a crash or a full disk mid-write must not leave a
-    // truncated file that would become the campaign save everyone downloads.
-    fs::path part = file;
-    part += ".part";
-    {
-        std::ofstream out(part, std::ios::binary | std::ios::trunc);
-        out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
-        out.flush();
-        if (!out) {
-            out.close();
-            fs::remove(part, ec);
-            return false;
-        }
-    }
-    fs::rename(part, file, ec);
-    if (ec) {
-        fs::remove(part, ec);
-        return false;
-    }
+    // Written aside, synced and renamed when complete: a crash, a power cut or a full disk mid-write
+    // must not leave a truncated file that would become the campaign save everyone downloads.
+    if (!writeWhole(file, data.data(), data.size(), true)) return false;
     files.push_back(file);
     // Keep a history, but not forever.
     while (files.size() > keep_) {
@@ -151,8 +210,12 @@ void FileStorage::storePlayer(const std::string& campaign, const std::string& na
     std::snprintf(buf, sizeof(buf), "last_seen %s, position %.1f %.1f %.1f", timestamp(false).c_str(), lastPos.x,
                   lastPos.y, lastPos.z);
     lines[name] = buf;
-    std::ofstream out(file, std::ios::trunc);
-    for (const auto& [k, v] : lines) out << k << "=" << v << "\n";
+    std::string text;
+    for (const auto& [k, v] : lines) text += k + "=" + v + "\n";
+    // Replaced whole, so a crash mid-write never loses the other players' lines. Not synced: it is
+    // rewritten every half minute for every player, and an fsync each time would stall the server
+    // loop on a slow disk; the next rewrite repairs what a power cut takes.
+    writeWhole(file, text.data(), text.size(), false);
 }
 
 }  // namespace coop

@@ -12,6 +12,12 @@ class IServerStorage {
 public:
     virtual ~IServerStorage() = default;
     virtual bool loadSave(const std::string& campaign, std::vector<uint8_t>& data) = 0;
+    // True when the campaign has stored saves, readable or not. A campaign whose saves exist but
+    // cannot be read (loadSave() false) is not a new one: nobody may start it over from their own save.
+    virtual bool hasSaveFiles(const std::string& campaign) {
+        (void)campaign;
+        return false;
+    }
     virtual bool storeSave(const std::string& campaign, const std::vector<uint8_t>& data, const std::string& by) = 0;
     virtual void journal(const std::string& campaign, const std::string& line) = 0;
     virtual void storePlayer(const std::string& campaign, const std::string& name, const Vec3& lastPos) = 0;
@@ -25,6 +31,10 @@ public:
         if (it == saves.end() || it->second.empty()) return false;
         data = it->second.back();
         return true;
+    }
+    bool hasSaveFiles(const std::string& campaign) override {
+        auto it = saves.find(campaign);
+        return it != saves.end() && !it->second.empty();
     }
     bool storeSave(const std::string& campaign, const std::vector<uint8_t>& data, const std::string&) override {
         auto& history = saves[campaign];
@@ -48,7 +58,10 @@ public:
 class FileStorage : public IServerStorage {
 public:
     explicit FileStorage(std::string root, size_t keepSaves = 20) : root_(std::move(root)), keep_(keepSaves) {}
+    // The newest save that is whole and readable: an empty or broken newest file (a power cut, a
+    // full disk) does not hide the older ones.
     bool loadSave(const std::string& campaign, std::vector<uint8_t>& data) override;
+    bool hasSaveFiles(const std::string& campaign) override;
     bool storeSave(const std::string& campaign, const std::vector<uint8_t>& data, const std::string& by) override;
     void journal(const std::string& campaign, const std::string& line) override;
     void storePlayer(const std::string& campaign, const std::string& name, const Vec3& lastPos) override;

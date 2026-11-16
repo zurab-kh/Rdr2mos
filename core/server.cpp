@@ -17,10 +17,31 @@ constexpr size_t kMaxCachedEntities = 4096;  // world copy per campaign (a sessi
 constexpr size_t kMaxUploadBytes = 256u << 20;  // all save uploads in progress together
 constexpr uint32_t kMaxAuthFailures = 10;    // wrong passwords per address and minute
 constexpr uint32_t kAuthWindowMs = 60000;
-// Per player: messages with side effects (damage, story, waypoints, save requests, ...) and bytes of
-// everything that gets passed on. Real play stays far below both.
-constexpr float kControlPerSecond = 60, kControlBurst = 120;
+// Per player and kind of message; real play stays far below all of them. Nothing a player sends
+// reliably that has a lasting effect is dropped for being over a budget:
+//  * damage: one message per hit, or per frame of damage over time, routed to one player only.
+//    Room for ten targets hurt every frame at 60 fps (clients also add up the damage per target).
+//    Over the budget it is dropped: a hit that is not passed on is lost, but nothing else is;
+constexpr float kDamagePerSecond = 600, kDamageBurst = 1200;
+//  * story events and save requests are rare by construction and each one matters (a death, a
+//    mission change, a download). Over the budget the sender's messages are read later: it is
+//    slowed down, nothing is lost;
+constexpr float kStoryPerSecond = 20, kStoryBurst = 60;
+//  * waypoints and appearance go to everyone, and only the latest one counts: over the budget the
+//    latest waits and goes out when the budget allows;
+constexpr float kSharedPerSecond = 10, kSharedBurst = 20;
+//  * bytes of everything that gets passed on.
 constexpr float kBytesPerSecond = 256 * 1024, kBytesBurst = 512 * 1024;
+// A Hello from the address of a player in the campaign, with that player's name, on another port:
+// the same player again (its game restarted the mod on loading a save, or a NAT changed the port),
+// if the old connection has gone quiet. Two players with the same name behind one address keep
+// talking, so the newcomer waits a moment and then joins next to the other one.
+constexpr uint32_t kTakeoverSilenceMs = 1000;
+constexpr uint32_t kTakeoverWaitMs = 2000;
+// Byes for Data that has no session here: all senders together (each one smaller than the Data).
+constexpr float kResetsPerSecond = 100, kResetsBurst = 200;
+constexpr uint32_t kQuietMs = 15000;         // no resets for an address just turned away (its own timeout is 10 s)
+constexpr size_t kMaxQuiet = 4096;
 constexpr uint32_t kForgetMs = 20000;        // a client that is gone this long is dropped
 constexpr uint32_t kDeniedLingerMs = 1500;   // time for the "denied" message to get out
 constexpr uint32_t kStoryTickMs = 50;
@@ -101,20 +122,16 @@ uint64_t siphash(const uint64_t key[2], uint64_t m0, uint64_t m1) {
     return v0 ^ v1 ^ v2 ^ v3;
 }
 
-// A per-player allowance that refills over time.
-struct Budget {
-    float tokens = -1;
-    uint32_t lastMs = 0;
-    bool take(float cost, float perSecond, float burst, uint32_t nowMs) {
-        if (tokens < 0) tokens = burst;
-        else tokens = std::min(burst, tokens + static_cast<float>(nowMs - lastMs) * perSecond / 1000.0f);
-        lastMs = nowMs;
-        if (tokens < cost) return false;
-        tokens -= cost;
-        return true;
-    }
-};
 }  // namespace
+
+bool Server::Budget::take(float cost, float perSecond, float burst, uint32_t nowMs) {
+    if (tokens < 0) tokens = burst;
+    else tokens = std::min(burst, tokens + static_cast<float>(nowMs - lastMs) * perSecond / 1000.0f);
+    lastMs = nowMs;
+    if (tokens < cost) return false;
+    tokens -= cost;
+    return true;
+}
 
 // The real socket, seen by one client's link: sends go to that client. Its datagrams are handed to
 // the link directly (Link::receive), so nothing is queued or copied per datagram.
@@ -135,9 +152,13 @@ struct Server::Client {
     Link link;
     uint32_t linkEpoch = 0;
     uint32_t createdMs = 0, lostSinceMs = 0, deniedAtMs = 0;
+    uint32_t lastHeardMs = 0;       // the last datagram from this address
+    uint32_t admitWaitSinceMs = 0;  // connected, waiting to see whether it takes over an old connection
     bool admitted = false;
+    bool replaced = false;          // a new connection of the same player took this one's place
     uint8_t id = 0;
     std::string campaign, name, avatar;
+    std::string baseName;           // the name asked for, cleaned (`name` may have a " 2" added)
     bool wantsWorld = false;
     uint32_t joinedMs = 0;
     // latest state, for the story logic and for players who join later
@@ -159,8 +180,10 @@ struct Server::Client {
     size_t uploadTotal = 0, downloadOffset = 0;
     uint32_t uploadCrc = 0, downloadCrc = 0;
     bool uploading = false, downloading = false;
-    // limits
-    Budget control, bytes;
+    // limits, and the latest waypoint / appearance waiting for the budget
+    Budget damage, story, shared, bytes;
+    std::vector<uint8_t> laterWaypoint, laterAppearance;
+    bool haveLaterWaypoint = false, haveLaterAppearance = false;
 };
 
 struct Server::Campaign {
@@ -259,16 +282,32 @@ void Server::pump(uint32_t nowMs) {
         if (c.link.connected()) {
             c.lostSinceMs = 0;
             if (c.link.epoch() != c.linkEpoch) {  // (re)connected: a fresh session for this player
-                if (c.admitted) leave(c, nowMs, "rejoined");
+                // The same player starting over from the same address (its mod restarted, or the
+                // connection blipped) keeps its place, like one on a new port; anyone else rejoins.
+                if (c.admitted && !sameSeat(c, nowMs)) leave(c, nowMs, "rejoined");
                 c.linkEpoch = c.link.epoch();
+                c.admitWaitSinceMs = 0;
                 admit(c, nowMs);
+            } else if (c.admitWaitSinceMs) {
+                admit(c, nowMs);  // is it a player's new connection? (decided within kTakeoverWaitMs)
             }
             Msg type;
-            while (c.link.poll(type, message_)) {
-                if (!c.admitted) continue;
-                if (allow(c, type, message_.size(), nowMs)) handle(c, type, message_, nowMs);
-                else ++stats_.rateLimited;
+            size_t size = 0;
+            if (c.admitted) {
+                sendLater(c, nowMs);
+                while (c.link.peek(type, size)) {
+                    Verdict v = allow(c, type, size, nowMs);
+                    if (v == Verdict::Wait) break;  // stays in the inbox: read on a later pump
+                    c.link.poll(type, message_);
+                    if (v == Verdict::Handle) handle(c, type, message_, nowMs);
+                    else if (v == Verdict::Later) keepForLater(c, type, message_);
+                    else ++stats_.rateLimited;
+                }
+                sendLater(c, nowMs);
+            } else if (!c.admitWaitSinceMs) {
+                while (c.link.poll(type, message_)) {}  // not in a campaign: nothing to do with it
             }
+            // (What a waiting newcomer sends stays in its inbox and is handled once it is in.)
             if (c.downloading) pumpDownload(c);
         } else {
             if (c.admitted) leave(c, nowMs, "left");
@@ -277,8 +316,9 @@ void Server::pump(uint32_t nowMs) {
         bool deniedDone = c.deniedAtMs && nowMs - c.deniedAtMs > kDeniedLingerMs;
         bool gone = c.lostSinceMs && nowMs - c.lostSinceMs > kForgetMs;
         bool neverJoined = !c.link.connected() && !c.linkEpoch && nowMs - c.createdMs > kForgetMs;
-        if (deniedDone || gone || neverJoined) {
+        if (deniedDone || gone || neverJoined || c.replaced) {
             if (c.admitted) leave(c, nowMs, "left");
+            if (deniedDone && quiet_.size() < kMaxQuiet) quiet_[c.ep] = nowMs;
             auto ip = clientsPerIp_.find(c.ep.ip);
             if (ip != clientsPerIp_.end() && --ip->second == 0) clientsPerIp_.erase(ip);
             it = clients_.erase(it);
@@ -295,6 +335,8 @@ void Server::pump(uint32_t nowMs) {
         lastPersistMs_ = nowMs;
         for (auto f = authFailures_.begin(); f != authFailures_.end();)
             f = nowMs - f->second.sinceMs > kAuthWindowMs ? authFailures_.erase(f) : std::next(f);
+        for (auto q = quiet_.begin(); q != quiet_.end();)
+            q = nowMs - q->second > kQuietMs ? quiet_.erase(q) : std::next(q);
         for (auto& [ep, c] : clients_)
             if (c->admitted && c->haveState) storage_.storePlayer(c->campaign, c->name, c->state.pos);
     }
@@ -359,20 +401,82 @@ void Server::dispatch(const Endpoint& from, const uint8_t* data, size_t size, ui
             c->link.start(c->socket.get(), lc, nowMs);
             it = clients_.emplace(from, std::move(c)).first;
             ++clientsPerIp_[from.ip];
+            quiet_.erase(from);
         }
     } else if (it == clients_.end()) {
+        if (type == PacketType::Data && versionOk) answerStaleData(from, r, nowMs);
         ++stats_.dropped;  // random traffic costs nothing
         return;
     }
+    it->second->lastHeardMs = nowMs;
     it->second->link.receive(from, data, size, nowMs);
 }
 
-bool Server::allow(Client& c, Msg type, size_t size, uint32_t nowMs) {
-    // Save uploads are bounded by size, are not passed on, and should go as fast as the line allows.
-    if (type == Msg::SaveChunk) return true;
-    if (!c.bytes.take(static_cast<float>(size), kBytesPerSecond, kBytesBurst, nowMs)) return false;
-    bool stream = type == Msg::PlayerState || type == Msg::EntitySnapshot || type == Msg::Camera || type == Msg::WorldInfo;
-    return stream || c.control.take(1, kControlPerSecond, kControlBurst, nowMs);
+void Server::answerStaleData(const Endpoint& from, ByteReader& r, uint32_t nowMs) {
+    // Data from an address without a session: most likely a player whose session this server does
+    // not have, because it restarted or forgot the player after a long silence. Without a word from
+    // us that player waits for its own timeout, ten seconds of a frozen world: a Bye with the key it
+    // uses makes it connect again at once. The Bye is smaller than the Data it answers, and one
+    // budget covers all of them, so a forged sender address gains nothing.
+    uint16_t key = r.u16();
+    if (!r.ok()) return;
+    auto q = quiet_.find(from);
+    if (q != quiet_.end()) {
+        if (nowMs - q->second < kQuietMs) return;
+        quiet_.erase(q);
+    }
+    if (!resets_.take(1, kResetsPerSecond, kResetsBurst, nowMs)) return;
+    ByteWriter w;
+    writePacketHeader(w, PacketType::Bye);
+    w.u16(key);
+    socket_.sendTo(from, w.data.data(), w.data.size());
+    ++stats_.resets;
+}
+
+Server::Verdict Server::allow(Client& c, Msg type, size_t size, uint32_t nowMs) {
+    auto bytes = [&] { return c.bytes.take(static_cast<float>(size), kBytesPerSecond, kBytesBurst, nowMs); };
+    switch (type) {
+        case Msg::SaveChunk:
+            // Save uploads are bounded by size, are not passed on, and should go as fast as the line allows.
+            return Verdict::Handle;
+        case Msg::Story:
+        case Msg::SaveRequest:
+            return c.story.take(1, kStoryPerSecond, kStoryBurst, nowMs) ? Verdict::Handle : Verdict::Wait;
+        case Msg::Waypoint:
+        case Msg::Appearance: {
+            // One already waits: this newer one takes its place (and its turn), never overtakes it.
+            bool waiting = type == Msg::Waypoint ? c.haveLaterWaypoint : c.haveLaterAppearance;
+            if (waiting) return Verdict::Later;
+            return c.shared.take(1, kSharedPerSecond, kSharedBurst, nowMs) && bytes() ? Verdict::Handle : Verdict::Later;
+        }
+        case Msg::Damage:
+            return c.damage.take(1, kDamagePerSecond, kDamageBurst, nowMs) && bytes() ? Verdict::Handle : Verdict::Drop;
+        default:
+            // State streams: a newer state follows soon.
+            return bytes() ? Verdict::Handle : Verdict::Drop;
+    }
+}
+
+void Server::keepForLater(Client& c, Msg type, const std::vector<uint8_t>& payload) {
+    bool& have = type == Msg::Waypoint ? c.haveLaterWaypoint : c.haveLaterAppearance;
+    std::vector<uint8_t>& later = type == Msg::Waypoint ? c.laterWaypoint : c.laterAppearance;
+    if (have) ++stats_.rateLimited;  // superseded: only the latest one counts
+    later = payload;
+    have = true;
+}
+
+void Server::sendLater(Client& c, uint32_t nowMs) {
+    for (Msg type : {Msg::Waypoint, Msg::Appearance}) {
+        bool& have = type == Msg::Waypoint ? c.haveLaterWaypoint : c.haveLaterAppearance;
+        std::vector<uint8_t>& later = type == Msg::Waypoint ? c.laterWaypoint : c.laterAppearance;
+        if (!have || !c.shared.take(1, kSharedPerSecond, kSharedBurst, nowMs) ||
+            !c.bytes.take(static_cast<float>(later.size()), kBytesPerSecond, kBytesBurst, nowMs))
+            continue;
+        have = false;
+        std::vector<uint8_t> payload;
+        payload.swap(later);
+        handle(c, type, payload, nowMs);
+    }
 }
 
 bool Server::authBlocked(uint32_t ip, uint32_t nowMs) {
@@ -397,7 +501,26 @@ void Server::dropUpload(Client& c) {
     std::vector<uint8_t>().swap(c.upload);
 }
 
+void Server::refuseUpload(Client& c, uint32_t crc, const std::string& why) {
+    // Said at once: the player must not take the acknowledged pieces for a stored save.
+    dropUpload(c);
+    SaveResult result;
+    result.crc = crc;
+    result.stored = 0;
+    result.reason = why;
+    c.link.send(Msg::SaveResult, result, true);
+}
+
 // ---------------------------------------------------------------- joining and leaving
+
+bool Server::sameSeat(Client& c, uint32_t nowMs) {
+    // A new session on the link of an admitted player: is it that player again? Then admit() keeps
+    // its place, without a password check that could turn it away (it would have to leave first).
+    const HelloInfo& hello = c.link.peer();
+    std::string campaignName = sanitizeCampaign(hello.campaign.empty() ? std::string("default") : hello.campaign);
+    bool passwordOk = config_.password.empty() || (hello.password == config_.password && !authBlocked(c.ep.ip, nowMs));
+    return c.admitted && campaignName == c.campaign && cleanName(hello.name) == c.baseName && passwordOk;
+}
 
 void Server::admit(Client& c, uint32_t nowMs) {
     const HelloInfo& hello = c.link.peer();
@@ -405,6 +528,7 @@ void Server::admit(Client& c, uint32_t nowMs) {
     auto deny = [&](const std::string& reason) {
         c.link.send(Msg::Denied, Denied{reason}, true);
         c.deniedAtMs = nowMs ? nowMs : 1;
+        c.admitWaitSinceMs = 0;
     };
     if (campaignName.empty()) return deny("invalid campaign name");
     if (!config_.password.empty()) {
@@ -425,20 +549,69 @@ void Server::admit(Client& c, uint32_t nowMs) {
         if (slot->hasSave && !data.empty() && data.size() <= kMaxSaveBytes) {
             slot->saveCrc = crc32(data.data(), data.size());
             slot->save = std::make_shared<const std::vector<uint8_t>>(std::move(data));
+        } else if (storage_.hasSaveFiles(campaignName)) {
+            // Saves are there but none can be read (a broken disk, a folder without permissions).
+            // This is not a new campaign: said to have no save, the world owner's game would start
+            // it over from whatever local save it has. It stays "has a save" (with nothing to
+            // download) until someone who may replace it uploads one.
+            slot->hasSave = true;
+            slot->save.reset();
+            slot->saveCrc = 0;
+            storage_.journal(campaignName, "the campaign's save files could not be read");
         }
     }
     Campaign& camp = *slot;
-    if (static_cast<int>(camp.ids.size()) >= std::min<int>(config_.maxPlayers, kMaxPlayers)) return deny("campaign is full");
+
+    // The same player again on a new connection: its old one has gone quiet. It takes that place,
+    // with the same id and name, and the world if it owned it; nobody sees it leave and come back.
+    // (Still admitted: a new session from the same address, see sameSeat().)
+    const std::string baseName = cleanName(hello.name);
+    Client* twin = c.admitted ? &c : nullptr;
+    for (uint8_t other : camp.ids) {
+        Client* m = twin == &c ? nullptr : member(camp, other);
+        if (!m || m == &c || m->ep.ip != c.ep.ip || m->ep == c.ep || m->baseName != baseName) continue;
+        if (!twin || nowMs - m->lastHeardMs > nowMs - twin->lastHeardMs) twin = m;
+    }
+    if (twin && twin != &c && nowMs - twin->lastHeardMs < kTakeoverSilenceMs) {
+        if (!c.admitWaitSinceMs) c.admitWaitSinceMs = nowMs ? nowMs : 1;
+        if (nowMs - c.admitWaitSinceMs < kTakeoverWaitMs) return;  // pump() asks again
+        twin = nullptr;  // still talking: another player behind the same address, with the same name
+    }
+    c.admitWaitSinceMs = 0;
+    if (!twin && static_cast<int>(camp.ids.size()) >= std::min<int>(config_.maxPlayers, kMaxPlayers))
+        return deny("campaign is full");
 
     uint8_t id = 1;
-    while (camp.byId.count(id)) ++id;
-    std::string name = cleanName(hello.name);
-    for (int n = 2; std::any_of(camp.byId.begin(), camp.byId.end(), [&](auto& kv) { return kv.second->name == name; }); ++n) {
-        std::string suffix = " " + std::to_string(n);
-        name = cleanName(hello.name, 24 - suffix.size()) + suffix;  // still within the 24 bytes
+    std::string name;
+    bool ownedWorld = false;
+    if (twin) {
+        id = twin->id;
+        name = twin->name;
+        ownedWorld = camp.owner == id;
+        if (twin->haveState) storage_.storePlayer(camp.name, twin->name, twin->state.pos);
+        if (twin != &c) {
+            twin->admitted = false;
+            twin->replaced = true;  // pump() forgets it
+            dropUpload(*twin);
+            twin->downloading = false;
+            twin->download.reset();
+            twin->link.stop();  // a Bye, should the old game still be listening after all
+        }
+        ++stats_.takeovers;
+    } else {
+        while (camp.byId.count(id)) ++id;
+        name = baseName;
+        for (int n = 2; std::any_of(camp.byId.begin(), camp.byId.end(), [&](auto& kv) { return kv.second->name == name; }); ++n) {
+            std::string suffix = " " + std::to_string(n);
+            name = cleanName(hello.name, 24 - suffix.size()) + suffix;  // still within the 24 bytes
+        }
     }
 
     c.admitted = true;
+    c.baseName = baseName;
+    c.haveLaterWaypoint = c.haveLaterAppearance = false;
+    c.laterWaypoint.clear();
+    c.laterAppearance.clear();
     c.deniedAtMs = 0;  // an earlier attempt on this address may have been turned away
     c.id = id;
     c.campaign = campaignName;
@@ -455,7 +628,7 @@ void Server::admit(Client& c, uint32_t nowMs) {
     dropUpload(c);
     c.downloading = false;
     c.download.reset();
-    camp.ids.push_back(id);
+    if (!twin) camp.ids.push_back(id);  // a returning player keeps its place in the joining order
     camp.byId[id] = &c;
     ++revision_;
 
@@ -466,11 +639,14 @@ void Server::admit(Client& c, uint32_t nowMs) {
     w.campaignSaveCrc = camp.hasSave ? camp.saveCrc : 0;
     w.campaign = campaignName;
     c.link.send(Msg::Welcome, w, true);
-    storage_.journal(campaignName, name + " joined");
+    storage_.journal(campaignName, name + (twin ? " reconnected" : " joined"));
 
-    // The world goes to a player who asked for it, or to the first one in.
+    // The world goes to a player who asked for it, or to the first one in. A returning owner gets it
+    // back, as a new world: its restarted game numbers its entities afresh, so nothing of the old
+    // world (cached state, hits on its ids) may be taken for the new one.
     Client* owner = member(camp, camp.owner);
-    if (!owner || (c.wantsWorld && !owner->wantsWorld)) electOwner(camp, nowMs, c.wantsWorld || !owner ? id : 0);
+    if (ownedWorld) newWorld(camp, id);
+    else if (!owner || (c.wantsWorld && !owner->wantsWorld)) electOwner(camp, nowMs, c.wantsWorld || !owner ? id : 0);
     sendRoster(camp);
 
     // Bring the newcomer up to date at once: other players, the world, the map.
@@ -482,6 +658,7 @@ void Server::admit(Client& c, uint32_t nowMs) {
     }
     if (camp.owner != id) sendWorldTo(camp, c);
     if (!camp.waypoint.empty()) c.link.sendFrom(camp.waypointFrom, Msg::Waypoint, camp.waypoint, true);
+    if (twin) return;
     for (uint8_t other : camp.ids)
         if (Client* o = member(camp, other); o && o != &c) notice(*o, name + " joined the campaign");
 }
@@ -492,6 +669,7 @@ void Server::leave(Client& c, uint32_t nowMs, const char* why) {
     dropUpload(c);
     c.downloading = false;
     c.download.reset();
+    c.haveLaterWaypoint = c.haveLaterAppearance = false;
     ++revision_;
     auto cit = campaigns_.find(c.campaign);
     if (cit == campaigns_.end()) return;
@@ -521,17 +699,29 @@ void Server::electOwner(Campaign& camp, uint32_t nowMs, uint8_t preferred) {
             }
     if (!chosen && !camp.ids.empty()) chosen = camp.ids.front();
     if (chosen == camp.owner) return;
-    camp.owner = chosen;
-    ++camp.epoch;
+    newWorld(camp, chosen);
+    (void)nowMs;
+}
+
+void Server::newWorld(Campaign& camp, uint8_t owner) {
+    camp.owner = owner;
+    // 0 never names a world: it is what a sender without a roster puts into Damage.
+    if (++camp.epoch == 0) camp.epoch = 1;
     ++revision_;
     // A new world: whatever was cached belongs to the old one.
     camp.cache.clear();
     camp.worldInfo.clear();
     camp.ownerInMission = false;
-    for (uint8_t id : camp.ids)
-        if (Client* m = member(camp, id); m && m->holding) release(*m, "");
-    if (Client* o = member(camp, chosen)) storage_.journal(camp.name, o->name + " now owns the world");
-    (void)nowMs;
+    for (uint8_t id : camp.ids) {
+        Client* m = member(camp, id);
+        if (!m) continue;
+        if (m->holding) release(*m, "");
+        // Only the world owner may replace the campaign save: an upload under way from someone
+        // else is refused now, not silently at its next piece.
+        if (m->uploading && m->id != owner && camp.hasSave)
+            refuseUpload(*m, m->uploadCrc, "The world now belongs to another player - your save was not uploaded");
+    }
+    if (Client* o = member(camp, owner)) storage_.journal(camp.name, o->name + " now owns the world");
 }
 
 void Server::sendRoster(Campaign& camp) {
@@ -650,6 +840,13 @@ void Server::handle(Client& c, Msg type, const std::vector<uint8_t>& payload, ui
         case Msg::Damage: {
             Damage d;
             if (!decode(payload, d)) return;
+            // World entities are numbered afresh in every world: a hit sent before its sender heard
+            // of a new world owner names an entity of the old world, and the new owner would apply
+            // it to whatever has that id in its own. (0: the sender has no roster yet, or is older.)
+            if (!isPlayerRef(d.target) && d.worldEpoch && d.worldEpoch != camp.epoch) {
+                ++stats_.staleDamage;
+                return;
+            }
             // Players take their own damage; everything else lives in the owner's world.
             uint8_t to = isPlayerRef(d.target) ? playerOfRef(d.target) : camp.owner;
             Client* target = member(camp, to);
@@ -704,7 +901,8 @@ void Server::handle(Client& c, Msg type, const std::vector<uint8_t>& payload, ui
         case Msg::SaveRequest: {
             if (c.downloading) return;
             if (!camp.save) {
-                c.link.send(Msg::SaveChunk, SaveChunk{}, true);  // total 0: nothing stored yet
+                if (camp.hasSave) notice(c, "The server cannot read this campaign's save files - tell its admin");
+                c.link.send(Msg::SaveChunk, SaveChunk{}, true);  // total 0: nothing to send
                 return;
             }
             c.download = camp.save;
@@ -717,9 +915,16 @@ void Server::handle(Client& c, Msg type, const std::vector<uint8_t>& payload, ui
         case Msg::SaveChunk: {
             SaveChunk& chunk = uploadChunk_;
             if (!decode(payload, chunk) || chunk.total == 0) return;
+            // Every refusal is told once per upload, at its first piece (or the piece that finds it
+            // refused); the pieces after it are dropped quietly.
             // The campaign save comes from the world owner (or from anyone, to start a campaign).
-            if (!isOwner && camp.hasSave) return;
+            if (!isOwner && camp.hasSave) {
+                if (chunk.offset == 0 || c.uploading)
+                    refuseUpload(c, chunk.crc, "Only the world owner can update the campaign save");
+                return;
+            }
             if (chunk.offset == 0) {
+                if (chunk.total > kMaxSaveBytes) return refuseUpload(c, chunk.crc, "Your save is too large for the server");
                 // The buffer grows with what really arrives: announcing 64 MB costs the sender 64 MB.
                 dropUpload(c);
                 c.uploading = true;
@@ -727,14 +932,12 @@ void Server::handle(Client& c, Msg type, const std::vector<uint8_t>& payload, ui
                 c.uploadCrc = chunk.crc;
                 c.upload.reserve(std::min<size_t>(chunk.total, 1u << 20));
             }
-            if (!c.uploading || chunk.offset != c.upload.size() || chunk.total != c.uploadTotal ||
-                chunk.crc != c.uploadCrc)
-                return;
-            if (uploadBytes() + chunk.data.size() > kMaxUploadBytes) {
-                dropUpload(c);
-                notice(c, "The server is busy - upload your save again later");
-                return;
-            }
+            if (!c.uploading) return;  // the rest of an upload that was refused
+            if (chunk.offset != c.upload.size() || chunk.total != c.uploadTotal || chunk.crc != c.uploadCrc ||
+                c.upload.size() + chunk.data.size() > c.uploadTotal)
+                return refuseUpload(c, c.uploadCrc, "Your save upload was interrupted - upload it again");
+            if (uploadBytes() + chunk.data.size() > kMaxUploadBytes)
+                return refuseUpload(c, c.uploadCrc, "The server is busy - upload your save again later");
             c.upload.insert(c.upload.end(), chunk.data.begin(), chunk.data.end());
             if (c.upload.size() >= c.uploadTotal) finishUpload(c, camp, nowMs);
             return;
@@ -746,21 +949,17 @@ void Server::handle(Client& c, Msg type, const std::vector<uint8_t>& payload, ui
 
 void Server::finishUpload(Client& c, Campaign& camp, uint32_t nowMs) {
     (void)nowMs;
-    bool ok = crc32(c.upload.data(), c.upload.size()) == c.uploadCrc && storage_.storeSave(camp.name, c.upload, c.name);
-    if (ok) {
-        camp.saveCrc = c.uploadCrc;
-        camp.save = std::make_shared<const std::vector<uint8_t>>(std::move(c.upload));
-    }
+    if (crc32(c.upload.data(), c.upload.size()) != c.uploadCrc)
+        return refuseUpload(c, c.uploadCrc, "Your save arrived damaged (checksum mismatch) - upload it again");
+    if (!storage_.storeSave(camp.name, c.upload, c.name))
+        return refuseUpload(c, c.uploadCrc, "The server could not store your save");
+    camp.saveCrc = c.uploadCrc;
+    camp.save = std::make_shared<const std::vector<uint8_t>>(std::move(c.upload));
     dropUpload(c);
     SaveResult result;
     result.crc = c.uploadCrc;
-    result.stored = ok ? 1 : 0;
-    if (!ok) result.reason = "The server could not store your save";
+    result.stored = 1;
     c.link.send(Msg::SaveResult, result, true);
-    if (!ok) {
-        notice(c, "The server could not store your save");
-        return;
-    }
     camp.hasSave = true;
     sendRoster(camp);  // everyone learns the campaign's new save (its CRC)
     for (uint8_t id : camp.ids)

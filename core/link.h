@@ -64,6 +64,9 @@ public:
     }
     // payload's storage is reused, so polling into the same vector in a loop does not allocate.
     bool poll(Msg& type, std::vector<uint8_t>& payload);
+    // The next message poll() would return, left in place: a reader that is not ready for it yet
+    // (the server's per-player limits) stops there and the message waits instead of being lost.
+    bool peek(Msg& type, size_t& size) const;
 
     State state() const { return state_; }
     bool connected() const { return state_ == State::Connected; }
@@ -107,6 +110,7 @@ private:
     void handleHello(const Endpoint& from, ByteReader& r, uint32_t nowMs);
     void handleChallenge(ByteReader& r, uint32_t nowMs);
     void handleData(ByteReader& r, uint32_t nowMs);
+    void answerStaleData(const Endpoint& from, ByteReader& r, uint32_t nowMs);
     void acknowledge(uint16_t ack, uint32_t nowMs);
     void selectiveAck(uint16_t ack, const uint8_t* bits, size_t size, uint32_t nowMs);
     void ackRecord(Pending& p, uint32_t nowMs);
@@ -142,6 +146,8 @@ private:
     uint32_t lastSendMs_ = 0;
     uint32_t lastHelloMs_ = 0;
     uint32_t lastPingMs_ = 0;
+    uint32_t lastResetMs_ = 0;
+    bool resetSent_ = false;
     bool helloSent_ = false;
     bool ackDirty_ = false;
     std::array<uint32_t, 4> pastPeerNonces_{};  // server sessions we have moved on from
