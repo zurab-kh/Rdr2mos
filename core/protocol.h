@@ -12,7 +12,7 @@
 namespace coop {
 
 constexpr uint16_t kMagic = 0x4352;  // "RC"
-constexpr uint8_t kProtocolVersion = 5;
+constexpr uint8_t kProtocolVersion = 6;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr size_t kMaxDatagram = 1200;  // stays below any sane path MTU
 constexpr size_t kMaxMessage = 1100;   // payload budget for one unreliable message
@@ -21,6 +21,10 @@ enum class PacketType : uint8_t {
     Hello = 1,
     Data = 2,
     Bye = 3,
+    // Server -> player, answering a Hello without a valid cookie: "say Hello again with this cookie".
+    // It proves the player really receives at its address before the server keeps any state for it,
+    // so a forged sender address can neither fill the server nor make it flood someone else.
+    Challenge = 4,
 };
 
 // Link-level role: the server listens (Host), players connect to it (Guest).
@@ -76,6 +80,7 @@ struct HelloInfo {
     std::string campaign;      // which campaign on the server to join
     std::string password;
     uint8_t wantsWorld = 0;    // 1 = this player wants to own the world (play the story as host)
+    uint32_t cookie = 0;       // echo of the server's Challenge, 0 = none yet
 };
 
 enum PlayerFlags : uint16_t {
@@ -309,6 +314,7 @@ bool decode(const std::vector<uint8_t>& bytes, T& v) {
 }
 
 // Every datagram starts with this 4-byte header.
+constexpr size_t kPacketHeaderBytes = 4;
 void writePacketHeader(ByteWriter& w, PacketType type);
 // Returns false for foreign traffic. `versionOk` is false when magic matches but the version differs.
 bool readPacketHeader(ByteReader& r, PacketType& type, bool& versionOk);
