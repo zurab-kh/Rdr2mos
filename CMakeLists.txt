@@ -37,7 +37,8 @@ add_executable(rdr2coop-server server/main.cpp)
 target_link_libraries(rdr2coop-server PRIVATE coop_core)
 
 # ---- tests
-add_executable(coop_tests tests/test_main.cpp)
+file(GLOB COOP_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp)
+add_executable(coop_tests ${COOP_TEST_SOURCES})
 target_link_libraries(coop_tests PRIVATE coop_core)
 enable_testing()
 add_test(NAME coop_tests COMMAND coop_tests)
