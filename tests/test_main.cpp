@@ -949,6 +949,7 @@ static void testSharedStoryFlow() {
     p.guestGame.player.flags = PF_InMission;
     p.run(500);
     CHECK(p.guestGame.held);
+    p.net.loss = 0;  // the Bye is a single datagram: lost, only the link timeout would tell the server
     p.hostLink.stop();
     p.run(300);
     CHECK(!p.guestGame.held && !p.guestGame.playerProtected && !p.guestGame.friendWaypoint);

@@ -67,6 +67,10 @@ struct Server::Client {
     uint16_t prevFlags = 0;
     bool holding = false, mismatch = false;
     uint32_t holdStartMs = 0, readySinceMs = 0, failGuardUntil = 0;
+    // storyTick's own bookkeeping: the connection it last saw (a new one = a fresh player), when the
+    // state last changed, since when the mission differs from the owner's, held at its last pass
+    uint32_t storyLink = 0, storyStateTime = 0, storyFreshMs = 0, mismatchSinceMs = 0;
+    bool storyHolding = false;
     // save transfer
     std::vector<uint8_t> upload, download;
     size_t uploadOffset = 0, downloadOffset = 0;
@@ -442,12 +446,19 @@ void Server::handle(Client& c, Msg type, const std::vector<uint8_t>& payload, ui
             }
             // A death in a mission.
             storage_.journal(camp.name, c.name + " died in a mission");
-            if (config_.storyMode != StoryMode::Shared || !config_.sharedFail || nowMs < c.failGuardUntil) return;
+            // The guard is set on players we just failed: their own death is that failure, not a new one.
+            bool guarded = c.failGuardUntil && static_cast<int32_t>(c.failGuardUntil - nowMs) > 0;
+            if (config_.storyMode != StoryMode::Shared || !config_.sharedFail || guarded) return;
+            // Mismatch flags compare a player with the world owner; the owner's own flag only says that
+            // someone differs, so it says nothing about the owner's mission.
+            Client* owner = member(camp, camp.owner);
+            auto elsewhere = [&](const Client& p) { return p.mismatch && &p != owner; };
             for (uint8_t id : camp.ids) {
                 Client* o = member(camp, id);
-                if (!o || o == &c || !o->haveState || o->mismatch) continue;
+                if (!o || o == &c || !o->haveState) continue;
                 bool inMission = o->state.flags & PF_InMission, dead = o->state.flags & PF_Dead;
-                bool sameMission = !o->missionScript || !c.missionScript || o->missionScript == c.missionScript;
+                bool known = o->missionScript && c.missionScript;
+                bool sameMission = known ? o->missionScript == c.missionScript : !elsewhere(*o) && !elsewhere(c);
                 if (!inMission || dead || !sameMission) continue;
                 StoryCommandMsg fail;
                 fail.cmd = StoryCmd::Fail;
@@ -555,15 +566,51 @@ void Server::release(Client& c, const std::string& why) {
 }
 
 void Server::storyTick(Campaign& camp, uint32_t nowMs) {
+    // Chained missions change scripts a moment apart on different machines: only a difference
+    // that lasts is a mismatch.
+    constexpr uint32_t kMismatchConfirmMs = 1500;
+    // A game that has sent nothing for this long is loading, paused or hung: nobody waits for it.
+    constexpr uint32_t kStaleMs = 5000;
     const bool shared = config_.storyMode == StoryMode::Shared;
     Client* owner = member(camp, camp.owner);
+    auto names = [](const std::vector<const Client*>& list) {
+        std::string out;
+        for (size_t i = 0; i < list.size(); ++i) {
+            if (i) out += i + 1 == list.size() ? " and " : ", ";
+            out += list[i]->name;
+        }
+        return out;
+    };
+
+    // A player seen for the first time on this connection starts from the state they are in: a
+    // mission or a scene that already runs when someone (re)joins is not an event.
+    for (uint8_t id : camp.ids) {
+        Client* m = member(camp, id);
+        if (!m || !m->haveState) continue;
+        if (m->storyLink != m->linkEpoch) {
+            m->storyLink = m->linkEpoch;
+            m->prevFlags = m->state.flags;
+            m->storyStateTime = m->state.timeMs;
+            m->storyFreshMs = nowMs;
+            m->mismatchSinceMs = 0;
+            m->storyHolding = m->holding;
+        } else if (m->state.timeMs != m->storyStateTime) {
+            m->storyStateTime = m->state.timeMs;
+            m->storyFreshMs = nowMs;
+        }
+    }
+    auto stale = [&](const Client& p) { return nowMs - p.storyFreshMs > kStaleMs; };
 
     // Which mission does the world owner play; who is in a different one?
+    std::vector<const Client*> elsewhere;
     for (uint8_t id : camp.ids) {
         Client* m = member(camp, id);
         if (!m || !m->haveState || m == owner) continue;
         bool both = owner && owner->haveState && (m->state.flags & PF_InMission) && (owner->state.flags & PF_InMission);
-        bool mismatch = shared && both && m->missionScript && owner->missionScript && m->missionScript != owner->missionScript;
+        bool differs = shared && both && m->missionScript && owner->missionScript && m->missionScript != owner->missionScript;
+        if (!differs) m->mismatchSinceMs = 0;
+        else if (!m->mismatchSinceMs) m->mismatchSinceMs = nowMs ? nowMs : 1;
+        bool mismatch = differs && nowMs - m->mismatchSinceMs >= kMismatchConfirmMs;
         if (mismatch != m->mismatch) {
             m->mismatch = mismatch;
             StoryCommandMsg cmd;
@@ -573,18 +620,19 @@ void Server::storyTick(Campaign& camp, uint32_t nowMs) {
             command(*m, cmd);
             if (mismatch && m->holding) release(*m, "");
         }
+        if (m->mismatch) elsewhere.push_back(m);
     }
 
     // The world owner hears about it too.
-    bool anyMismatch = false;
-    for (uint8_t id : camp.ids)
-        if (Client* m = member(camp, id); m && m != owner && m->mismatch) anyMismatch = true;
+    bool anyMismatch = !elsewhere.empty();
     if (owner && anyMismatch != owner->mismatch) {
         owner->mismatch = anyMismatch;
         StoryCommandMsg cmd;
         cmd.cmd = StoryCmd::Mismatch;
         cmd.flag = anyMismatch;
-        if (anyMismatch) cmd.text = "Someone is in a different mission - they should load the campaign save";
+        if (anyMismatch)
+            cmd.text = names(elsewhere) + (elsewhere.size() == 1 ? " is" : " are") +
+                       " in a different mission - they should load the campaign save";
         command(*owner, cmd);
     }
 
@@ -626,47 +674,78 @@ void Server::storyTick(Campaign& camp, uint32_t nowMs) {
 
     // Cutscene barrier: whoever finishes a scene first waits for everybody in the same mission.
     if (shared && config_.cutsceneBarrier) {
-        bool joinWindow = owner && camp.ownerInMission && nowMs - camp.ownerMissionStartMs < kJoinWaitMs;
-        auto busyOthers = [&](const Client& self) {
+        const bool joinWindow = owner && camp.ownerInMission && nowMs - camp.ownerMissionStartMs < kJoinWaitMs;
+        auto excluded = [&](const Client& p) { return p.mismatch && &p != owner; };
+        // Whom a player waits for: the others in the same mission who still watch a scene and, for a
+        // while after the owner started the mission, those who have not started it yet. Of the ones it
+        // would wait for, `away` have stopped answering; `late` are still not in the mission.
+        struct Waits {
+            std::vector<const Client*> watching, joining, away, late;
+            bool busy() const { return !watching.empty() || !joining.empty(); }
+        };
+        auto waitsOf = [&](const Client& self) {
+            Waits w;
             for (uint8_t id : camp.ids) {
-                Client* o = member(camp, id);
-                if (!o || o == &self || !o->haveState || (o->mismatch && o != owner)) continue;
-                bool inMission = o->state.flags & PF_InMission, cut = o->state.flags & PF_Cutscene;
-                if (o->state.flags & PF_Dead) continue;
-                if (cut) return true;                     // still watching
-                if (!inMission && joinWindow) return true; // has not started the mission yet
+                const Client* o = member(camp, id);
+                if (!o || o == &self || !o->haveState || excluded(*o) || (o->state.flags & PF_Dead)) continue;
+                bool inMission = o->state.flags & PF_InMission;
+                if (inMission && self.missionScript && o->missionScript && self.missionScript != o->missionScript) continue;
+                // A frozen player waits like us, whatever its game says about control.
+                bool watching = inMission && (o->state.flags & PF_Cutscene) && !o->holding;
+                std::vector<const Client*>* list = watching ? &w.watching : inMission ? nullptr : joinWindow ? &w.joining : &w.late;
+                if (!list) continue;
+                if (list != &w.late && stale(*o)) list = &w.away;
+                list->push_back(o);
             }
-            return false;
+            return w;
         };
         for (uint8_t id : camp.ids) {
             Client* m = member(camp, id);
             if (!m || !m->haveState) continue;
             uint16_t f = m->state.flags;
             bool inMission = f & PF_InMission, cut = f & PF_Cutscene, dead = f & PF_Dead;
-            bool sceneEnded = (m->prevFlags & PF_Cutscene) && !cut && inMission;
-            bool excluded = m->mismatch && m != owner;
-            if (!m->holding && sceneEnded && !dead && !excluded && busyOthers(*m)) {
-                bool watching = false;
-                for (uint8_t oid : camp.ids)
-                    if (Client* o = member(camp, oid); o && o != m && o->haveState && (o->state.flags & PF_Cutscene)) watching = true;
-                hold(*m, nowMs, watching ? "Waiting for the others to finish the cutscene..."
-                                         : "Waiting for the others to start the mission...");
+            // A "scene" seen while this player's world was frozen is the freeze itself.
+            bool sceneEnded = (m->prevFlags & PF_Cutscene) && !(m->prevFlags & PF_Holding) && !cut && inMission;
+            // electOwner() lets everybody go when the world changes hands, but in the shared story each
+            // game runs its own mission: whoever still has to wait keeps waiting.
+            bool letGo = m->storyHolding && !m->holding;
+            bool startWait = !m->holding && (sceneEnded || letGo) && inMission && !cut && !dead && !excluded(*m);
+            if (!startWait && !m->holding) continue;
+            Waits w = waitsOf(*m);
+            if (startWait && w.busy()) {
+                uint32_t since = m->holdStartMs;
+                hold(*m, nowMs, w.watching.empty() ? "Waiting for " + names(w.joining) + " to start the mission..."
+                                                   : "Waiting for " + names(w.watching) + " to finish the cutscene...");
+                if (letGo) m->holdStartMs = since;  // the same wait goes on, and so does its timeout
             }
             if (!m->holding) continue;
             if (dead || !inMission) {
                 release(*m, "");
-            } else if (!busyOthers(*m)) {
+            } else if (!w.busy()) {
                 if (!m->readySinceMs) m->readySinceMs = nowMs ? nowMs : 1;
-                if (nowMs - m->readySinceMs >= kSettleMs) release(*m, "Continuing together");
+                if (nowMs - m->readySinceMs >= kSettleMs) {
+                    // Say whom we go on without, if anyone.
+                    std::vector<const Client*> without = w.away;
+                    bool waitedForJoin = camp.ownerInMission && m->holdStartMs - camp.ownerMissionStartMs < kJoinWaitMs;
+                    if (waitedForJoin) without.insert(without.end(), w.late.begin(), w.late.end());
+                    release(*m, without.empty() ? "Continuing together" : "Continuing without " + names(without));
+                }
             } else {
                 m->readySinceMs = 0;
-                if (nowMs - m->holdStartMs > config_.barrierTimeoutMs) release(*m, "Stopped waiting for the others");
+                if (nowMs - m->holdStartMs > config_.barrierTimeoutMs) {
+                    std::vector<const Client*> waited = w.watching;
+                    waited.insert(waited.end(), w.joining.begin(), w.joining.end());
+                    release(*m, "Stopped waiting for " + names(waited));
+                }
             }
         }
     }
 
     for (uint8_t id : camp.ids)
-        if (Client* m = member(camp, id); m && m->haveState) m->prevFlags = m->state.flags;
+        if (Client* m = member(camp, id); m && m->haveState) {
+            m->prevFlags = m->state.flags;
+            m->storyHolding = m->holding;
+        }
 }
 
 }  // namespace coop
