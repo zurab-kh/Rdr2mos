@@ -9,7 +9,9 @@
 //  * shares map waypoints;
 //  * campaign saves: the world owner's new saves go to the server automatically, and anyone can
 //    download the campaign save into a free local slot. A transfer cut off by a reconnect is
-//    picked up again, and a save the server already has is never sent back.
+//    picked up again, and a save the server already has is never sent back. An upload counts as
+//    stored only when the server says so (SaveResult); a save the owner made just before quitting
+//    goes up when the owner is back.
 #pragma once
 #include <cstdint>
 #include <functional>
@@ -44,7 +46,8 @@ public:
 
     // Call every frame. `peers` are the other players we know the state of.
     void tick(uint32_t nowMs, const PlayerState& local, const std::vector<Peer>& peers, uint8_t worldOwner, uint8_t me);
-    // Story messages: StoryCommand, Camera, Waypoint, SaveChunk. `from` is the sending player for relayed ones.
+    // Story messages: StoryCommand, Camera, Waypoint, SaveChunk, SaveResult. `from` is the sending
+    // player for relayed ones.
     void handle(Msg type, uint8_t from, const uint8_t* data, size_t size, uint32_t nowMs);
     // The connection ended: releases everything the story layer holds on to (frozen world, camera,
     // protection, map marker). What outlives a connection is kept: a shared failure still waiting
@@ -71,6 +74,8 @@ private:
     void startDownload(const std::string& why);
     bool startUpload(bool automatic, const std::string& why);
     void sendSaveChunks();
+    void dropUpload();
+    void uploadAnswered(const SaveResult& r);
     void receiveSaveChunk(const SaveChunk& c, uint32_t nowMs);
 
     IGame& game_;
@@ -100,6 +105,10 @@ private:
     Vec3 regroupPos_;
     float regroupDistance_ = 0;
     std::string regroupText_;
+    uint8_t worldOwner_ = 0;    // as of the last tick (0: not known yet)
+    uint8_t regroupOwner_ = 0;  // whom the regroup is toward: the world owner when it came in
+    bool regroupWasInMission_ = false;  // we already played a mission when it came in
+    bool regroupDeferred_ = false;      // a scene of ours ran since: its position is out of date
     // spectator camera
     MotionBuffer camMotion_{60, 250};
     float camFov_ = 50.0f;
@@ -120,10 +129,19 @@ private:
     // the newest file the server and we agree on (sent up, or received): never sent again by itself
     uint32_t uploadedCrc_ = 0, downloadedCrc_ = 0;
     bool haveUploadedCrc_ = false, haveDownloadedCrc_ = false;
-    // upload: queued into the link until sendingSave_ ends, then delivered once nothing is unacknowledged
+    // a file the server refused: not offered again by itself
+    uint32_t refusedCrc_ = 0;
+    bool haveRefusedCrc_ = false;
+    // the stamp of the newest file the server gave an answer for (stored or refused)
+    uint64_t answeredStamp_ = 0;
+    // upload: queued into the link until sendingSave_ ends, then unconfirmed until the server's
+    // SaveResult (or until it is overdue: a server may drop a refused upload without a word)
     std::vector<uint8_t> up_;
     size_t upOffset_ = 0;
     uint32_t upCrc_ = 0;
+    uint64_t upStamp_ = 0;
+    uint32_t upQueuedMs_ = 0;  // when the last piece went into the link
+    bool upAsOwner_ = false;   // started while we owned the world
     bool sendingSave_ = false, uploadUnconfirmed_ = false, uploadAgain_ = false;
     // download
     std::vector<uint8_t> down_;
